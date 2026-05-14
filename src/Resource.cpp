@@ -301,6 +301,17 @@ Resource::Resource(const Bytes& data, const Link& link, const Bytes& request_id,
 {
 	assert(_object);
 	MEM("Resource object created");
+	// Request/response-framed resource (used by Link::request); the actual
+	// pack-and-send pipeline is built out in plan step 5. We just stash
+	// the inputs for now.
+	_object->_initiator   = true;
+	_object->_is_request  = !is_response;
+	_object->_is_response = is_response;
+	_object->_request_id  = request_id;
+	_object->_encrypted   = data;       // placeholder; sender pipeline encrypts via Link in step 5
+	_object->_timeout     = timeout;
+	_object->_status      = Type::Resource::NONE;
+	_object->_last_activity_ms = Utilities::OS::ltime();
 }
 
 Resource::Resource(const Bytes& data, const Link& link, bool advertise /*= true*/, bool auto_compress /*= true*/, Callbacks::concluded callback /*= nullptr*/, Callbacks::progress progress_callback /*= nullptr*/, double timeout /*= 0.0*/, int segment_index /*= 1*/, const Bytes& original_hash /*= {Type::NONE}*/, const Bytes& request_id /*= {Type::NONE}*/, bool is_response /*= false*/) :
@@ -308,6 +319,25 @@ Resource::Resource(const Bytes& data, const Link& link, bool advertise /*= true*
 {
 	assert(_object);
 	MEM("Resource object created");
+	// Sender-side primary constructor. step 4 only initialises the data
+	// type; the hashmap build + ADV send happens in step 5.
+	_object->_initiator         = true;
+	_object->_callbacks._concluded = callback;
+	_object->_callbacks._progress  = progress_callback;
+	_object->_encrypted         = data;
+	_object->_segment_index     = (uint8_t)segment_index;
+	_object->_total_segments    = 1;        // single-segment port; always 1
+	_object->_is_split          = false;
+	_object->_original_hash     = (original_hash.size() > 0 ? original_hash : Bytes());
+	_object->_request_id        = request_id;
+	_object->_is_request        = !is_response && !request_id.empty();
+	_object->_is_response       = is_response;
+	_object->_compressed        = false;    // never set; plan declines bz2
+	_object->_has_metadata      = false;
+	_object->_encrypted_flag    = true;     // Resource always encrypts via Link
+	_object->_timeout           = timeout;
+	_object->_status            = Type::Resource::NONE;
+	_object->_last_activity_ms  = Utilities::OS::ltime();
 }
 
 
@@ -377,7 +407,11 @@ const Bytes& Resource::request_id() const {
 
 const Bytes& Resource::data() const {
 	assert(_object);
-	return _object->_data;
+	// Sender side: the prepared (eventually encrypted) payload.
+	// Receiver side: callers should use the buffer through ResourceBuffer
+	// once assembly completes; that hookup lands in step 7 along with the
+	// resource_concluded callback wiring.
+	return _object->_encrypted;
 }
 
 const Type::Resource::status Resource::status() const {
@@ -387,12 +421,12 @@ const Type::Resource::status Resource::status() const {
 
 const size_t Resource::size() const {
 	assert(_object);
-	return _object->_size;
+	return _object->_transfer_size;
 }
 
 const size_t Resource::total_size() const {
 	assert(_object);
-	return _object->_total_size;
+	return _object->_data_size;
 }
 
 // setters
