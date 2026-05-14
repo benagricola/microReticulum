@@ -498,12 +498,12 @@ Recall last heard app_data for a destination hash.
 					return true;
 				}
 				else {
-					DEBUGF("Received invalid announce for %s: Destination mismatch.", packet.destination_hash().toHex().c_str());
+					NOTICEF("Received invalid announce for %s: Destination mismatch.", packet.destination_hash().toHex().c_str());
 					return false;
 				}
 			}
 			else {
-				DEBUGF("Received invalid announce for %s: Invalid signature.", packet.destination_hash().toHex().c_str());
+				NOTICEF("Received invalid announce for %s: Invalid signature.", packet.destination_hash().toHex().c_str());
 				//p del announced_identity
 				return false;
 			}
@@ -580,7 +580,7 @@ const Bytes Identity::decrypt(const Bytes& ciphertext_token) const {
 		throw std::runtime_error("Decryption failed because identity does not hold a private key");
 	}
 	if (ciphertext_token.size() <= Type::Identity::KEYSIZE/8/2) {
-		DEBUGF("Decryption failed because the token size %lu was invalid.", ciphertext_token.size());
+		NOTICEF("Decryption failed because the token size %lu was invalid.", ciphertext_token.size());
 		return {Bytes::NONE};
 	}
 	Bytes plaintext;
@@ -614,7 +614,7 @@ const Bytes Identity::decrypt(const Bytes& ciphertext_token) const {
 		//TRACEF("Identity::decrypt: Token decrypted data of length %lu", plaintext.size());
 	}
 	catch (const std::exception& e) {
-		DEBUGF("Decryption by %s failed: %s", toString().c_str(), e.what());
+		NOTICEF("Decryption by %s failed: %s", toString().c_str(), e.what());
 	}
 		
 	return plaintext;
