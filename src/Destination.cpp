@@ -24,6 +24,15 @@
 #include <string.h>
 
 using namespace RNS;
+
+// PATCH-OUTBOUND-RATCHET-PROVIDER-V1
+// Provider hook: when set, returns a fresh 32-byte ratchet pubkey
+// for the destination being announced. Wired from the LXMF gateway.
+typedef bool (*outbound_ratchet_provider_fn)(const uint8_t* dest_hash, uint8_t* out_pubkey_32);
+static outbound_ratchet_provider_fn _lxmf_outbound_ratchet_provider = nullptr;
+extern "C" void rns_set_outbound_ratchet_provider(outbound_ratchet_provider_fn fn) {
+    _lxmf_outbound_ratchet_provider = fn;
+}
 using namespace RNS::Type::Destination;
 using namespace RNS::Utilities;
 
@@ -292,7 +301,16 @@ Packet Destination::announce(const Bytes& app_data, bool path_response, const In
 			//TRACEF("Destination::announce: app data:     %s", new_app_data.toHex().c_str());
 			//TRACEF("Destination::announce: app data text:%s", new_app_data.toString().c_str());
 			// PATCH-OUTBOUND-RATCHET-V1
-			Bytes ratchet = Cryptography::random(Type::Identity::RATCHETSIZE/8);
+			Bytes ratchet;
+			{
+				uint8_t _ratchet_buf[Type::Identity::RATCHETSIZE/8];
+				if (_lxmf_outbound_ratchet_provider != nullptr &&
+				    _lxmf_outbound_ratchet_provider(_object->_hash.data(), _ratchet_buf)) {
+					ratchet = Bytes(_ratchet_buf, Type::Identity::RATCHETSIZE/8);
+				} else {
+					ratchet = Cryptography::random(Type::Identity::RATCHETSIZE/8);
+				}
+			}
 			signed_data << _object->_hash << _object->_identity.get_public_key() << _object->_name_hash << random_hash << ratchet;
 			if (new_app_data) {
 				signed_data << new_app_data;
