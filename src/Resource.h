@@ -99,6 +99,13 @@ namespace RNS {
 		// map_hash doesn't match anything we expect.
 		void on_part(const Packet& part_packet);
 
+		// Sender-only: ingest an incoming RESOURCE_REQ body and send the
+		// requested parts as RESOURCE packets. Body layout matches
+		// Resource.py:931-979: [exhausted][last_map_hash if exhausted]
+		// [resource_hash 16B][requested_map_hashes 4*n]. If exhausted is
+		// set, also emit the next hashmap segment via _send_hmu.
+		void on_request(const Bytes& body);
+
 		// Receiver: ingest an incoming RESOURCE_HMU body (16-byte hash
 		// prefix + msgpack[segment, hashmap_bytes]). Extends our
 		// _map_hashes vector with the additional segment's map_hashes.

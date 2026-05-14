@@ -1359,6 +1359,40 @@ void Link::receive(const Packet& packet) {
 					}
 					break;
 				}
+				// --- RESOURCE_REQ dispatch (plan step 8) ---
+				// Decrypt the body, parse out the resource hash, route to
+				// the matching outgoing resource so it can send the
+				// requested parts. Body layout matches
+				// Resource.py:931-979: [exhausted][last_map_hash if
+				// exhausted][hash 16B][requested_map_hashes 4*N].
+				case Type::Packet::RESOURCE_REQ:
+				{
+					const Bytes plaintext = decrypt(packet.data());
+					if (!plaintext) {
+						WARNING("RESOURCE_REQ decrypt failed");
+						break;
+					}
+					const uint8_t HASHLEN = Type::Identity::HASHLENGTH / 8;
+					const uint8_t MAPLEN  = Type::Resource::MAPHASH_LEN;
+					if (plaintext.size() < 1 + HASHLEN) break;
+
+					// Resource hash sits after the exhausted byte plus
+					// (4 if exhausted else 0) bytes of last_map_hash.
+					size_t hash_off = 1;
+					if (plaintext[0] == Type::Resource::HASHMAP_IS_EXHAUSTED) {
+						hash_off += MAPLEN;
+					}
+					if (plaintext.size() < hash_off + HASHLEN) break;
+					Bytes resource_hash(plaintext.data() + hash_off, HASHLEN);
+
+					for (auto& resource : _object->_outgoing_resources) {
+						if (resource.hash() == resource_hash) {
+							const_cast<Resource&>(resource).on_request(plaintext);
+							break;
+						}
+					}
+					break;
+				}
 				// --- RESOURCE_HMU dispatch (plan step 7) ---
 				// Body is 16-byte resource hash + msgpack[segment, hashmap].
 				// Decrypt, look up the matching incoming resource by hash,

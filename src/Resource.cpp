@@ -863,6 +863,99 @@ void Resource::_send_proof() {
 	DEBUGF("Resource: sent PRF for %s", d._hash.toHex().c_str());
 }
 
+// --------------------------------------------------------------------------
+// Sender REQ handling (plan step 8)
+//
+// Receiver has asked for a set of parts identified by map_hash. We scan
+// our pre-built _map_hashes to find each requested hash, then send the
+// matching part as a RESOURCE packet. If the receiver's REQ also signals
+// hashmap-exhausted, we figure out which HMU segment they need next and
+// emit it. Robustness: receivers may legitimately re-request parts
+// (proof timeout, retry) — we don't track sent_parts as a hard mutex,
+// just resend.
+// --------------------------------------------------------------------------
+
+void Resource::on_request(const Bytes& body) {
+	assert(_object);
+	auto& d = *_object;
+	if (!d._initiator) return;
+	if (d._status == Type::Resource::FAILED ||
+	    d._status == Type::Resource::COMPLETE) return;
+
+	if (d._status == Type::Resource::ADVERTISED) {
+		d._status = Type::Resource::TRANSFERRING;
+	}
+	d._last_activity_ms = Utilities::OS::ltime();
+	d._retries_left = Type::Resource::MAX_RETRIES;
+
+	const uint8_t HASHLEN  = Type::Identity::HASHLENGTH / 8;
+	const uint8_t MAPLEN   = Type::Resource::MAPHASH_LEN;
+	if (body.size() < 1 + HASHLEN) {
+		WARNING("on_request: body too short");
+		return;
+	}
+
+	const uint8_t exhausted = body[0];
+	size_t cursor = 1;
+	Bytes last_map_hash;
+	if (exhausted == Type::Resource::HASHMAP_IS_EXHAUSTED) {
+		if (body.size() < 1 + MAPLEN + HASHLEN) {
+			WARNING("on_request: exhausted REQ truncated");
+			return;
+		}
+		last_map_hash = Bytes(body.data() + cursor, MAPLEN);
+		cursor += MAPLEN;
+	}
+	Bytes peer_hash(body.data() + cursor, HASHLEN);
+	cursor += HASHLEN;
+	if (peer_hash != d._hash) {
+		DEBUG("on_request: hash mismatch; not for us");
+		return;
+	}
+
+	// Send each requested part.
+	uint16_t resent = 0;
+	while (cursor + MAPLEN <= body.size()) {
+		Bytes req_map_hash(body.data() + cursor, MAPLEN);
+		cursor += MAPLEN;
+		for (uint16_t i = 0; i < d._parts_count; ++i) {
+			if (d._map_hashes[i] == req_map_hash) {
+				try {
+					Packet part_packet(d._link, d._parts[i],
+					                   Type::Packet::DATA, Type::Packet::RESOURCE);
+					part_packet.send();
+					resent++;
+					d._sent_parts++;
+				}
+				catch (const std::exception& e) {
+					ERRORF("on_request: part %u send failed: %s", (unsigned)i, e.what());
+				}
+				break;
+			}
+		}
+	}
+	DEBUGF("on_request: sent %u parts (exhausted=%s)", (unsigned)resent,
+	       exhausted == Type::Resource::HASHMAP_IS_EXHAUSTED ? "yes" : "no");
+
+	// If the receiver's hashmap is exhausted, derive which segment they
+	// need next and emit it. last_map_hash sits at the boundary between
+	// what they have and what they don't; find which index it maps to,
+	// then the next HMU segment is floor(index / HASHMAP_MAX_LEN) + 1.
+	if (exhausted == Type::Resource::HASHMAP_IS_EXHAUSTED) {
+		const uint16_t HMU_MAX = Type::Resource::ResourceAdvertisement::HASHMAP_MAX_LEN;
+		uint16_t last_index = 0;
+		for (uint16_t i = 0; i < d._parts_count; ++i) {
+			if (d._map_hashes[i] == last_map_hash) { last_index = i; break; }
+		}
+		const uint8_t next_seg = (uint8_t)((last_index / HMU_MAX) + 1);
+		const size_t next_start = (size_t)next_seg * HMU_MAX * Type::Resource::MAPHASH_LEN;
+		if (next_start < d._map_full.size()) {
+			_send_hmu(next_seg);
+		}
+	}
+}
+
+
 void Resource::_send_hmu(uint8_t segment_index) {
 	assert(_object);
 	auto& d = *_object;
