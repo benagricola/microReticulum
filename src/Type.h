@@ -552,6 +552,17 @@ namespace RNS { namespace Type {
 		static const uint8_t HASHMAP_IS_NOT_EXHAUSTED = 0x00;
 		static const uint8_t HASHMAP_IS_EXHAUSTED = 0xFF;
 
+		// Firmware port: hybrid RAM-vs-flash buffer for receive.
+		// Resources advertised at <= RAM_BUFFER_THRESHOLD bytes stream into
+		// HeapResourceBuffer; larger ones stream into FlashResourceBuffer.
+		// FIRMWARE_MAX_INCOMING is the hard per-resource cap (advertisements
+		// larger than this are refused with RESOURCE_RCL). FLASH_QUOTA_BYTES
+		// is the soft cap on total pending flash-backed bytes across all
+		// in-flight resources; an ADV that would push us over is refused.
+		static const uint32_t RAM_BUFFER_THRESHOLD = 8 * 1024;        //  8 KiB
+		static const uint32_t FIRMWARE_MAX_INCOMING = 1 * 1024 * 1024; //  1 MiB
+		static const uint32_t FLASH_QUOTA_BYTES = 4 * 1024 * 1024;     //  4 MiB
+
 		// Status constants
 		enum status {
 			NONE            = 0x00,
