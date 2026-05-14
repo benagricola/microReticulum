@@ -16,6 +16,7 @@
 
 #include "LinkData.h"
 #include "Resource.h"
+#include "ResourceBuffer.h"
 #include "Reticulum.h"
 #include "Transport.h"
 #include "Packet.h"
@@ -1153,6 +1154,94 @@ void Link::receive(const Packet& packet) {
 				case Type::Packet::LINKCLOSE:
 				{
 					teardown_packet(packet);
+					break;
+				}
+				// --- RESOURCE_ADV dispatch (plan step 6) ---
+				// Decrypt the body, validate flag combinations against our
+				// firmware's no-bz2 / no-split / no-metadata stance, check
+				// the size against FIRMWARE_MAX_INCOMING and the flash
+				// quota, allocate a Resource via Resource::accept which
+				// picks the right ResourceBuffer (heap vs flash), register
+				// it with this Link, and fire the initial REQ. Refusals
+				// emit a RESOURCE_RCL back to the sender with the
+				// advertised hash so they fail cleanly rather than waiting
+				// for our timeout.
+				case Type::Packet::RESOURCE_ADV:
+				{
+					if (_object->_resource_strategy == Type::Link::ACCEPT_NONE) {
+						DEBUG("RESOURCE_ADV refused: resource_strategy=ACCEPT_NONE");
+						break;
+					}
+					const Bytes plaintext = decrypt(packet.data());
+					if (!plaintext) {
+						WARNING("RESOURCE_ADV decrypt failed");
+						break;
+					}
+					ResourceAdvertisement adv;
+					if (!adv.unpack(plaintext)) {
+						WARNING("RESOURCE_ADV unpack failed");
+						break;
+					}
+					DEBUGF("RESOURCE_ADV received: hash=%s t=%u n=%u f=0x%02x",
+					       adv.hash().toHex().c_str(),
+					       (unsigned)adv.transfer_size(),
+					       (unsigned)adv.parts(),
+					       (unsigned)adv.flags());
+
+					auto send_rcl = [&](const char* reason) {
+						NOTICEF("Rejecting incoming resource (%s): %s",
+						        adv.hash().toHex().c_str(), reason);
+						try {
+							Packet rcl(*this, adv.hash(),
+							           Type::Packet::DATA, Type::Packet::RESOURCE_RCL);
+							rcl.send();
+						}
+						catch (const std::exception& e) {
+							ERRORF("RCL send failed: %s", e.what());
+						}
+					};
+
+					if (adv.compressed())   { send_rcl("compressed (c=1) not supported"); break; }
+					if (adv.split())        { send_rcl("split (s=1) not supported"); break; }
+					if (adv.has_metadata()) { send_rcl("metadata (x=1) not supported"); break; }
+					if (adv.transfer_size() == 0) {
+						send_rcl("zero-size resource"); break;
+					}
+					if (adv.transfer_size() > Type::Resource::FIRMWARE_MAX_INCOMING) {
+						send_rcl("transfer size exceeds firmware cap"); break;
+					}
+					// Flash quota check: only matters for >RAM_BUFFER_THRESHOLD
+					// resources, since heap-backed ones don't consume flash.
+					if (adv.transfer_size() > Type::Resource::RAM_BUFFER_THRESHOLD &&
+					    !flash_quota_can_allocate(adv.transfer_size())) {
+						send_rcl("flash quota exhausted"); break;
+					}
+					// Duplicate-ADV guard: if we already have an in-flight
+					// receive for this hash, don't replace state; let the
+					// sender retransmit parts against the existing buffer.
+					{
+						bool already = false;
+						for (const auto& r : _object->_incoming_resources) {
+							if (r.hash() == adv.hash()) { already = true; break; }
+						}
+						if (already) {
+							DEBUGF("RESOURCE_ADV duplicate for hash %s; ignoring",
+							       adv.hash().toHex().c_str());
+							break;
+						}
+					}
+
+					Resource resource = Resource::accept(adv, *this,
+					                                    _object->_callbacks._resource_concluded,
+					                                    nullptr);
+					if (resource.status() == Type::Resource::FAILED) {
+						// Buffer allocation failed (e.g. heap OOM after the
+						// quota check passed). Tell the sender.
+						send_rcl("buffer allocation failed");
+						break;
+					}
+					register_incoming_resource(resource);
+					resource.send_part_request();
 					break;
 				}
 /*z

@@ -505,6 +505,139 @@ void Resource::_send_advertisement() {
 	d._link.register_outgoing_resource(*this);
 }
 
+// --------------------------------------------------------------------------
+// Receiver pipeline (plan step 6)
+//
+// Resource::accept is the static factory the Link's RESOURCE_ADV dispatch
+// arm calls. It constructs a Resource in receive mode, allocates a
+// ResourceBuffer sized to the advertisement (Heap or Flash depending on
+// _t against RAM_BUFFER_THRESHOLD), seeds the hashmap from the ADV's
+// first-segment map_hashes (subsequent segments arrive via HMU), and
+// transitions status to TRANSFERRING. The caller is responsible for
+// calling link.register_incoming_resource(resource) and for invoking
+// resource.send_part_request() to fire the first REQ.
+// --------------------------------------------------------------------------
+
+Resource Resource::accept(const ResourceAdvertisement& adv, const Link& link,
+                          Callbacks::concluded concluded,
+                          Callbacks::progress progress) {
+	// Reuse the main constructor with advertise=false so no sender work
+	// runs; then mutate fields into receive mode.
+	Resource r(Bytes(), link, /*advertise=*/false, /*auto_compress=*/false,
+	           concluded, progress, 0.0);
+
+	auto& d = *r._object;
+	d._initiator       = false;
+	d._hash            = adv.hash();
+	d._random_hash     = adv.random_hash();
+	d._original_hash   = adv.original_hash();
+	d._request_id      = adv.request_id();
+	d._transfer_size   = adv.transfer_size();
+	d._data_size       = adv.data_size();
+	d._parts_count     = adv.parts();
+	d._segment_index   = adv.segment_index();
+	d._total_segments  = adv.total_segments();
+	d._is_request      = adv.is_request();
+	d._is_response     = adv.is_response();
+	d._compressed      = adv.compressed();
+	d._is_split        = adv.split();
+	d._has_metadata    = adv.has_metadata();
+	d._encrypted_flag  = adv.encrypted();
+	d._sdu             = const_cast<Link&>(link).get_mdu();
+
+	// Allocate the receive buffer. Heap below RAM_BUFFER_THRESHOLD,
+	// flash-streamed above. nullptr means flash quota would be exceeded.
+	d._buffer = make_resource_buffer(d._transfer_size);
+	if (!d._buffer || !d._buffer->open(d._transfer_size)) {
+		ERRORF("Resource::accept: failed to allocate buffer for %u-byte resource",
+		       (unsigned)d._transfer_size);
+		d._status = Type::Resource::FAILED;
+		return r;
+	}
+
+	// Seed the hashmap with the ADV's first-segment map_hashes. Slots
+	// beyond first-segment stay empty until corresponding HMU arrives.
+	d._map_hashes.assign(d._parts_count, Bytes());
+	const Bytes& adv_map = adv.hashmap();
+	const size_t avail_hashes = adv_map.size() / Type::Resource::MAPHASH_LEN;
+	for (size_t i = 0; i < avail_hashes && i < d._parts_count; ++i) {
+		d._map_hashes[i] = Bytes(adv_map.data() + i * Type::Resource::MAPHASH_LEN,
+		                         Type::Resource::MAPHASH_LEN);
+	}
+	d._parts_received.assign(d._parts_count, false);
+	d._received_count    = 0;
+	d._outstanding_parts = 0;
+	d._consecutive_completed_height = -1;
+
+	d._status            = Type::Resource::TRANSFERRING;
+	d._started_ms        = Utilities::OS::ltime();
+	d._last_activity_ms  = d._started_ms;
+	d._retries_left      = Type::Resource::MAX_RETRIES;
+
+	DEBUGF("Resource::accept: n=%u t=%u hash=%s (buffer=%s)",
+	       (unsigned)d._parts_count, (unsigned)d._transfer_size,
+	       d._hash.toHex().c_str(),
+	       d._buffer->is_flash_backed() ? "flash" : "heap");
+	return r;
+}
+
+void Resource::send_part_request() {
+	assert(_object);
+	auto& d = *_object;
+	if (d._status == Type::Resource::FAILED ||
+	    d._status == Type::Resource::COMPLETE) return;
+
+	// Find up to `window` not-yet-received parts starting from
+	// consecutive_completed_height + 1 whose map_hashes we have.
+	uint16_t pn = (d._consecutive_completed_height >= 0)
+	                  ? (uint16_t)(d._consecutive_completed_height + 1) : 0;
+	uint8_t exhausted = Type::Resource::HASHMAP_IS_NOT_EXHAUSTED;
+	Bytes requested;
+	uint16_t asked = 0;
+
+	while (asked < d._window && pn < d._parts_count) {
+		if (d._parts_received[pn]) { pn++; continue; }
+		if (d._map_hashes[pn].empty()) {
+			// Hashmap exhausted at this position — ask sender for more.
+			exhausted = Type::Resource::HASHMAP_IS_EXHAUSTED;
+			break;
+		}
+		requested.append(d._map_hashes[pn]);
+		asked++;
+		pn++;
+	}
+
+	Bytes body;
+	body.append(Bytes(&exhausted, 1));
+	if (exhausted == Type::Resource::HASHMAP_IS_EXHAUSTED) {
+		// Append the last known map_hash before the gap so the sender
+		// can derive which segment to send next.
+		uint16_t last_known = 0;
+		for (uint16_t i = 0; i < d._parts_count; ++i) {
+			if (!d._map_hashes[i].empty()) last_known = i;
+		}
+		body.append(d._map_hashes[last_known]);
+	}
+	body.append(d._hash);
+	body.append(requested);
+
+	try {
+		Packet req_packet(d._link, body, Type::Packet::DATA, Type::Packet::RESOURCE_REQ);
+		req_packet.send();
+	}
+	catch (const std::exception& e) {
+		ERRORF("Resource: REQ send failed: %s", e.what());
+		d._status = Type::Resource::FAILED;
+		return;
+	}
+	d._req_sent_ms      = Utilities::OS::ltime();
+	d._last_activity_ms = d._req_sent_ms;
+	d._outstanding_parts = asked;
+	DEBUGF("Resource: sent REQ (asking for %u parts, exhausted=%s)",
+	       (unsigned)asked,
+	       exhausted == Type::Resource::HASHMAP_IS_EXHAUSTED ? "yes" : "no");
+}
+
 void Resource::_send_hmu(uint8_t segment_index) {
 	assert(_object);
 	auto& d = *_object;

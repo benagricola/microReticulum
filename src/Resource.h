@@ -27,6 +27,10 @@ namespace RNS {
 	class Destination;
 	class Link;
 	class Resource;
+	class ResourceAdvertisement;   // forward-declared so Resource's member
+	                               // signatures resolve to this class
+	                               // rather than the same-named namespace
+	                               // at RNS::Type::Resource::ResourceAdvertisement.
 
 	class Resource {
 
@@ -70,7 +74,22 @@ namespace RNS {
 		}
 
 	public:
-	    //p static def accept(advertisement_packet, callback=None, progress_callback = None, request_id = None):
+		// Receiver-side factory. Builds a Resource in receive mode against
+		// the given Link: allocates a ResourceBuffer sized to the
+		// advertisement, seeds the hashmap with the ADV's first-segment
+		// map_hashes, sets initiator=false / status=TRANSFERRING, and
+		// returns the handle for the caller to register with
+		// link.register_incoming_resource. Returns a NONE-Resource on
+		// buffer allocation failure (flash quota / out of memory).
+		static Resource accept(const ResourceAdvertisement& adv,
+		                       const Link& link,
+		                       Callbacks::concluded concluded = nullptr,
+		                       Callbacks::progress progress = nullptr);
+
+		// Receiver: send a RESOURCE_REQ packet asking for the next window
+		// of parts we haven't yet received. Called once after accept (the
+		// initial request), then again after each window completes.
+		void send_part_request();
 
 	private:
 		// Sender-side pipeline (step 5):
