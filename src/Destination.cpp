@@ -291,7 +291,9 @@ Packet Destination::announce(const Bytes& app_data, bool path_response, const In
 			//TRACEF("Destination::announce: random hash:  %s", random_hash.toHex().c_str());
 			//TRACEF("Destination::announce: app data:     %s", new_app_data.toHex().c_str());
 			//TRACEF("Destination::announce: app data text:%s", new_app_data.toString().c_str());
-			signed_data << _object->_hash << _object->_identity.get_public_key() << _object->_name_hash << random_hash;
+			// PATCH-OUTBOUND-RATCHET-V1
+			Bytes ratchet = Cryptography::random(Type::Identity::RATCHETSIZE/8);
+			signed_data << _object->_hash << _object->_identity.get_public_key() << _object->_name_hash << random_hash << ratchet;
 			if (new_app_data) {
 				signed_data << new_app_data;
 			}
@@ -300,7 +302,7 @@ Packet Destination::announce(const Bytes& app_data, bool path_response, const In
 			Bytes signature(_object->_identity.sign(signed_data));
 			//TRACEF("Destination::announce: signature:    %s", signature.toHex().c_str());
 
-			announce_data << _object->_identity.get_public_key() << _object->_name_hash << random_hash << signature;
+			announce_data << _object->_identity.get_public_key() << _object->_name_hash << random_hash << ratchet << signature;
 
 			if (new_app_data) {
 				announce_data << new_app_data;
@@ -327,7 +329,7 @@ Packet Destination::announce(const Bytes& app_data, bool path_response, const In
 		//TRACE("Destination::announce: creating announce packet...");
 		//p announce_packet = RNS.Packet(self, announce_data, RNS.Packet.ANNOUNCE, context = announce_context, attached_interface = attached_interface)
 		//Packet announce_packet(*this, announce_data, Type::Packet::ANNOUNCE, announce_context, Type::Transport::BROADCAST, Type::Packet::HEADER_1, nullptr, attached_interface);
-		Packet announce_packet(*this, attached_interface, announce_data, Type::Packet::ANNOUNCE, announce_context, Type::Transport::BROADCAST, Type::Packet::HEADER_1);
+		Packet announce_packet(*this, attached_interface, announce_data, Type::Packet::ANNOUNCE, announce_context, Type::Transport::BROADCAST, Type::Packet::HEADER_1, {Bytes::NONE}, true, Type::Packet::FLAG_SET);
 
 		if (send) {
 			TRACE("Destination::announce: sending announce packet...");
