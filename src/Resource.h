@@ -117,8 +117,78 @@ namespace RNS {
 	};
 
 
+	// Wire form of a RESOURCE_ADV packet body. The msgpack dict layout is
+	// dictated by interop with stock RNS (see RNS/Resource.py:1281-1307,
+	// 1341-1380). Field key letters and the f-flag bit positions are not
+	// negotiable — peers identify fields by exact key.
 	class ResourceAdvertisement {
+	public:
+		// Bit positions in the `f` flag byte
+		static const uint8_t FLAG_ENCRYPTED    = 0x01;  // bit 0
+		static const uint8_t FLAG_COMPRESSED   = 0x02;  // bit 1
+		static const uint8_t FLAG_SPLIT        = 0x04;  // bit 2
+		static const uint8_t FLAG_IS_REQUEST   = 0x08;  // bit 3
+		static const uint8_t FLAG_IS_RESPONSE  = 0x10;  // bit 4
+		static const uint8_t FLAG_HAS_METADATA = 0x20;  // bit 5
 
+		ResourceAdvertisement() = default;
+
+		// Serialize to a msgpack body suitable for use as RESOURCE_ADV packet
+		// data. Field order matches Python (t,d,n,h,r,o,i,l,q,f,m) so wire
+		// captures look identical to reference traffic, although peers don't
+		// rely on order.
+		Bytes pack() const;
+
+		// Parse a msgpack body into an advertisement. Returns false (and
+		// leaves the object in an indeterminate state) on malformed input or
+		// missing required keys.
+		bool unpack(const Bytes& body);
+
+		// Field accessors
+		uint32_t       transfer_size()  const { return _t; }
+		uint32_t       data_size()      const { return _d; }
+		uint16_t       parts()          const { return _n; }
+		const Bytes&   hash()           const { return _h; }
+		const Bytes&   random_hash()    const { return _r; }
+		const Bytes&   original_hash()  const { return _o; }
+		uint8_t        segment_index()  const { return _i; }
+		uint8_t        total_segments() const { return _l; }
+		const Bytes&   request_id()     const { return _q; }
+		uint8_t        flags()          const { return _f; }
+		const Bytes&   hashmap()        const { return _m; }
+
+		bool encrypted()    const { return (_f & FLAG_ENCRYPTED)    != 0; }
+		bool compressed()   const { return (_f & FLAG_COMPRESSED)   != 0; }
+		bool split()        const { return (_f & FLAG_SPLIT)        != 0; }
+		bool is_request()   const { return (_f & FLAG_IS_REQUEST)   != 0; }
+		bool is_response()  const { return (_f & FLAG_IS_RESPONSE)  != 0; }
+		bool has_metadata() const { return (_f & FLAG_HAS_METADATA) != 0; }
+
+		// Mutators (used by Resource sender to populate before pack())
+		void set_transfer_size(uint32_t t)        { _t = t; }
+		void set_data_size(uint32_t d)            { _d = d; }
+		void set_parts(uint16_t n)                { _n = n; }
+		void set_hash(const Bytes& h)             { _h = h; }
+		void set_random_hash(const Bytes& r)      { _r = r; }
+		void set_original_hash(const Bytes& o)    { _o = o; }
+		void set_segment_index(uint8_t i)         { _i = i; }
+		void set_total_segments(uint8_t l)        { _l = l; }
+		void set_request_id(const Bytes& q)       { _q = q; }
+		void set_flags(uint8_t f)                 { _f = f; }
+		void set_hashmap(const Bytes& m)          { _m = m; }
+
+	private:
+		uint32_t _t = 0;   // transfer size (on-wire, after encryption)
+		uint32_t _d = 0;   // data size (uncompressed; equal to _t since c=0)
+		uint16_t _n = 0;   // number of parts
+		Bytes    _h;       // 16 B resource hash
+		Bytes    _r;       // 4  B random salt
+		Bytes    _o;       // 16 B original (first-segment) hash; equals _h
+		uint8_t  _i = 1;   // segment index (always 1 in this port)
+		uint8_t  _l = 1;   // total segments (always 1 in this port)
+		Bytes    _q;       // empty (nil-on-wire) for non-request resources
+		uint8_t  _f = 0;   // flag byte (see FLAG_* above)
+		Bytes    _m;       // hashmap bytes (n * 4)
 	};
 
 }
