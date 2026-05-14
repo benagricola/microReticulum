@@ -638,6 +638,231 @@ void Resource::send_part_request() {
 	       exhausted == Type::Resource::HASHMAP_IS_EXHAUSTED ? "yes" : "no");
 }
 
+// --------------------------------------------------------------------------
+// Receiver part assembly + PRF emission (plan step 7)
+// --------------------------------------------------------------------------
+
+void Resource::on_part(const Packet& part_packet) {
+	assert(_object);
+	auto& d = *_object;
+	if (d._status != Type::Resource::TRANSFERRING) return;
+	if (!d._buffer) return;
+
+	// Identify the part by recomputing the map_hash with our random salt.
+	const Bytes& part_data = part_packet.data();
+	const Bytes map_hash =
+		Identity::full_hash(part_data + d._random_hash).left(Type::Resource::MAPHASH_LEN);
+
+	// Match against not-yet-received slots whose map_hash we know.
+	uint16_t matched = 0xFFFF;
+	for (uint16_t i = 0; i < d._parts_count; ++i) {
+		if (d._parts_received[i]) continue;
+		if (d._map_hashes[i].size() != Type::Resource::MAPHASH_LEN) continue;
+		if (d._map_hashes[i] == map_hash) { matched = i; break; }
+	}
+	if (matched == 0xFFFF) {
+		// Either a part for a different resource on the same link, or a
+		// duplicate of one we've already accepted. Silently ignore — the
+		// Python reference does the same.
+		return;
+	}
+
+	if (!d._buffer->write_part(matched, d._sdu, part_data)) {
+		ERRORF("Resource::on_part: buffer write failed for index %u", (unsigned)matched);
+		d._status = Type::Resource::FAILED;
+		return;
+	}
+	d._parts_received[matched] = true;
+	d._received_count++;
+	if (d._outstanding_parts > 0) d._outstanding_parts--;
+	d._last_activity_ms = Utilities::OS::ltime();
+
+	// Advance the consecutive-completed pointer as far as we can.
+	int32_t cp = d._consecutive_completed_height + 1;
+	while (cp < (int32_t)d._parts_count && d._parts_received[cp]) {
+		d._consecutive_completed_height = cp;
+		cp++;
+	}
+
+	// Fire progress callback (verified-bytes-so-far == received_count * sdu,
+	// approximate but good enough for the SPA progress bar).
+	if (d._callbacks._progress) {
+		try { d._callbacks._progress(*this); }
+		catch (const std::exception& e) {
+			ERRORF("Resource::on_part: progress callback threw: %s", e.what());
+		}
+	}
+
+	if (d._received_count >= d._parts_count) {
+		_assemble_and_deliver();
+	}
+	else if (d._outstanding_parts == 0) {
+		// Window done; request the next batch.
+		send_part_request();
+	}
+}
+
+void Resource::on_hashmap_update(const Bytes& body) {
+	assert(_object);
+	auto& d = *_object;
+	const uint8_t HASHLEN = Type::Identity::HASHLENGTH / 8;
+	if (body.size() < HASHLEN + 3) {
+		WARNING("RESOURCE_HMU body too short");
+		return;
+	}
+	// Body: 16 B hash + msgpack([segment, hashmap_bytes])
+	Bytes peer_hash(body.data(), HASHLEN);
+	if (peer_hash != d._hash) {
+		DEBUG("RESOURCE_HMU hash mismatch; ignoring");
+		return;
+	}
+	MsgPack::Unpacker unpacker;
+	unpacker.feed(body.data() + HASHLEN, body.size() - HASHLEN);
+	uint32_t segment = 0;
+	MsgPack::bin_t<uint8_t> hashmap_bytes;
+	if (!unpacker.from_array(segment, hashmap_bytes)) {
+		WARNING("RESOURCE_HMU msgpack unpack failed");
+		return;
+	}
+
+	const uint16_t HMU_MAX = Type::Resource::ResourceAdvertisement::HASHMAP_MAX_LEN;
+	const size_t seg_start_index = (size_t)segment * HMU_MAX;
+	const size_t entries = hashmap_bytes.size() / Type::Resource::MAPHASH_LEN;
+	for (size_t i = 0; i < entries; ++i) {
+		const size_t slot = seg_start_index + i;
+		if (slot >= d._parts_count) break;
+		if (d._map_hashes[slot].empty()) {
+			d._map_hashes[slot] = Bytes(hashmap_bytes.data() + i * Type::Resource::MAPHASH_LEN,
+			                            Type::Resource::MAPHASH_LEN);
+		}
+	}
+	DEBUGF("RESOURCE_HMU applied segment=%u (%u hashes)",
+	       (unsigned)segment, (unsigned)entries);
+}
+
+void Resource::on_proof(const Bytes& proof) {
+	assert(_object);
+	auto& d = *_object;
+	if (!d._initiator) return;
+	if (d._status != Type::Resource::ADVERTISED &&
+	    d._status != Type::Resource::TRANSFERRING &&
+	    d._status != Type::Resource::AWAITING_PROOF) return;
+
+	if (proof == d._expected_proof) {
+		d._status = Type::Resource::COMPLETE;
+		d._last_activity_ms = Utilities::OS::ltime();
+		DEBUGF("Resource: PRF matched, COMPLETE hash=%s", d._hash.toHex().c_str());
+		if (d._callbacks._concluded) {
+			try { d._callbacks._concluded(*this); }
+			catch (const std::exception& e) {
+				ERRORF("Resource::on_proof: concluded callback threw: %s", e.what());
+			}
+		}
+	}
+	else {
+		d._status = Type::Resource::CORRUPT;
+		WARNINGF("Resource: PRF mismatch for %s — peer's hash differed from our expected_proof",
+		         d._hash.toHex().c_str());
+		if (d._callbacks._concluded) {
+			try { d._callbacks._concluded(*this); }
+			catch (const std::exception& e) {
+				ERRORF("Resource::on_proof: concluded callback threw: %s", e.what());
+			}
+		}
+	}
+}
+
+const Bytes& Resource::plaintext() const {
+	assert(_object);
+	// Receiver: post-assembly decrypted body. Sender: empty.
+	if (!_object->_initiator) return _object->_plaintext;
+	return _object->_encrypted;
+}
+
+void Resource::_assemble_and_deliver() {
+	auto& d = *_object;
+	d._status = Type::Resource::ASSEMBLING;
+	d._last_activity_ms = Utilities::OS::ltime();
+
+	// Verify the resource hash. We hash the assembled ciphertext + the
+	// random_hash salt and truncate to 16 bytes, matching the sender's
+	// `Identity::truncated_hash(encrypted + random_hash)`.
+	const Bytes assembled = d._buffer->read_all();
+	const Bytes computed_hash =
+		Identity::truncated_hash(assembled + d._random_hash);
+	if (computed_hash != d._hash) {
+		WARNINGF("Resource: assembled hash mismatch for %s — corrupt",
+		         d._hash.toHex().c_str());
+		d._status = Type::Resource::CORRUPT;
+		if (d._callbacks._concluded) {
+			try { d._callbacks._concluded(*this); }
+			catch (const std::exception& e) {
+				ERRORF("Resource::_assemble: concluded callback threw: %s", e.what());
+			}
+		}
+		return;
+	}
+
+	// Decrypt via the Link's key, then strip the random_hash prefix the
+	// sender prepended before encryption. Result is the original payload.
+	Bytes decrypted;
+	try {
+		decrypted = d._link.decrypt(assembled);
+	}
+	catch (const std::exception& e) {
+		ERRORF("Resource: Link.decrypt failed: %s", e.what());
+		d._status = Type::Resource::CORRUPT;
+		if (d._callbacks._concluded) {
+			try { d._callbacks._concluded(*this); }
+			catch (const std::exception& cb_e) {
+				ERRORF("Resource::_assemble: concluded callback threw: %s", cb_e.what());
+			}
+		}
+		return;
+	}
+	if (decrypted.size() < Type::Resource::RANDOM_HASH_SIZE) {
+		ERROR("Resource: decrypted body too short to contain random_hash prefix");
+		d._status = Type::Resource::CORRUPT;
+		return;
+	}
+	d._plaintext = Bytes(decrypted.data() + Type::Resource::RANDOM_HASH_SIZE,
+	                     decrypted.size() - Type::Resource::RANDOM_HASH_SIZE);
+
+	d._status = Type::Resource::COMPLETE;
+	d._last_activity_ms = Utilities::OS::ltime();
+	DEBUGF("Resource: assembled %s (%zu plaintext bytes)",
+	       d._hash.toHex().c_str(), d._plaintext.size());
+
+	// Send the PRF before firing the callback — the sender wants to know
+	// we got the bytes before we go off and process them, otherwise its
+	// MAX_RETRIES timer might fire while we're still on the callback.
+	_send_proof();
+
+	if (d._callbacks._concluded) {
+		try { d._callbacks._concluded(*this); }
+		catch (const std::exception& e) {
+			ERRORF("Resource::_assemble: concluded callback threw: %s", e.what());
+		}
+	}
+}
+
+void Resource::_send_proof() {
+	auto& d = *_object;
+	// PRF body = SHA-256(assembled || hash). The sender pre-computed the
+	// same value at build time as _expected_proof.
+	const Bytes proof = Identity::full_hash(d._buffer->read_all() + d._hash);
+	try {
+		Packet prf_packet(d._link, proof,
+		                  Type::Packet::PROOF, Type::Packet::RESOURCE_PRF);
+		prf_packet.send();
+	}
+	catch (const std::exception& e) {
+		ERRORF("Resource::_send_proof: PRF send failed: %s", e.what());
+		return;
+	}
+	DEBUGF("Resource: sent PRF for %s", d._hash.toHex().c_str());
+}
+
 void Resource::_send_hmu(uint8_t segment_index) {
 	assert(_object);
 	auto& d = *_object;

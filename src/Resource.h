@@ -91,6 +91,28 @@ namespace RNS {
 		// initial request), then again after each window completes.
 		void send_part_request();
 
+		// Receiver: ingest an incoming RESOURCE part packet. Computes the
+		// part's map_hash, locates the corresponding slot, writes data
+		// into the ResourceBuffer at part_index*sdu. If the window is now
+		// fully satisfied, fires the next REQ; if all parts have arrived,
+		// triggers assembly + PRF emission. Silently ignores parts whose
+		// map_hash doesn't match anything we expect.
+		void on_part(const Packet& part_packet);
+
+		// Receiver: ingest an incoming RESOURCE_HMU body (16-byte hash
+		// prefix + msgpack[segment, hashmap_bytes]). Extends our
+		// _map_hashes vector with the additional segment's map_hashes.
+		void on_hashmap_update(const Bytes& body);
+
+		// Sender-only: handle an incoming RESOURCE_PRF (32 B SHA-256).
+		// Verifies against _expected_proof, transitions to COMPLETE or
+		// CORRUPT, fires the conclusion callback.
+		void on_proof(const Bytes& proof);
+
+		// Computed plaintext after assemble succeeds (receiver side).
+		// Equivalent to data() for senders. Empty before assembly.
+		const Bytes& plaintext() const;
+
 	private:
 		// Sender-side pipeline (step 5):
 		//  * encrypt the plaintext via the parent Link
@@ -112,6 +134,17 @@ namespace RNS {
 		// the REQ handler reactively (step 8) when the receiver asks
 		// for more.
 		void _send_hmu(uint8_t segment_index);
+
+		// Receiver-only: called from on_part when all parts have arrived.
+		// Hashes the assembled buffer + random_hash, compares to the
+		// advertised _hash, then decrypts via the Link, strips the
+		// random_hash prefix, stores the plaintext in _plaintext for
+		// callback retrieval, fires the concluded callback, sends PRF.
+		void _assemble_and_deliver();
+
+		// Receiver-only: emit the RESOURCE_PRF packet so the sender
+		// can transition to COMPLETE.
+		void _send_proof();
 
 	public:
 //p def hashmap_update_packet(self, plaintext):

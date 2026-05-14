@@ -45,6 +45,10 @@ private:
 	// Sender side: _encrypted holds the post-Link-encrypt bytes after build().
 	// Receiver side: payload is streamed into _buffer (heap or flash); _encrypted unused.
 	Bytes _encrypted;
+	// Receiver side: post-assembly decrypted body (the LXMF wire bytes,
+	// after the 4-byte random_hash prefix is stripped). data() returns
+	// this on the receiver. Empty before assembly completes.
+	Bytes _plaintext;
 	std::unique_ptr<ResourceBuffer> _buffer;
 	// Sender side: pre-packed RESOURCE packet bodies + their map_hashes, indexed by part.
 	std::vector<Bytes> _parts;
