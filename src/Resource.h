@@ -72,6 +72,28 @@ namespace RNS {
 	public:
 	    //p static def accept(advertisement_packet, callback=None, progress_callback = None, request_id = None):
 
+	private:
+		// Sender-side pipeline (step 5):
+		//  * encrypt the plaintext via the parent Link
+		//  * compute resource_hash, random_hash, expected_proof
+		//  * slice into parts; compute map_hash per part; concat into the
+		//    full hashmap blob
+		// Returns false on Link-MDU-not-known or size-cap violation; the
+		// constructor leaves status=NONE in that case so the caller (LXMF
+		// dispatch) can choose how to handle a build failure.
+		bool _build_outgoing(uint16_t link_mdu);
+
+		// Send the RESOURCE_ADV packet plus any follow-up RESOURCE_HMU
+		// packets (one per hashmap segment beyond the first), register
+		// the resource with the Link, transition to ADVERTISED.
+		void _send_advertisement();
+
+		// Emit a single RESOURCE_HMU packet for segment >= 1 of the
+		// hashmap. Called by _send_advertisement() proactively and by
+		// the REQ handler reactively (step 8) when the receiver asks
+		// for more.
+		void _send_hmu(uint8_t segment_index);
+
 	public:
 //p def hashmap_update_packet(self, plaintext):
 //p def hashmap_update(self, segment, hashmap):

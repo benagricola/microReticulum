@@ -18,7 +18,11 @@
 #include "Reticulum.h"
 #include "Transport.h"
 #include "Packet.h"
+#include "Identity.h"
+#include "Cryptography/Hashes.h"
 #include "Log.h"
+
+#include <MsgPack.h>
 
 #include <algorithm>
 #include <cstring>
@@ -319,12 +323,10 @@ Resource::Resource(const Bytes& data, const Link& link, bool advertise /*= true*
 {
 	assert(_object);
 	MEM("Resource object created");
-	// Sender-side primary constructor. step 4 only initialises the data
-	// type; the hashmap build + ADV send happens in step 5.
 	_object->_initiator         = true;
 	_object->_callbacks._concluded = callback;
 	_object->_callbacks._progress  = progress_callback;
-	_object->_encrypted         = data;
+	_object->_encrypted         = data;     // _build_outgoing replaces this with the ciphertext
 	_object->_segment_index     = (uint8_t)segment_index;
 	_object->_total_segments    = 1;        // single-segment port; always 1
 	_object->_is_split          = false;
@@ -338,6 +340,201 @@ Resource::Resource(const Bytes& data, const Link& link, bool advertise /*= true*
 	_object->_timeout           = timeout;
 	_object->_status            = Type::Resource::NONE;
 	_object->_last_activity_ms  = Utilities::OS::ltime();
+
+	if (advertise) {
+		const uint16_t link_mdu = const_cast<Link&>(link).get_mdu();
+		if (_build_outgoing(link_mdu)) {
+			_send_advertisement();
+		}
+		else {
+			ERROR("Resource: _build_outgoing failed; resource not advertised");
+		}
+	}
+}
+
+
+// --------------------------------------------------------------------------
+// Sender pipeline (plan step 5)
+//
+// _build_outgoing prepares everything offline: encrypts the plaintext via
+// the parent Link, generates the random_hash salt, computes the resource
+// hash and expected proof, slices the ciphertext into parts of sdu bytes,
+// computes a 4-byte map_hash per part, and concatenates all map_hashes
+// into _map_full. After this method returns the resource is ready to be
+// announced; no packets have been sent yet.
+//
+// _send_advertisement sends the RESOURCE_ADV (carrying the first
+// HASHMAP_MAX_LEN map_hashes) plus follow-up RESOURCE_HMU packets for any
+// additional hashmap segments, then transitions to ADVERTISED and
+// registers with the Link's outgoing-resources set.
+//
+// The HMU send loop in _send_advertisement is proactive: rather than wait
+// for the receiver to send REQ with exhausted=0xFF, we ship every HMU
+// immediately after the ADV. The receiver's hashmap then fills in as the
+// HMU packets arrive, and the receiver never has to ask for more. The
+// reactive REQ-with-exhausted path stays implemented (step 8) for
+// retry / out-of-order cases, but in the happy path the receiver gets
+// the full hashmap up-front.
+// --------------------------------------------------------------------------
+
+bool Resource::_build_outgoing(uint16_t link_mdu) {
+	assert(_object);
+	auto& d = *_object;
+	if (link_mdu == 0) {
+		ERROR("Resource: link MDU is zero (link not active?)");
+		return false;
+	}
+
+	// Random salt prepended to the plaintext before encryption. Makes the
+	// per-part map_hashes unpredictable to anyone without the Link key.
+	Bytes random_hash = Identity::get_random_hash().left(Type::Resource::RANDOM_HASH_SIZE);
+	d._random_hash = random_hash;
+
+	const Bytes plaintext = d._encrypted;   // the constructor stashed plaintext here
+	Bytes salted;
+	salted.append(random_hash);
+	salted.append(plaintext);
+
+	// Encrypt via the Link's derived key (Fernet over AES-128-CBC).
+	const Bytes encrypted = d._link.encrypt(salted);
+	d._encrypted    = encrypted;
+	d._transfer_size = (uint32_t)encrypted.size();
+	d._data_size     = d._transfer_size;   // _d == _t (no compression in this port)
+
+	if (d._transfer_size > Type::Resource::FIRMWARE_MAX_INCOMING) {
+		ERRORF("Resource: transfer size %u exceeds firmware cap %u",
+		       (unsigned)d._transfer_size,
+		       (unsigned)Type::Resource::FIRMWARE_MAX_INCOMING);
+		return false;
+	}
+
+	// Resource hash and the proof the receiver will return on completion.
+	d._hash           = Identity::truncated_hash(encrypted + random_hash);
+	d._expected_proof = Identity::full_hash(encrypted + d._hash);
+	if (d._original_hash.empty()) d._original_hash = d._hash;
+
+	// Slice into parts. Each part's map_hash = sha256(part_data || random_hash)[:4].
+	const uint16_t sdu = link_mdu;
+	d._sdu = sdu;
+	const uint32_t n_parts32 = (d._transfer_size + sdu - 1) / sdu;
+	if (n_parts32 > 0xFFFF) {
+		ERRORF("Resource: too many parts: %u", (unsigned)n_parts32);
+		return false;
+	}
+	const uint16_t n_parts = (uint16_t)n_parts32;
+	d._parts_count = n_parts;
+
+	d._parts.clear();      d._parts.reserve(n_parts);
+	d._map_hashes.clear(); d._map_hashes.reserve(n_parts);
+	d._map_full = Bytes();
+
+	for (uint16_t i = 0; i < n_parts; ++i) {
+		const size_t offset = (size_t)i * sdu;
+		const size_t length = std::min((size_t)sdu, (size_t)(d._transfer_size - offset));
+		Bytes part_data(encrypted.data() + offset, length);
+
+		const Bytes map_hash =
+			Identity::full_hash(part_data + random_hash).left(Type::Resource::MAPHASH_LEN);
+
+		d._parts.push_back(part_data);
+		d._map_hashes.push_back(map_hash);
+		d._map_full.append(map_hash);
+	}
+
+	return true;
+}
+
+void Resource::_send_advertisement() {
+	assert(_object);
+	auto& d = *_object;
+
+	const uint16_t HMU_MAX = Type::Resource::ResourceAdvertisement::HASHMAP_MAX_LEN;
+
+	ResourceAdvertisement adv;
+	adv.set_transfer_size(d._transfer_size);
+	adv.set_data_size(d._data_size);
+	adv.set_parts(d._parts_count);
+	adv.set_hash(d._hash);
+	adv.set_random_hash(d._random_hash);
+	adv.set_original_hash(d._original_hash);
+	adv.set_segment_index(d._segment_index);
+	adv.set_total_segments(d._total_segments);
+	adv.set_request_id(d._request_id);
+
+	uint8_t flags = 0;
+	if (d._encrypted_flag) flags |= ResourceAdvertisement::FLAG_ENCRYPTED;
+	if (d._compressed)     flags |= ResourceAdvertisement::FLAG_COMPRESSED;
+	if (d._is_split)       flags |= ResourceAdvertisement::FLAG_SPLIT;
+	if (d._is_request)     flags |= ResourceAdvertisement::FLAG_IS_REQUEST;
+	if (d._is_response)    flags |= ResourceAdvertisement::FLAG_IS_RESPONSE;
+	if (d._has_metadata)   flags |= ResourceAdvertisement::FLAG_HAS_METADATA;
+	adv.set_flags(flags);
+
+	// ADV carries the first HMU_MAX map_hashes; follow-ups go via HMU.
+	const size_t map_first_len =
+		std::min((size_t)HMU_MAX * Type::Resource::MAPHASH_LEN, (size_t)d._map_full.size());
+	adv.set_hashmap(Bytes(d._map_full.data(), map_first_len));
+
+	const Bytes adv_body = adv.pack();
+	try {
+		Packet adv_packet(d._link, adv_body, Type::Packet::DATA, Type::Packet::RESOURCE_ADV);
+		adv_packet.send();
+	}
+	catch (const std::exception& e) {
+		ERRORF("Resource: ADV send failed: %s", e.what());
+		d._status = Type::Resource::FAILED;
+		return;
+	}
+
+	d._adv_sent_ms     = Utilities::OS::ltime();
+	d._started_ms      = d._adv_sent_ms;
+	d._last_activity_ms = d._adv_sent_ms;
+	d._status          = Type::Resource::ADVERTISED;
+	d._adv_retries_left = Type::Resource::MAX_ADV_RETRIES;
+
+	DEBUGF("Resource: sent ADV n=%u t=%u hash=%s",
+	       (unsigned)d._parts_count, (unsigned)d._transfer_size,
+	       d._hash.toHex().c_str());
+
+	// Proactively emit HMU packets for the rest of the hashmap.
+	const uint16_t n_segments = (uint16_t)((d._parts_count + HMU_MAX - 1) / HMU_MAX);
+	for (uint16_t seg = 1; seg < n_segments; ++seg) {
+		_send_hmu((uint8_t)seg);
+	}
+
+	d._link.register_outgoing_resource(*this);
+}
+
+void Resource::_send_hmu(uint8_t segment_index) {
+	assert(_object);
+	auto& d = *_object;
+	const uint16_t HMU_MAX = Type::Resource::ResourceAdvertisement::HASHMAP_MAX_LEN;
+
+	const size_t start = (size_t)segment_index * HMU_MAX * Type::Resource::MAPHASH_LEN;
+	if (start >= d._map_full.size()) return;
+	const size_t end =
+		std::min(d._map_full.size(), start + (size_t)HMU_MAX * Type::Resource::MAPHASH_LEN);
+
+	Bytes hashmap_seg(d._map_full.data() + start, end - start);
+
+	// Body: 16 B resource hash || msgpack([segment_index, hashmap_seg])
+	MsgPack::Packer packer;
+	packer.to_array((uint32_t)segment_index, hashmap_seg);
+	Bytes body;
+	body.append(d._hash);
+	body.append(Bytes(packer.data(), packer.size()));
+
+	try {
+		Packet hmu_packet(d._link, body, Type::Packet::DATA, Type::Packet::RESOURCE_HMU);
+		hmu_packet.send();
+	}
+	catch (const std::exception& e) {
+		ERRORF("Resource: HMU send failed (seg=%u): %s", segment_index, e.what());
+		return;
+	}
+	DEBUGF("Resource: sent HMU segment=%u (%u hashes)",
+	       segment_index,
+	       (unsigned)((end - start) / Type::Resource::MAPHASH_LEN));
 }
 
 

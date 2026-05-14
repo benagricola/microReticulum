@@ -49,6 +49,10 @@ private:
 	// Sender side: pre-packed RESOURCE packet bodies + their map_hashes, indexed by part.
 	std::vector<Bytes> _parts;
 	std::vector<Bytes> _map_hashes;
+	// Sender side: full hashmap blob (n * 4 bytes). _map_hashes is the
+	// per-part split form, _map_full is the concatenated form used to
+	// fill the ADV's `m` field and slice into HMU segments.
+	Bytes _map_full;
 	// Receiver side: per-part received flag and sliding window state.
 	std::vector<bool>  _parts_received;
 
