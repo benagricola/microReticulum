@@ -992,7 +992,140 @@ void Resource::_send_hmu(uint8_t segment_index) {
 void Resource::validate_proof(const Bytes& proof_data) {
 }
 
+// --------------------------------------------------------------------------
+// Cancel paths + timeout watchdog (plan step 9)
+// --------------------------------------------------------------------------
+
 void Resource::cancel() {
+	assert(_object);
+	auto& d = *_object;
+	if (d._status == Type::Resource::COMPLETE ||
+	    d._status == Type::Resource::FAILED ||
+	    d._status == Type::Resource::CORRUPT) return;
+
+	// Sender abandons -> send ICL; receiver abandons -> send RCL.
+	const Type::Packet::context_types ctx =
+		d._initiator ? Type::Packet::RESOURCE_ICL : Type::Packet::RESOURCE_RCL;
+	try {
+		Packet cancel_packet(d._link, d._hash, Type::Packet::DATA, ctx);
+		cancel_packet.send();
+	}
+	catch (const std::exception& e) {
+		WARNINGF("Resource::cancel: cancel packet send failed: %s", e.what());
+	}
+	d._status = Type::Resource::FAILED;
+	if (d._buffer) d._buffer->discard();
+	DEBUGF("Resource: cancelled (%s side) hash=%s",
+	       d._initiator ? "sender" : "receiver", d._hash.toHex().c_str());
+
+	if (d._callbacks._concluded) {
+		try { d._callbacks._concluded(*this); }
+		catch (const std::exception& e) {
+			ERRORF("Resource::cancel: concluded callback threw: %s", e.what());
+		}
+	}
+}
+
+void Resource::on_initiator_cancel(const Bytes& sender_hash) {
+	assert(_object);
+	auto& d = *_object;
+	if (d._initiator) return;       // ICL is for receivers
+	if (sender_hash != d._hash) return;
+	if (d._status == Type::Resource::COMPLETE ||
+	    d._status == Type::Resource::FAILED ||
+	    d._status == Type::Resource::CORRUPT) return;
+
+	NOTICEF("Resource: received ICL (sender abandoned) hash=%s",
+	        d._hash.toHex().c_str());
+	d._status = Type::Resource::FAILED;
+	if (d._buffer) d._buffer->discard();
+	if (d._callbacks._concluded) {
+		try { d._callbacks._concluded(*this); }
+		catch (const std::exception& e) {
+			ERRORF("Resource::on_initiator_cancel: callback threw: %s", e.what());
+		}
+	}
+}
+
+void Resource::on_receiver_cancel(const Bytes& receiver_hash) {
+	assert(_object);
+	auto& d = *_object;
+	if (!d._initiator) return;       // RCL is for senders
+	if (receiver_hash != d._hash) return;
+	if (d._status == Type::Resource::COMPLETE ||
+	    d._status == Type::Resource::FAILED ||
+	    d._status == Type::Resource::CORRUPT) return;
+
+	NOTICEF("Resource: received RCL (receiver refused) hash=%s",
+	        d._hash.toHex().c_str());
+	d._status = Type::Resource::FAILED;
+	if (d._callbacks._concluded) {
+		try { d._callbacks._concluded(*this); }
+		catch (const std::exception& e) {
+			ERRORF("Resource::on_receiver_cancel: callback threw: %s", e.what());
+		}
+	}
+}
+
+void Resource::tick(uint64_t now_ms) {
+	assert(_object);
+	auto& d = *_object;
+	if (d._status == Type::Resource::COMPLETE ||
+	    d._status == Type::Resource::FAILED ||
+	    d._status == Type::Resource::CORRUPT) return;
+
+	// Compute the per-window timeout. RTT defaults to a generous fallback
+	// when the Link hasn't measured one yet (link just established).
+	double rtt = const_cast<Link&>(d._link).rtt();
+	if (rtt <= 0.0) rtt = 2.0;
+	const uint64_t window_timeout_ms =
+		(uint64_t)(rtt * Type::Resource::PART_TIMEOUT_FACTOR_AFTER_RTT * 1000.0);
+	const uint64_t adv_timeout_ms =
+		(uint64_t)(rtt * Type::Resource::PART_TIMEOUT_FACTOR * 1000.0);
+	const uint64_t elapsed = now_ms - d._last_activity_ms;
+
+	if (d._initiator) {
+		// Sender. ADVERTISED waiting for REQ: re-send ADV up to
+		// MAX_ADV_RETRIES. TRANSFERRING / AWAITING_PROOF: just count
+		// retries; receiver is responsible for re-REQing.
+		if (d._status == Type::Resource::ADVERTISED && elapsed > adv_timeout_ms) {
+			if (d._adv_retries_left > 0) {
+				d._adv_retries_left--;
+				DEBUGF("Resource: ADV retry (%u left)", (unsigned)d._adv_retries_left);
+				_send_advertisement();
+			}
+			else {
+				NOTICEF("Resource: ADV timeout exhausted, FAILED hash=%s",
+				        d._hash.toHex().c_str());
+				cancel();
+			}
+		}
+		else if ((d._status == Type::Resource::TRANSFERRING ||
+		          d._status == Type::Resource::AWAITING_PROOF) &&
+		         elapsed > window_timeout_ms * Type::Resource::MAX_RETRIES) {
+			NOTICEF("Resource: transfer timeout, FAILED hash=%s",
+			        d._hash.toHex().c_str());
+			cancel();
+		}
+	}
+	else {
+		// Receiver. Re-request the current window if we've been waiting
+		// too long; FAIL if MAX_RETRIES rounds have been exhausted.
+		if (d._status == Type::Resource::TRANSFERRING && elapsed > window_timeout_ms) {
+			if (d._retries_left > 0) {
+				d._retries_left--;
+				DEBUGF("Resource: REQ retry (%u left)", (unsigned)d._retries_left);
+				// outstanding_parts is reset by send_part_request itself
+				d._outstanding_parts = 0;
+				send_part_request();
+			}
+			else {
+				NOTICEF("Resource: receive timeout, FAILED hash=%s",
+				        d._hash.toHex().c_str());
+				cancel();
+			}
+		}
+	}
 }
 
 /*

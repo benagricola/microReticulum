@@ -116,6 +116,23 @@ namespace RNS {
 		// CORRUPT, fires the conclusion callback.
 		void on_proof(const Bytes& proof);
 
+		// Receiver: incoming RESOURCE_ICL (sender abandoned). Releases
+		// state; fires concluded callback with FAILED status.
+		void on_initiator_cancel(const Bytes& sender_hash);
+
+		// Sender: incoming RESOURCE_RCL (receiver refused/abandoned).
+		// Releases state; fires concluded callback with FAILED status.
+		void on_receiver_cancel(const Bytes& receiver_hash);
+
+		// Periodic-tick watchdog. The caller (Link / firmware main loop)
+		// invokes this every loop pass with the current OS::ltime(). The
+		// resource checks how long it's been since _last_activity_ms and
+		// retries / fails as appropriate, with up to MAX_RETRIES rounds
+		// for parts (receiver) or MAX_ADV_RETRIES re-advertisements
+		// (sender). Once status is COMPLETE / FAILED / CORRUPT this is
+		// a no-op.
+		void tick(uint64_t now_ms);
+
 		// Computed plaintext after assemble succeeds (receiver side).
 		// Equivalent to data() for senders. Empty before assembly.
 		const Bytes& plaintext() const;

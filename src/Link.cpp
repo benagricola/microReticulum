@@ -1359,6 +1359,38 @@ void Link::receive(const Packet& packet) {
 					}
 					break;
 				}
+				// --- RESOURCE_ICL dispatch (plan step 9) ---
+				// Sender abandoned the resource. Body is the 16-byte hash.
+				case Type::Packet::RESOURCE_ICL:
+				{
+					const Bytes plaintext = decrypt(packet.data());
+					if (!plaintext) break;
+					Bytes resource_hash =
+						plaintext.left(Type::Identity::HASHLENGTH / 8);
+					for (auto& resource : _object->_incoming_resources) {
+						if (resource.hash() == resource_hash) {
+							const_cast<Resource&>(resource).on_initiator_cancel(resource_hash);
+							break;
+						}
+					}
+					break;
+				}
+				// --- RESOURCE_RCL dispatch (plan step 9) ---
+				// Receiver refused/abandoned. Body is the 16-byte hash.
+				case Type::Packet::RESOURCE_RCL:
+				{
+					const Bytes plaintext = decrypt(packet.data());
+					if (!plaintext) break;
+					Bytes resource_hash =
+						plaintext.left(Type::Identity::HASHLENGTH / 8);
+					for (auto& resource : _object->_outgoing_resources) {
+						if (resource.hash() == resource_hash) {
+							const_cast<Resource&>(resource).on_receiver_cancel(resource_hash);
+							break;
+						}
+					}
+					break;
+				}
 				// --- RESOURCE_REQ dispatch (plan step 8) ---
 				// Decrypt the body, parse out the resource hash, route to
 				// the matching outgoing resource so it can send the
@@ -1611,6 +1643,37 @@ void Link::cancel_incoming_resource(const Resource& resource) {
 bool Link::ready_for_new_resource() {
 	assert(_object);
 	return (_object->_outgoing_resources.size() > 0);
+}
+
+void Link::tick_resources(uint64_t now_ms) {
+	assert(_object);
+	// Snapshot the sets first: tick() may call cancel() which fires the
+	// concluded callback, which may unregister the resource from the
+	// Link and invalidate the iterator.
+	std::vector<Resource> incoming(_object->_incoming_resources.begin(),
+	                               _object->_incoming_resources.end());
+	std::vector<Resource> outgoing(_object->_outgoing_resources.begin(),
+	                               _object->_outgoing_resources.end());
+	for (auto& r : incoming) r.tick(now_ms);
+	for (auto& r : outgoing) r.tick(now_ms);
+
+	// Sweep terminal resources out of the in-flight sets so we don't
+	// keep ticking them.
+	auto sweep = [](std::set<Resource>& set) {
+		for (auto it = set.begin(); it != set.end(); ) {
+			auto st = it->status();
+			if (st == Type::Resource::COMPLETE ||
+			    st == Type::Resource::FAILED ||
+			    st == Type::Resource::CORRUPT) {
+				it = set.erase(it);
+			}
+			else {
+				++it;
+			}
+		}
+	};
+	sweep(_object->_incoming_resources);
+	sweep(_object->_outgoing_resources);
 }
 
 std::string Link::toString() const {

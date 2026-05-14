@@ -239,6 +239,11 @@ namespace RNS {
 		void cancel_outgoing_resource(const Resource& resource);
 		void cancel_incoming_resource(const Resource& resource);
 		bool ready_for_new_resource();
+		// Drive watchdog timeouts on every in-flight Resource attached
+		// to this Link. Called once per Transport::jobs() pass for each
+		// active Link; resources transition to FAILED if their windows
+		// time out. Plan step 9.
+		void tick_resources(uint64_t now_ms);
 
 		//void __str__();
 		std::string toString() const;

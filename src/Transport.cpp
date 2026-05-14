@@ -364,9 +364,15 @@ DestinationEntry empty_destination_entry;
 					}
 				}
 				std::set<Link> active_links(_active_links);
+				const uint64_t now_ms = OS::ltime();
 				for (auto& link : active_links) {
 					if (link.status() == Type::Link::CLOSED) {
 						_active_links.erase(link);
+					}
+					else {
+						// Drive the watchdog on any in-flight resources
+						// attached to this link. Plan step 9.
+						const_cast<Link&>(link).tick_resources(now_ms);
 					}
 				}
 
