@@ -428,20 +428,26 @@ Recall last heard app_data for a destination hash.
 			//TRACEF("Identity::validate_announce: name_hash:        %s", name_hash.toHex().c_str());
 			Bytes random_hash = packet.data().mid(KEYSIZE/8 + NAME_HASH_LENGTH/8, RANDOM_HASH_LENGTH/8);
 			//TRACEF("Identity::validate_announce: random_hash:      %s", random_hash.toHex().c_str());
-			Bytes signature = packet.data().mid(KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8, SIGLENGTH/8);
-			//TRACEF("Identity::validate_announce: signature:        %s", signature.toHex().c_str());
-			Bytes app_data;
-			if (packet.data().size() > (KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8 + SIGLENGTH/8)) {
-				app_data = packet.data().mid(KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8 + SIGLENGTH/8);
+			// PATCH-RATCHET-V1
+			const size_t header_len = KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8;
+			const bool has_ratchet = (packet.context_flag() == RNS::Type::Packet::FLAG_SET);
+			Bytes ratchet;
+			if (has_ratchet && packet.data().size() >= header_len + RATCHETSIZE/8) {
+				ratchet = packet.data().mid(header_len, RATCHETSIZE/8);
 			}
-			//TRACEF("Identity::validate_announce: app_data:         %s", app_data.toHex().c_str());
-			//TRACEF("Identity::validate_announce: app_data text:    %s", app_data.toString().c_str());
+			const size_t sig_offset = header_len + (has_ratchet ? RATCHETSIZE/8 : 0);
+			Bytes signature = packet.data().mid(sig_offset, SIGLENGTH/8);
+			Bytes app_data;
+			if (packet.data().size() > (sig_offset + SIGLENGTH/8)) {
+				app_data = packet.data().mid(sig_offset + SIGLENGTH/8);
+			}
 
 			Bytes signed_data;
-			signed_data << packet.destination_hash() << public_key << name_hash << random_hash+app_data;
-			//TRACEF("Identity::validate_announce: signed_data:      %s", signed_data.toHex().c_str());
+			signed_data << packet.destination_hash() << public_key << name_hash << random_hash;
+			if (has_ratchet) signed_data << ratchet;
+			signed_data << app_data;
 
-			if (packet.data().size() <= KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8 + SIGLENGTH/8) {
+			if (packet.data().size() <= sig_offset + SIGLENGTH/8) {
 				app_data.clear();
 			}
 
