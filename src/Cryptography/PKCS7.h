@@ -48,10 +48,10 @@ namespace RNS { namespace Cryptography {
 			// create zero-filled byte padding array of size padlen
 			//p v = bytes([padlen])
 			//uint8_t pad[padlen] = {0};
+			// PATCH-PKCS7-PAD-V1
 			uint8_t pad[padlen];
-			memset(pad, 0, padlen);
-			// set last byte of padding array to size of padding
-			pad[padlen-1] = (uint8_t)padlen;
+			// Standard PKCS7: every padding byte equals padlen.
+			memset(pad, (uint8_t)padlen, padlen);
 			// concatenate data with padding
 			//p return data+v*padlen
 			data.append(pad, padlen);
