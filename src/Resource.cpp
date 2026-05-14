@@ -1210,5 +1210,10 @@ const size_t Resource::total_size() const {
 	return _object->_data_size;
 }
 
+const Link& Resource::link() const {
+	assert(_object);
+	return _object->_link;
+}
+
 // setters
 

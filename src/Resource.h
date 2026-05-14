@@ -206,6 +206,11 @@ namespace RNS {
 		const Type::Resource::status status() const;
 		const size_t size() const;
 		const size_t total_size() const;
+		// The underlying Link this resource transfers over. Used by callers
+		// of resource_concluded_callback to identify which link the now-
+		// terminal resource belonged to (Link is otherwise not in the
+		// callback parameter list).
+		const Link& link() const;
 
 		// setters
 
