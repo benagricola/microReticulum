@@ -29,6 +29,15 @@
 #include <string.h>
 
 using namespace RNS;
+
+// PATCH-INBOUND-RATCHET-V1
+// Provider hook: returns the index-th (0=newest) ratchet privkey
+// for the identity being decrypted to. Wired from the LXMF gateway.
+typedef bool (*inbound_ratchet_privkey_fn)(const uint8_t* identity_hash, size_t index, uint8_t* out_privkey_32);
+static inbound_ratchet_privkey_fn _lxmf_inbound_ratchet_provider = nullptr;
+extern "C" void rns_set_inbound_ratchet_provider(inbound_ratchet_privkey_fn fn) {
+    _lxmf_inbound_ratchet_provider = fn;
+}
 using namespace RNS::Type::Identity;
 using namespace RNS::Cryptography;
 using namespace RNS::Utilities;
@@ -589,40 +598,39 @@ const Bytes Identity::decrypt(const Bytes& ciphertext_token) const {
 		NOTICEF("Decryption failed because the token size %lu was invalid.", ciphertext_token.size());
 		return {Bytes::NONE};
 	}
-	Bytes plaintext;
-	try {
-		//peer_pub_bytes = ciphertext_token[:Identity.KEYSIZE//8//2]
-		Bytes peer_pub_bytes = ciphertext_token.left(Type::Identity::KEYSIZE/8/2);
-		//peer_pub = X25519PublicKey.from_public_bytes(peer_pub_bytes)
-		//Cryptography::X25519PublicKey::Ptr peer_pub = Cryptography::X25519PublicKey::from_public_bytes(peer_pub_bytes);
-		TRACEF("Identity::decrypt: peer public key:      %s", peer_pub_bytes.toHex().c_str());
+	Bytes peer_pub_bytes = ciphertext_token.left(Type::Identity::KEYSIZE/8/2);
+	Bytes ciphertext(ciphertext_token.mid(Type::Identity::KEYSIZE/8/2));
 
-		// CRYPTO: create shared key for key exchange using peer public key
-		//shared_key = _object->_prv->exchange(peer_pub);
-		Bytes shared_key = _object->_prv->exchange(peer_pub_bytes);
-		TRACEF("Identity::decrypt: shared key:           %s", shared_key.toHex().c_str());
+	auto try_decrypt = [&](const Bytes& priv_bytes) -> Bytes {
+		try {
+			auto prv = Cryptography::X25519PrivateKey::from_private_bytes(priv_bytes);
+			Bytes shared_key = prv->exchange(peer_pub_bytes);
+			Bytes derived_key = Cryptography::hkdf(
+				DERIVED_KEY_LENGTH, shared_key, get_salt(), get_context());
+			Cryptography::Token token(derived_key);
+			return token.decrypt(ciphertext);
+		} catch (...) {
+			return Bytes(Bytes::NONE);
+		}
+	};
 
-		Bytes derived_key = Cryptography::hkdf(
-			DERIVED_KEY_LENGTH,
-			shared_key,
-			get_salt(),
-			get_context()
-		);
-		TRACEF("Identity::decrypt: derived key:          %s", derived_key.toHex().c_str());
-
-		Cryptography::Token token(derived_key);
-		//ciphertext = ciphertext_token[Identity.KEYSIZE//8//2:]
-		Bytes ciphertext(ciphertext_token.mid(Type::Identity::KEYSIZE/8/2));
-		TRACEF("Identity::decrypt: Token decrypting data of length %lu", ciphertext.size());
-		TRACEF("Identity::decrypt: ciphertext: %s", ciphertext.toHex().c_str());
-		plaintext = token.decrypt(ciphertext);
-		TRACEF("Identity::decrypt: plaintext:  %s", plaintext.toHex().c_str());
-		//TRACEF("Identity::decrypt: Token decrypted data of length %lu", plaintext.size());
+	// PATCH-INBOUND-RATCHET-V1: try ratchet privkeys first (newest first).
+	if (_lxmf_inbound_ratchet_provider != nullptr) {
+		uint8_t prv_buf[Type::Identity::RATCHETSIZE/8];
+		for (size_t i = 0; i < 32; ++i) {
+			if (!_lxmf_inbound_ratchet_provider(_object->_hash.data(), i, prv_buf)) break;
+			Bytes attempt = try_decrypt(Bytes(prv_buf, Type::Identity::RATCHETSIZE/8));
+			if (attempt.size() > 0) {
+				TRACEF("Identity::decrypt: ratchet privkey #%lu succeeded", (unsigned long)i);
+				return attempt;
+			}
+		}
 	}
-	catch (const std::exception& e) {
-		NOTICEF("Decryption by %s failed: %s", toString().c_str(), e.what());
+
+	Bytes plaintext = try_decrypt(_object->_prv->private_bytes());
+	if (plaintext.size() == 0) {
+		NOTICEF("Decryption by %s failed: token HMAC was invalid (all ratchet and identity candidates failed)", toString().c_str());
 	}
-		
 	return plaintext;
 }
 
