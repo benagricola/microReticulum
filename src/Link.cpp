@@ -1374,7 +1374,7 @@ void Link::receive(const Packet& packet) {
 					const Bytes plaintext = decrypt(packet.data());
 					if (!plaintext) break;
 					Bytes resource_hash =
-						plaintext.left(Type::Identity::HASHLENGTH / 8);
+						plaintext.left(Type::Identity::TRUNCATED_HASHLENGTH / 8);
 					for (auto& resource : _object->_incoming_resources) {
 						if (resource.hash() == resource_hash) {
 							const_cast<Resource&>(resource).on_initiator_cancel(resource_hash);
@@ -1390,7 +1390,7 @@ void Link::receive(const Packet& packet) {
 					const Bytes plaintext = decrypt(packet.data());
 					if (!plaintext) break;
 					Bytes resource_hash =
-						plaintext.left(Type::Identity::HASHLENGTH / 8);
+						plaintext.left(Type::Identity::TRUNCATED_HASHLENGTH / 8);
 					for (auto& resource : _object->_outgoing_resources) {
 						if (resource.hash() == resource_hash) {
 							const_cast<Resource&>(resource).on_receiver_cancel(resource_hash);
@@ -1412,7 +1412,7 @@ void Link::receive(const Packet& packet) {
 						WARNING("RESOURCE_REQ decrypt failed");
 						break;
 					}
-					const uint8_t HASHLEN = Type::Identity::HASHLENGTH / 8;
+					const uint8_t HASHLEN = Type::Identity::TRUNCATED_HASHLENGTH / 8;
 					const uint8_t MAPLEN  = Type::Resource::MAPHASH_LEN;
 					if (plaintext.size() < 1 + HASHLEN) break;
 
@@ -1444,7 +1444,7 @@ void Link::receive(const Packet& packet) {
 						WARNING("RESOURCE_HMU decrypt failed");
 						break;
 					}
-					const uint8_t HASHLEN = Type::Identity::HASHLENGTH / 8;
+					const uint8_t HASHLEN = Type::Identity::TRUNCATED_HASHLENGTH / 8;
 					if (plaintext.size() < HASHLEN) break;
 					Bytes resource_hash(plaintext.data(), HASHLEN);
 					for (auto& resource : _object->_incoming_resources) {

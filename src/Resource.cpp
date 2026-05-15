@@ -705,7 +705,7 @@ void Resource::on_part(const Packet& part_packet) {
 void Resource::on_hashmap_update(const Bytes& body) {
 	assert(_object);
 	auto& d = *_object;
-	const uint8_t HASHLEN = Type::Identity::HASHLENGTH / 8;
+	const uint8_t HASHLEN = Type::Identity::TRUNCATED_HASHLENGTH / 8;
 	if (body.size() < HASHLEN + 3) {
 		WARNING("RESOURCE_HMU body too short");
 		return;
@@ -888,7 +888,7 @@ void Resource::on_request(const Bytes& body) {
 	d._last_activity_ms = Utilities::OS::ltime();
 	d._retries_left = Type::Resource::MAX_RETRIES;
 
-	const uint8_t HASHLEN  = Type::Identity::HASHLENGTH / 8;
+	const uint8_t HASHLEN  = Type::Identity::TRUNCATED_HASHLENGTH / 8;
 	const uint8_t MAPLEN   = Type::Resource::MAPHASH_LEN;
 	if (body.size() < 1 + HASHLEN) {
 		WARNING("on_request: body too short");
