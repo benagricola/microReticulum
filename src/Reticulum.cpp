@@ -239,26 +239,39 @@ void Reticulum::loop() {
 	assert(_object);
 	// Catch exceptions from loop work
 	try {
+		// Pet the task watchdog at every safe boundary inside the loop:
+		// each housekeeping step can do non-trivial work (flash lookups,
+		// per-packet crypto, link/resource state machine), so resetting
+		// between them keeps a long iteration from tripping the WDT.
+		// This is NOT extending the timeout — if any single step hangs,
+		// the WDT still fires inside it. (#60)
+		OS::reset_watchdog();
 		if (!_object->_is_connected_to_shared_instance) {
 
 			// Perform Reticulum housekeeping
 			if (OS::time() > (_object->_jobs_last_run + JOB_INTERVAL)) {
 				jobs();
+				OS::reset_watchdog();
 			}
 
-			// Perform Interface processing
+			// Perform Interface processing — each interface.loop() may
+			// dispatch one or more inbound packets through Transport
+			// and into Link/Resource callbacks; non-trivial work.
 			for (auto& [hash, interface] : Transport::get_interfaces()) {
 				interface.loop();
+				OS::reset_watchdog();
 			}
 
 			// Perform Filesystem processing
 			microStore::FileSystem& filesystem = OS::get_filesystem();
 			if (filesystem) {
 				filesystem.loop();
+				OS::reset_watchdog();
 			}
 
 			// Perform Transport processing
 			RNS::Transport::loop();
+			OS::reset_watchdog();
 		}
 
 		// Perform random number gnerator housekeeping

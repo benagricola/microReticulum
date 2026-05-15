@@ -396,7 +396,11 @@ bool Resource::_build_outgoing(uint16_t link_mdu) {
 	salted.append(plaintext);
 
 	// Encrypt via the Link's derived key (Fernet over AES-128-CBC).
+	// AES on a 12 KB blob takes tens of ms; the per-part loop below
+	// adds more. Same WDT story as the receive side. (#60)
+	Utilities::OS::reset_watchdog();
 	const Bytes encrypted = d._link.encrypt(salted);
+	Utilities::OS::reset_watchdog();
 	d._encrypted    = encrypted;
 	d._transfer_size = (uint32_t)encrypted.size();
 	d._data_size     = d._transfer_size;   // _d == _t (no compression in this port)
@@ -439,6 +443,10 @@ bool Resource::_build_outgoing(uint16_t link_mdu) {
 		d._parts.push_back(part_data);
 		d._map_hashes.push_back(map_hash);
 		d._map_full.append(map_hash);
+
+		// SHA-256 per part + the vector growth. 30 iterations adds up
+		// to a few hundred ms total — keep the WDT happy. (#60)
+		if ((i & 0x07) == 0) Utilities::OS::reset_watchdog();
 	}
 
 	return true;
@@ -784,12 +792,23 @@ void Resource::_assemble_and_deliver() {
 	d._status = Type::Resource::ASSEMBLING;
 	d._last_activity_ms = Utilities::OS::ltime();
 
+	// This whole function runs inside the firmware's main-loop tick,
+	// which holds rns_lock. The work it does — re-reading the assembled
+	// blob, SHA-256ing it, decrypting via the Link key, and firing the
+	// concluded callback (which writes attachment bytes to LittleFS) —
+	// can easily exceed the 5 s task watchdog window for a ~12 KB
+	// resource. We reset the WDT at safe progress points so a long
+	// receive doesn't reboot the device. (#60)
+	Utilities::OS::reset_watchdog();
+
 	// Verify the resource hash. We hash the assembled ciphertext + the
 	// random_hash salt and truncate to 16 bytes, matching the sender's
 	// `Identity::truncated_hash(encrypted + random_hash)`.
 	const Bytes assembled = d._buffer->read_all();
+	Utilities::OS::reset_watchdog();
 	const Bytes computed_hash =
 		Identity::truncated_hash(assembled + d._random_hash);
+	Utilities::OS::reset_watchdog();
 	if (computed_hash != d._hash) {
 		WARNINGF("Resource: assembled hash mismatch for %s — corrupt",
 		         d._hash.toHex().c_str());
@@ -808,6 +827,7 @@ void Resource::_assemble_and_deliver() {
 	Bytes decrypted;
 	try {
 		decrypted = d._link.decrypt(assembled);
+		Utilities::OS::reset_watchdog();
 	}
 	catch (const std::exception& e) {
 		ERRORF("Resource: Link.decrypt failed: %s", e.what());
@@ -837,12 +857,17 @@ void Resource::_assemble_and_deliver() {
 	// we got the bytes before we go off and process them, otherwise its
 	// MAX_RETRIES timer might fire while we're still on the callback.
 	_send_proof();
+	Utilities::OS::reset_watchdog();
 
 	if (d._callbacks._concluded) {
 		try { d._callbacks._concluded(*this); }
 		catch (const std::exception& e) {
 			ERRORF("Resource::_assemble: concluded callback threw: %s", e.what());
 		}
+		// The concluded callback in LXMFGateway writes any attachment
+		// blobs to LittleFS, which can block for hundreds of ms on
+		// fragmented flash. Reset again on the way out.
+		Utilities::OS::reset_watchdog();
 	}
 }
 
@@ -913,7 +938,10 @@ void Resource::on_request(const Bytes& body) {
 		return;
 	}
 
-	// Send each requested part.
+	// Send each requested part. Each send() queues a packet to the
+	// modem (encrypt + frame); a full REQ batch can chain several
+	// sends and push the loop tick past the WDT window if the radio
+	// queue is also draining. (#60)
 	uint16_t resent = 0;
 	while (cursor + MAPLEN <= body.size()) {
 		Bytes req_map_hash(body.data() + cursor, MAPLEN);
@@ -933,6 +961,7 @@ void Resource::on_request(const Bytes& body) {
 				break;
 			}
 		}
+		Utilities::OS::reset_watchdog();
 	}
 	DEBUGF("on_request: sent %u parts (exhausted=%s)", (unsigned)resent,
 	       exhausted == Type::Resource::HASHMAP_IS_EXHAUSTED ? "yes" : "no");
