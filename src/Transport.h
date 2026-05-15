@@ -375,6 +375,16 @@ namespace RNS {
 		inline static const RateTable& get_announce_rate_table() { return _announce_rate_table; }
 		inline static const LinkTable& get_link_table() { return _link_table; }
 
+		// Public accessors for the packet activity counters. These are
+		// incremented inside Transport::outbound (sent) / Transport::inbound
+		// (received) and count every Reticulum packet that passes through
+		// the local stack — useful for status surfaces that need to confirm
+		// the radio is actually doing work rather than just reporting
+		// "online". Counters are monotonic since boot.
+		inline static uint32_t packets_sent()       { return _packets_sent; }
+		inline static uint32_t packets_received()   { return _packets_received; }
+		inline static uint32_t destinations_added() { return _destinations_added; }
+
 	private:
 		// CBA MUST use references to interfaces here in order for virtul overrides for send/receive to work
 		// map is sorted, can use find
