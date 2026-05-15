@@ -66,6 +66,13 @@ namespace RNS {
 		// Return the currently running Reticulum instance
 		inline static const Reticulum& get_instance() { return _instance; }
 
+		// Public accessors for the storage / cache root paths so other
+		// subsystems (Identity, etc.) can build file paths under the
+		// device's configured Reticulum storage tree without needing
+		// friend access to the private static char arrays.
+		inline static const char* storagepath() { return _storagepath; }
+		inline static const char* cachepath()   { return _cachepath; }
+
 	public:
 		Reticulum();
 		Reticulum(Type::NoneConstructor none) {

@@ -220,6 +220,13 @@ void Reticulum::start() {
 	INFO("Starting Transport...");
 	Transport::start(*this);
 
+	// Load the persisted known-destinations cache so we don't lose every
+	// peer identity on each reboot. Without this, after a watchdog or
+	// power-cycle the device can't send to a peer until that peer's next
+	// auto-announce arrives (5+ minutes typical). The map is otherwise
+	// RAM-only.
+	Identity::load_known_destinations();
+
 	// Initialize time-based variables *after* time offset update and Transport start
 	_object->_last_data_persist = OS::time();
 	_object->_last_cache_clean = OS::time();

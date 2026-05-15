@@ -52,6 +52,33 @@ using namespace RNS::Utilities;
 // CBA ACCUMULATES
 /*static*/ uint16_t Identity::_known_destinations_maxsize = RNS_KNOWN_DESTINATIONS_MAX;
 
+// Binary serialisation helpers used by save_known_destinations /
+// load_known_destinations. Defined here at file scope so both functions
+// can see them (the file's compilation order otherwise puts save before
+// load).
+namespace {
+constexpr uint32_t KD_MAGIC   = 0xC0DEC0DE;
+constexpr uint32_t KD_VERSION = 1;
+void put_u16(Bytes& b, uint16_t v) {
+	uint8_t tmp[2] = {(uint8_t)(v >> 8), (uint8_t)v};
+	b.append(tmp, 2);
+}
+void put_u32(Bytes& b, uint32_t v) {
+	uint8_t tmp[4] = {(uint8_t)(v >> 24), (uint8_t)(v >> 16),
+	                  (uint8_t)(v >> 8),  (uint8_t)v};
+	b.append(tmp, 4);
+}
+void put_u64(Bytes& b, uint64_t v) {
+	uint8_t tmp[8];
+	for (int i = 0; i < 8; ++i) tmp[i] = (uint8_t)(v >> (56 - 8 * i));
+	b.append(tmp, 8);
+}
+void put_bytes(Bytes& b, const Bytes& src) {
+	put_u16(b, (uint16_t)src.size());
+	if (src.size()) b.append(src.data(), src.size());
+}
+} // anonymous namespace
+
 Identity::Identity(bool create_keys /*= true*/) : _object(new Object()) {
 	if (create_keys) {
 		createKeys();
@@ -289,12 +316,6 @@ Recall last heard app_data for a destination hash.
 }
 
 /*static*/ bool Identity::save_known_destinations() {
-	// TODO: Improve the storage method so we don't have to
-	// deserialize and serialize the entire table on every
-	// save, but the only changes. It might be possible to
-	// simply overwrite on exit now that every local client
-	// disconnect triggers a data persist.
-
 	bool success = false;
 	try {
 		if (_saving_known_destinations) {
@@ -311,41 +332,37 @@ Recall last heard app_data for a destination hash.
 		}
 
 		_saving_known_destinations = true;
-		double save_start = OS::time();
+		const double save_start = OS::time();
 
-		std::map<Bytes, IdentityEntry> storage_known_destinations;
-// TODO
-/*
-		if os.path.isfile(RNS.Reticulum.storagepath+"/known_destinations"):
-			try:
-				file = open(RNS.Reticulum.storagepath+"/known_destinations","rb")
-				storage_known_destinations = umsgpack.load(file)
-				file.close()
-			except:
-				pass
-*/
-
-		for (auto& [destination_hash, identity_entry] : storage_known_destinations) {
-			if (_known_destinations.find(destination_hash) == _known_destinations.end()) {
-				//_known_destinations[destination_hash] = storage_known_destinations[destination_hash];
-				//_known_destinations[destination_hash] = identity_entry;
-				// CBA ACCUMULATES
-				_known_destinations.insert({destination_hash, identity_entry});
-				// CBA IMMEDIATE CULL
-				cull_known_destinations();
-			}
+		// Serialize the entire table into a binary blob (see format
+		// comment near load_known_destinations).
+		Bytes buf;
+		put_u32(buf, KD_MAGIC);
+		put_u32(buf, KD_VERSION);
+		put_u16(buf, (uint16_t)_known_destinations.size());
+		for (const auto& [destination_hash, entry] : _known_destinations) {
+			put_bytes(buf, destination_hash);
+			put_u64(buf, (uint64_t)(entry._timestamp * 1000.0));
+			put_bytes(buf, entry._packet_hash);
+			put_bytes(buf, entry._public_key);
+			put_bytes(buf, entry._app_data);
 		}
 
-// TODO
-/*
-		DEBUGF("Saving %lu known destinations to storage...", _known_destinations.size());
-		file = open(RNS.Reticulum.storagepath+"/known_destinations","wb")
-		umsgpack.dump(Identity.known_destinations, file)
-		file.close()
-		DEBUGF("Saved known destinations to storage in %.3f seconds", OS::round(OS::time() - save_start, 3));
-*/
-
-		success = true;
+		char path[Type::Reticulum::FILEPATH_MAXSIZE];
+		snprintf(path, Type::Reticulum::FILEPATH_MAXSIZE, "%s/known_destinations",
+		         Reticulum::storagepath());
+		const size_t wrote = OS::write_file(path, buf);
+		if (wrote == buf.size()) {
+			DEBUGF("Identity: saved %u known destinations (%u bytes) in %.3fs",
+			       (unsigned)_known_destinations.size(),
+			       (unsigned)buf.size(),
+			       OS::round(OS::time() - save_start, 3));
+			success = true;
+		}
+		else {
+			ERRORF("Identity: known_destinations write truncated (%u of %u bytes)",
+			       (unsigned)wrote, (unsigned)buf.size());
+		}
 	}
 	catch (const std::exception& e) {
 		ERRORF("Error while saving known destinations to disk, the contained exception was: %s", e.what());
@@ -356,27 +373,100 @@ Recall last heard app_data for a destination hash.
 	return success;
 }
 
+// Binary wire format for the known_destinations persistence file. Single
+// file, replaced atomically (well, write-then-rename would be — for now,
+// write-truncate which is fine because the file is only loaded at boot
+// and the old data is acceptable on read failure):
+//
+//   uint32_t  magic       = 0xC0DEC0DE
+//   uint32_t  version     = 1
+//   uint16_t  count
+//   for each of `count` entries:
+//     uint16_t dest_hash_len      then dest_hash bytes
+//     uint64_t timestamp_ms       (entry._timestamp converted to ms-since-epoch
+//                                  for storage stability across rebuilds)
+//     uint16_t pkt_hash_len       then pkt_hash bytes
+//     uint16_t pub_key_len        then pub_key bytes
+//     uint16_t app_data_len       then app_data bytes
+//
+// Average entry: 16 (dest_hash) + 8 (ts) + 16 (pkt_hash) + 32 (pub_key) +
+// ~100 (app_data) + 8 (length prefixes) ≈ 180 bytes. 100 entries × 180 B
+// ≈ 18 KiB, well within LittleFS budget.
+
 /*static*/ void Identity::load_known_destinations() {
-// TODO
-/*
-	if os.path.isfile(RNS.Reticulum.storagepath+"/known_destinations"):
-		try:
-			file = open(RNS.Reticulum.storagepath+"/known_destinations","rb")
-			loaded_known_destinations = umsgpack.load(file)
-			file.close()
+	try {
+		char path[Type::Reticulum::FILEPATH_MAXSIZE];
+		snprintf(path, Type::Reticulum::FILEPATH_MAXSIZE, "%s/known_destinations",
+		         Reticulum::storagepath());
+		if (!OS::file_exists(path)) {
+			DEBUG("Identity: no known_destinations file, starting with empty cache");
+			return;
+		}
+		Bytes buf;
+		if (OS::read_file(path, buf) == 0) {
+			WARNING("Identity: known_destinations file present but unreadable");
+			return;
+		}
+		const uint8_t* p   = buf.data();
+		const uint8_t* end = p + buf.size();
+		auto need = [&](size_t n) { return (size_t)(end - p) >= n; };
+		auto read_u16 = [&]() -> uint16_t {
+			uint16_t v = ((uint16_t)p[0] << 8) | p[1]; p += 2; return v;
+		};
+		auto read_u32 = [&]() -> uint32_t {
+			uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+			             ((uint32_t)p[2] << 8)  | p[3]; p += 4; return v;
+		};
+		auto read_u64 = [&]() -> uint64_t {
+			uint64_t v = 0;
+			for (int i = 0; i < 8; ++i) v = (v << 8) | p[i];
+			p += 8; return v;
+		};
+		auto read_bytes = [&]() -> Bytes {
+			if (!need(2)) return Bytes();
+			uint16_t len = read_u16();
+			if (!need(len)) return Bytes();
+			Bytes b(p, len); p += len; return b;
+		};
 
-			Identity.known_destinations = {}
-			for known_destination in loaded_known_destinations:
-				if len(known_destination) == RNS.Reticulum.TRUNCATED_HASHLENGTH//8:
-					Identity.known_destinations[known_destination] = loaded_known_destinations[known_destination]
-
-			RNS.log("Loaded "+str(len(Identity.known_destinations))+" known destination from storage", RNS.LOG_VERBOSE)
-		except:
-			RNS.log("Error loading known destinations from disk, file will be recreated on exit", RNS.LOG_ERROR)
-	else:
-		RNS.log("Destinations file does not exist, no known destinations loaded", RNS.LOG_VERBOSE)
-*/
-
+		if (!need(10)) { WARNING("Identity: known_destinations file truncated"); return; }
+		uint32_t magic = read_u32();
+		if (magic != KD_MAGIC) {
+			WARNINGF("Identity: known_destinations bad magic 0x%08x — discarding", (unsigned)magic);
+			return;
+		}
+		uint32_t version = read_u32();
+		if (version != KD_VERSION) {
+			WARNINGF("Identity: known_destinations file version %u not supported (expected %u) — discarding", (unsigned)version, (unsigned)KD_VERSION);
+			return;
+		}
+		uint16_t count = read_u16();
+		_known_destinations.clear();
+		uint16_t loaded = 0;
+		for (uint16_t i = 0; i < count; ++i) {
+			Bytes dest_hash = read_bytes();
+			if (!need(8)) break;
+			uint64_t ts_ms  = read_u64();
+			Bytes pkt_hash  = read_bytes();
+			Bytes pub_key   = read_bytes();
+			Bytes app_data  = read_bytes();
+			if (dest_hash.size() != Type::Reticulum::TRUNCATED_HASHLENGTH / 8) continue;
+			if (pub_key.size()   != Type::Identity::KEYSIZE / 8) continue;
+			double ts = (double)ts_ms / 1000.0;
+			try {
+				_known_destinations.insert({dest_hash, {ts, pkt_hash, pub_key, app_data}});
+				loaded++;
+			}
+			catch (const std::bad_alloc&) {
+				ERROR("Identity: bad_alloc while loading known_destinations — stopping early");
+				break;
+			}
+		}
+		NOTICEF("Identity: loaded %u known destinations from disk", (unsigned)loaded);
+	}
+	catch (const std::exception& e) {
+		ERRORF("Identity::load_known_destinations exception: %s", e.what());
+	}
 }
 
 /*static*/ void Identity::cull_known_destinations() {
