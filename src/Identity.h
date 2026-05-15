@@ -57,6 +57,13 @@ namespace RNS {
 	private:
 		static IdentityTable _known_destinations;
 		static bool _saving_known_destinations;
+		// Set true whenever _known_destinations is mutated (remember()).
+		// Checked by save_known_destinations() to skip no-op writes when
+		// the cache hasn't changed since the last flush. Lets the
+		// firmware run save_known_destinations() on a tight (~60 s)
+		// interval cheaply, so an unplanned reboot (watchdog, panic)
+		// doesn't drop announces learned in the prior hour. (#59)
+		static bool _known_destinations_dirty;
 		// CBA
 		static uint16_t _known_destinations_maxsize;
 

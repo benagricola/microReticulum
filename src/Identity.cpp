@@ -48,6 +48,7 @@ using namespace RNS::Utilities;
 
 /*static*/ Identity::IdentityTable Identity::_known_destinations;
 /*static*/ bool Identity::_saving_known_destinations = false;
+/*static*/ bool Identity::_known_destinations_dirty = false;
 // CBA
 // CBA ACCUMULATES
 /*static*/ uint16_t Identity::_known_destinations_maxsize = RNS_KNOWN_DESTINATIONS_MAX;
@@ -261,6 +262,7 @@ Can be used to load previously created and saved identities into Reticulum.
 			_known_destinations.insert_or_assign(
 				destination_hash,
 				IdentityEntry{OS::time(), packet_hash, public_key, app_data});
+			_known_destinations_dirty = true;
 			// CBA IMMEDIATE CULL
 			cull_known_destinations();
 		}
@@ -326,6 +328,12 @@ Recall last heard app_data for a destination hash.
 }
 
 /*static*/ bool Identity::save_known_destinations() {
+	// Fast path: nothing changed since the last successful flush, so
+	// the on-disk blob is already current. Lets callers run this on a
+	// tight interval cheaply. (#59)
+	if (!_known_destinations_dirty) {
+		return true;
+	}
 	bool success = false;
 	try {
 		if (_saving_known_destinations) {
@@ -368,6 +376,7 @@ Recall last heard app_data for a destination hash.
 			       (unsigned)buf.size(),
 			       OS::round(OS::time() - save_start, 3));
 			success = true;
+			_known_destinations_dirty = false;
 		}
 		else {
 			ERRORF("Identity: known_destinations write truncated (%u of %u bytes)",

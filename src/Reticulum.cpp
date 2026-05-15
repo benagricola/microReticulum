@@ -232,6 +232,7 @@ void Reticulum::start() {
 	_object->_last_cache_clean = OS::time();
 	_object->_jobs_last_run = OS::time();
 	_object->_last_time_persist = OS::time();
+	_object->_last_known_destinations_save = OS::time();
 }
 
 void Reticulum::loop() {
@@ -304,6 +305,19 @@ void Reticulum::jobs() {
 
 	if (now > _object->_last_data_persist + _persist_interval) {
 		persist_data();
+	}
+
+	// Identity::_known_destinations fast-path flush. The full
+	// persist_data() above runs hourly to limit flash wear on the
+	// chunkier Transport tables. Known-destinations is small and
+	// volatile (one entry per announce we hear), so we save it on a
+	// tight 60-second window so an unplanned reboot doesn't drop the
+	// entries we just learned. save_known_destinations() short-
+	// circuits when nothing changed. (#59)
+	static constexpr uint16_t KD_SAVE_INTERVAL = 60;
+	if (now > _object->_last_known_destinations_save + KD_SAVE_INTERVAL) {
+		Identity::save_known_destinations();
+		_object->_last_known_destinations_save = now;
 	}
 
 #ifdef ARDUINO
