@@ -77,9 +77,17 @@ Link::Link(const Destination& destination /*= {Type::NONE}*/, Callbacks::establi
 	_object->_pub_bytes     = _object->_pub->public_bytes();
 	TRACEF("Link::load_private_key: pub bytes:     %s", _object->_pub_bytes.toHex().c_str());
 
-	_object->_sig_pub       = _object->_sig_prv->public_key();
-	_object->_sig_pub_bytes = _object->_sig_pub->public_bytes();
-	TRACEF("Link::load_private_key: sig pub bytes: %s", _object->_sig_pub_bytes.toHex().c_str());
+	// _sig_prv may be null when this constructor is called with a NONE
+	// destination and no owner (the "I'm a default-constructed empty
+	// Link, do not touch crypto" case). Skip the public-key derivation
+	// in that case rather than null-dereference. Callers that need a
+	// usable Link will pass either a destination (initiator) or an
+	// owner (responder), in which case _sig_prv is set above.
+	if (_object->_sig_prv) {
+		_object->_sig_pub       = _object->_sig_prv->public_key();
+		_object->_sig_pub_bytes = _object->_sig_pub->public_bytes();
+		TRACEF("Link::load_private_key: sig pub bytes: %s", _object->_sig_pub_bytes.toHex().c_str());
+	}
 
 	if (!peer_pub_bytes) {
 		_object->_peer_pub = nullptr;
