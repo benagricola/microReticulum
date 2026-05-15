@@ -250,7 +250,17 @@ Can be used to load previously created and saved identities into Reticulum.
 		//p _known_destinations[destination_hash] = {OS::time(), packet_hash, public_key, app_data};
 		// CBA ACCUMULATES
 		try {
-			_known_destinations.insert({destination_hash, {OS::time(), packet_hash, public_key, app_data}});
+			// insert_or_assign (NOT insert) — std::map::insert leaves the
+			// existing value untouched if the key already exists, which
+			// means subsequent announces from a known peer never refresh
+			// the stored timestamp. cull_known_destinations sorts by
+			// timestamp and would then evict actively-announcing peers
+			// first because their stored ts stayed pinned to first-heard,
+			// producing the "AnnounceLog has the entry but Identity::recall
+			// returns empty" divergence. Overwrite on every announce.
+			_known_destinations.insert_or_assign(
+				destination_hash,
+				IdentityEntry{OS::time(), packet_hash, public_key, app_data});
 			// CBA IMMEDIATE CULL
 			cull_known_destinations();
 		}
