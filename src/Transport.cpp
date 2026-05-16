@@ -854,10 +854,14 @@ DestinationEntry empty_destination_entry;
 
 	TRACEF("Transport::outbound: destination=%s hops=%d", packet.destination_hash().toHex().c_str(), packet.hops());
 
-	while (_jobs_running) {
-		TRACE("Transport::outbound: sleeping...");
-		OS::sleep(0.0005);
-	}
+	// (#60) Single-threaded RNS: rns_lock in the firmware already
+	// serialises all Transport access between loopTask and web_task.
+	// The legacy spin-wait on `_jobs_running` was a Python-era cross-
+	// thread guard that deadlocks here, because Resource::tick() runs
+	// *inside* jobs() and can call cancel() -> Packet::send() -> here,
+	// at which point `_jobs_running` is still true and we'd loop
+	// forever. Skip the wait entirely; if we're already inside jobs(),
+	// proceeding is correct and safe under the rns_lock invariant.
 	_jobs_locked = true;
 
 	bool sent = false;
@@ -1426,11 +1430,9 @@ DestinationEntry empty_destination_entry;
 	}
 */
 
-	while (_jobs_running) {
-		TRACE("Transport::inbound: sleeping...");
-		OS::sleep(0.0005);
-	}
-
+	// (#60) Same reentrancy reasoning as Transport::outbound: rns_lock
+	// already serialises Transport access; spinning on `_jobs_running`
+	// deadlocks when packet dispatch reenters from inside jobs().
 	if (!_identity) {
 		WARNING("Transport::inbound: No identity!");
 		return;
