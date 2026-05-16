@@ -239,30 +239,39 @@ DestinationEntry empty_destination_entry;
 	//p thread = threading.Thread(target=Transport.jobloop, daemon=True)
 	//p thread.start()
 
+	// Path-store initialization runs for every device regardless of
+	// transport-relay mode. Endpoints also need to record paths so
+	// outbound sends can route via the right interface and so the
+	// announce log on the device stays consistent with the path table.
+	// Previously this lived inside `if (transport_enabled())` which
+	// left _path_store uninitialised on endpoint-only nodes — every
+	// announce hit a put-fail and the API path-estimate returned
+	// kind=unknown forever. (#98)
+#if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
+	// CBA microStore
+	if (Utilities::OS::get_filesystem()) {
+		INFOF("FileSystem available: %lu", Utilities::OS::get_filesystem().storageAvailable());
+		// CBA Must pass time offset into microStore for accurate timestamps on devices without a real-time clock
+#if defined(ARDUINO)
+		microStore::set_time_offset(Utilities::OS::getTimeOffset() / 1000);
+		_path_store.init(Utilities::OS::get_filesystem(), "/path_store", false, _path_store_segment_size, _path_store_segment_count);
+#else
+		_path_store.init(Utilities::OS::get_filesystem(), "path_store", false, _path_store_segment_size, _path_store_segment_count);
+#endif
+		// If the filesystem is full then clear the path store since it's of no use full anyway
+		if (Utilities::OS::get_filesystem().storageAvailable() > 0 && Utilities::OS::get_filesystem().storageAvailable() < 1024) {
+			WARNING("FileSystem is full, clearing existing path store");
+			_path_store.clear();
+		}
+	}
+#endif // RNS_USE_FS && RNS_PERSIST_PATHS
+
 	// Load transport-related data
 	if (Reticulum::transport_enabled()) {
 		INFO("Transport mode is enabled");
 
 		// Read in path table
 		//read_path_table();
-#if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
-		// CBA microStore
-		if (Utilities::OS::get_filesystem()) {
-			INFOF("FileSystem available: %lu", Utilities::OS::get_filesystem().storageAvailable());
-			// CBA Must pass time offset into microStore for accurate timestamps on devices without a real-time clock
-#if defined(ARDUINO)
-			microStore::set_time_offset(Utilities::OS::getTimeOffset() / 1000);
-			_path_store.init(Utilities::OS::get_filesystem(), "/path_store", false, _path_store_segment_size, _path_store_segment_count);
-#else
-			_path_store.init(Utilities::OS::get_filesystem(), "path_store", false, _path_store_segment_size, _path_store_segment_count);
-#endif
-			// If the filesystem is full then clear the path store since it's of no use full anyway
-			if (Utilities::OS::get_filesystem().storageAvailable() > 0 && Utilities::OS::get_filesystem().storageAvailable() < 1024) {
-				WARNING("FileSystem is full, clearing existing path store");
-				_path_store.clear();
-			}
-		}
-#endif // RNS_USE_FS && RNS_PERSIST_PATHS
 
 		// CBA The following write and clean is very resource intensive so skip at startup
 		// and let a later (optimized) scheduled write and clean take care of it.
@@ -2263,12 +2272,18 @@ DestinationEntry empty_destination_entry;
 							}
 							else {
 								ERRORF("Failed to add destination %s to path table!", packet.destination_hash().toHex().c_str());
-								// [PATHDBG] Post-failure: dump the store to learn segment
-								// state, dead-record count, and active_file status — the
-								// FileStore prints this via printf so it should reach
-								// serial even when our log routing is gated.
-								RNS::head("[PATHDBG] post-fail dumpInfo follows:", RNS::LOG_NOTICE);
-								_path_store.dumpInfo();
+								// [PATHDBG] DO NOT call _path_store.dumpInfo() when
+								// the store is invalid — it dereferences a null
+								// active_file and crashes (LoadProhibited). Only
+								// dump when the store is at least registered.
+								if (_path_store.isValid()) {
+									RNS::head("[PATHDBG] post-fail dumpInfo follows:", RNS::LOG_NOTICE);
+									_path_store.dumpInfo();
+								} else {
+									RNS::head("[PATHDBG] post-fail: store is NOT initialised "
+									          "(was Transport::start called with transport_enabled=true?)",
+									          RNS::LOG_NOTICE);
+								}
 							}
 						}
 						catch (const std::bad_alloc&) {
