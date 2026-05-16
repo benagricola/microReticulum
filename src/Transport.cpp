@@ -2231,12 +2231,44 @@ DestinationEntry empty_destination_entry;
 							else {
 								ttl = DESTINATION_TIMEOUT;
 							}
+							// [PATHDBG] Pre-put diagnostics — establish whether the
+							// inputs and the store are in a state that could plausibly
+							// produce a successful put. Tags every line so the noise
+							// can be grepped or ripped out once the bug is found. (#98)
+							{
+								const bool iface_valid = (bool)packet.receiving_interface();
+								const bool pkt_valid   = (bool)packet;
+								const bool entry_valid = (bool)destination_table_entry;
+								const bool store_valid = (bool)_path_store;
+								const bool typed_valid = _new_path_table.isValid();
+								HEADF(LOG_NOTICE,
+									"[PATHDBG] pre-put dest=%s iface=%d pkt=%d entry=%d store=%d typed=%d ttl=%lu",
+									packet.destination_hash().toHex().c_str(),
+									iface_valid, pkt_valid, entry_valid,
+									store_valid, typed_valid, (unsigned long)ttl);
+								auto codec_bytes = microStore::Codec<DestinationEntry>::encode(destination_table_entry);
+								HEADF(LOG_NOTICE,
+									"[PATHDBG] codec-encoded value_len=%u (USTORE_MAX_VALUE_LEN=1024)",
+									(unsigned)codec_bytes.size());
+								auto key_bytes = packet.destination_hash().collection();
+								HEADF(LOG_NOTICE,
+									"[PATHDBG] key_len=%u (USTORE_MAX_KEY_LEN=64)",
+									(unsigned)key_bytes.size());
+							}
 							if (_new_path_table.put(packet.destination_hash().collection(), destination_table_entry, ttl)) {
 								TRACEF("Added destination %s to path table!", packet.destination_hash().toHex().c_str());
 								++_destinations_added;
+								HEADF(LOG_NOTICE, "[PATHDBG] put OK for %s",
+									packet.destination_hash().toHex().c_str());
 							}
 							else {
 								ERRORF("Failed to add destination %s to path table!", packet.destination_hash().toHex().c_str());
+								// [PATHDBG] Post-failure: dump the store to learn segment
+								// state, dead-record count, and active_file status — the
+								// FileStore prints this via printf so it should reach
+								// serial even when our log routing is gated.
+								RNS::head("[PATHDBG] post-fail dumpInfo follows:", RNS::LOG_NOTICE);
+								_path_store.dumpInfo();
 							}
 						}
 						catch (const std::bad_alloc&) {

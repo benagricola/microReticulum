@@ -14,6 +14,7 @@
 
 #include "DestinationEntry.h"
 
+#include "Log.h"
 #include "Transport.h"
 #include "Type.h"
 
@@ -23,7 +24,17 @@ using namespace RNS::Persistence;
 /*static*/ std::vector<uint8_t> microStore::Codec<DestinationEntry>::encode(const DestinationEntry& entry) {
 
 	// If invalid/empty entry then return empty
-	if (!entry) return {};
+	if (!entry) {
+		// [PATHDBG] Codec returning empty bytes — store.put will then
+		// store a zero-length value which the FileStore rejects.
+		// Surface which sub-field made the entry invalid. (#98)
+		const bool iface_valid = (bool)const_cast<DestinationEntry&>(entry).receiving_interface();
+		const bool pkt_valid   = (bool)const_cast<DestinationEntry&>(entry).announce_packet();
+		RNS::headf(RNS::LOG_NOTICE,
+			"[PATHDBG] Codec<DestinationEntry>::encode invalid entry (iface=%d pkt=%d) → returning empty",
+			iface_valid, pkt_valid);
+		return {};
+	}
 
 	std::vector<uint8_t> out;
 
