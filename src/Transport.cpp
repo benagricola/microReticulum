@@ -339,8 +339,14 @@ DestinationEntry empty_destination_entry;
 
 			// Process active and pending link lists
 			if (OS::time() > (_links_last_checked + _links_check_interval)) {
+				const uint64_t now_ms = OS::ltime();
 				std::set<Link> pending_links(_pending_links);
 				for (auto& link : pending_links) {
+					// (#106) Establishment-timeout watchdog for
+					// PENDING/HANDSHAKE links. Without it, a dropped
+					// LRPROOF or LRRTT leaks the link object and
+					// silently refuses all subsequent traffic.
+					const_cast<Link&>(link).watchdog_tick(now_ms);
 					if (link.status() == Type::Link::CLOSED) {
 						// If we are not a Transport Instance, finding a pending link
 						// that was never activated will trigger an expiry of the path
@@ -373,8 +379,12 @@ DestinationEntry empty_destination_entry;
 					}
 				}
 				std::set<Link> active_links(_active_links);
-				const uint64_t now_ms = OS::ltime();
 				for (auto& link : active_links) {
+					// (#106) Note that responder-side links land in
+					// _active_links while still in HANDSHAKE state (see
+					// Transport::register_link), so the watchdog tick
+					// has to run here too — not just on _pending_links.
+					const_cast<Link&>(link).watchdog_tick(now_ms);
 					if (link.status() == Type::Link::CLOSED) {
 						_active_links.erase(link);
 					}

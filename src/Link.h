@@ -245,6 +245,14 @@ namespace RNS {
 		// time out. Plan step 9.
 		void tick_resources(uint64_t now_ms);
 
+		// Link-level establishment-timeout watchdog. Initiators stuck in
+		// PENDING (sent LRTREQ, no LRPROOF back) and responders stuck in
+		// HANDSHAKE (sent LRPROOF, no LRRTT back) transition to CLOSED
+		// with teardown_reason=TIMEOUT after establishment_timeout
+		// elapses. Mirrors RNS/Link.py's __watchdog_job for these
+		// states. Called once per Transport::jobs() pass. (#106)
+		void watchdog_tick(uint64_t now_ms);
+
 		//void __str__();
 		std::string toString() const;
 

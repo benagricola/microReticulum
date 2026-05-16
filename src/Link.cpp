@@ -761,11 +761,43 @@ void Link::link_closed() {
 	}
 }
 
-// CBA TODO Implement watchdog
-void Link::start_watchdog() {
-	//z thread = threading.Thread(target=_object->___watchdog_job)
-	//z thread.daemon = True
-	//z thread.start()
+// Per-link watchdog. Upstream RNS runs a thread per Link sleeping
+// between event-time checks; we instead poll once per Transport::jobs()
+// pass via watchdog_tick() — see below. start_watchdog() is kept as a
+// no-op for API compatibility with upstream call-sites.
+void Link::start_watchdog() {}
+
+void Link::watchdog_tick(uint64_t /*now_ms*/) {
+	assert(_object);
+	if (_object->_status == Type::Link::CLOSED) return;
+
+	const double now = OS::time();
+	const double timeout_at = _object->_request_time + _object->_establishment_timeout;
+
+	// PENDING: initiator sent LRTREQ, waiting for LRPROOF.
+	// HANDSHAKE: responder sent LRPROOF, waiting for LRRTT.
+	// Both bail out if their establishment_timeout elapsed — without
+	// this, a lossy interface (LoRa) that drops the LRRTT silently
+	// leaves the link half-established forever, leaks the Link object,
+	// and refuses any RESOURCE_ADV that follows. (#106)
+	if (_object->_status == Type::Link::PENDING ||
+	    _object->_status == Type::Link::HANDSHAKE) {
+		if (now >= timeout_at) {
+			DEBUGF("Link %s establishment timed out (%s, %s)",
+			       toString().c_str(),
+			       _object->_status == Type::Link::PENDING ? "PENDING" : "HANDSHAKE",
+			       _object->_initiator
+			           ? (_object->_status == Type::Link::PENDING ? "waiting for proof" : "waiting for RTT response")
+			           : "waiting for RTT packet from initiator");
+			_object->_status = Type::Link::CLOSED;
+			_object->_teardown_reason = Type::Link::TIMEOUT;
+			link_closed();
+		}
+	}
+	// ACTIVE keepalive / STALE detection is not ported — the firmware
+	// has no long-lived link reuse pattern (each LXMF send opens a
+	// fresh link, sends one resource, closes). When that changes,
+	// port the upstream ACTIVE/STALE branches from RNS/Link.py:791-814.
 }
 
 /*p TODO
