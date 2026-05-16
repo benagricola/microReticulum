@@ -684,6 +684,12 @@ void Resource::on_part(const Packet& part_packet) {
 	d._received_count++;
 	if (d._outstanding_parts > 0) d._outstanding_parts--;
 	d._last_activity_ms = Utilities::OS::ltime();
+	// (#60) Reset receiver retry budget on each successful part. The
+	// retry counter only matters when the transfer stalls entirely; as
+	// long as parts keep arriving we should keep going, even on a
+	// lossy link where every batch needs another window_timeout to
+	// re-request the dropped part.
+	d._retries_left = Type::Resource::MAX_RETRIES;
 
 	// Advance the consecutive-completed pointer as far as we can.
 	int32_t cp = d._consecutive_completed_height + 1;
