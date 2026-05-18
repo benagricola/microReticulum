@@ -133,6 +133,7 @@ namespace RNS {
 			using resource = void(*)(const ResourceAdvertisement& resource_advertisement);
 			using resource_started = void(*)(const Resource& resource);
 			using resource_concluded = void(*)(const Resource& resource);
+			using resource_progress  = void(*)(const Resource& resource);
 		public:
 			established _established = nullptr;
 			closed _closed = nullptr;
@@ -141,6 +142,7 @@ namespace RNS {
 			resource _resource = nullptr;
 			resource_started _resource_started = nullptr;
 			resource_concluded _resource_concluded = nullptr;
+			resource_progress _resource_progress = nullptr;
 		friend class Link;
 		};
 
@@ -231,6 +233,7 @@ namespace RNS {
 		void set_resource_callback(Callbacks::resource callback);
 		void set_resource_started_callback(Callbacks::resource_started callback);
 		void set_resource_concluded_callback(Callbacks::resource_concluded callback);
+		void set_resource_progress_callback(Callbacks::resource_progress callback);
 		void resource_concluded(const Resource& resource);
 		void set_resource_strategy(Type::Link::resource_strategy strategy);
 		void register_outgoing_resource(const Resource& resource);

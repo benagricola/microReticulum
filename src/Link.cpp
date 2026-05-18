@@ -1300,7 +1300,7 @@ void Link::receive(const Packet& packet) {
 
 					Resource resource = Resource::accept(adv, *this,
 					                                    _object->_callbacks._resource_concluded,
-					                                    nullptr);
+					                                    _object->_callbacks._resource_progress);
 					if (resource.status() == Type::Resource::FAILED) {
 						// Buffer allocation failed (e.g. heap OOM after the
 						// quota check passed). Tell the sender.
@@ -1638,6 +1638,11 @@ void Link::set_resource_started_callback(Callbacks::resource_started callback) {
 void Link::set_resource_concluded_callback(Callbacks::resource_concluded callback) {
 	assert(_object);
 	_object->_callbacks._resource_concluded = callback;
+}
+
+void Link::set_resource_progress_callback(Callbacks::resource_progress callback) {
+	assert(_object);
+	_object->_callbacks._resource_progress = callback;
 }
 
 
