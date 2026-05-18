@@ -1208,6 +1208,33 @@ void Link::receive(const Packet& packet) {
 				// for our timeout.
 				case Type::Packet::RESOURCE_ADV:
 				{
+					// Lossy-link recovery: if the LRRTT (ctx=254) packet
+					// that promotes us to ACTIVE was dropped in the air,
+					// but the sender's ADV reached us, the link is
+					// de-facto established — the sender wouldn't ADV
+					// without seeing our PROOF and transitioning itself
+					// to ACTIVE. Promote our side now and fire the
+					// link-established callback so the owner can set
+					// resource_strategy / packet callback before we
+					// evaluate the ADV. The poll-driven establishment
+					// watchdog stays as a backstop for the case where
+					// no ADV ever arrives.
+					if (_object->_status == Type::Link::HANDSHAKE) {
+						_object->_status = Type::Link::ACTIVE;
+						_object->_activated_at = OS::time();
+						_object->_last_proof = _object->_activated_at;
+						Transport::activate_link(*this);
+						DEBUGF("Link %s promoted HANDSHAKE -> ACTIVE on RESOURCE_ADV (LRRTT presumed lost)",
+						       toString().c_str());
+						if (_object->_owner.callbacks()._link_established != nullptr) {
+							try {
+								_object->_owner.callbacks()._link_established(*this);
+							}
+							catch (const std::exception& e) {
+								ERRORF("Recovery link_established callback threw: %s", e.what());
+							}
+						}
+					}
 					if (_object->_resource_strategy == Type::Link::ACCEPT_NONE) {
 						DEBUG("RESOURCE_ADV refused: resource_strategy=ACCEPT_NONE");
 						break;
