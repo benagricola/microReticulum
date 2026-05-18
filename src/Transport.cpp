@@ -2042,6 +2042,20 @@ DestinationEntry empty_destination_entry;
 							expires = now + PATHFINDER_E;
 						}
 
+						// Cap the per-destination random_blob set so the
+						// persisted DestinationEntry doesn't grow unbounded
+						// over the lifetime of a peer. Each blob serialises
+						// to ~12 bytes; without this cap the entry adds
+						// 12 bytes per received announce forever. The cap
+						// constants (MAX_RANDOM_BLOBS / PERSIST_RANDOM_BLOBS)
+						// have lived in Type.h since the port but the
+						// enforcement was never written — exposed by lifting
+						// the microStore USTORE_MAX_VALUE_LEN, which used to
+						// silently reject writes once the entry exceeded 1 KB
+						// and so masked the growth.
+						while (random_blobs.size() >= Type::Transport::MAX_RANDOM_BLOBS) {
+							random_blobs.erase(random_blobs.begin());
+						}
 						random_blobs.insert(random_blob);
 
 						if ((Reticulum::transport_enabled() || Transport::from_local_client(packet)) && packet.context() != Type::Packet::PATH_RESPONSE) {
