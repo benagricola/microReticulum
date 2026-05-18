@@ -99,6 +99,18 @@ namespace RNS {
 		// Called from on_part() when outstanding_parts == 0.
 		void update_eifr();
 
+		// Sender-side: fetch part `index` into `out`. If the ciphertext
+		// was spilled to disk in _build_outgoing (encrypted.size() >
+		// RAM_BUFFER_THRESHOLD), reads SDU-sized chunk from the on-disk
+		// file; otherwise copies from the in-memory _parts vector.
+		// Returns true on success.
+		bool _load_part(uint16_t index, Bytes& out) const;
+
+		// Sender-side cleanup: unlink any on-disk ciphertext file and
+		// clear the path. Called from cancel(), on_proof() COMPLETE/
+		// CORRUPT branches, and the destructor for safety. Idempotent.
+		void _release_ciphertext_file();
+
 		// Receiver: ingest an incoming RESOURCE part packet. Computes the
 		// part's map_hash, locates the corresponding slot, writes data
 		// into the ResourceBuffer at part_index*sdu. If the window is now

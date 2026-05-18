@@ -436,6 +436,55 @@ bool Resource::_build_outgoing(uint16_t link_mdu) {
 	d._map_hashes.clear(); d._map_hashes.reserve(n_parts);
 	d._map_full = Bytes();
 
+	// Spill decision: once the ciphertext is large enough that holding
+	// it in PSRAM for the entire (potentially minutes-long) Resource
+	// transfer is wasteful, write it to a temp file under the
+	// resource-tmp directory and have _load_part read SDU-sized chunks
+	// on demand. Threshold mirrors the receive side's HeapResourceBuffer
+	// vs FlashResourceBuffer cutoff (RAM_BUFFER_THRESHOLD = 8 KiB), so a
+	// fresh chat message stays in RAM and an attachment spills to disk.
+	const bool spill_to_disk =
+		d._transfer_size > Type::Resource::RAM_BUFFER_THRESHOLD;
+
+	if (spill_to_disk) {
+		// Pick a unique filename under the configured tmp dir. Resolver
+		// is SD-aware in the firmware (set up in RNode_Firmware.ino).
+		static uint64_t snd_counter = 0;
+		char path[256];
+		snprintf(path, sizeof(path), "%s/snd_%llu_%llu.bin",
+		         RNS::resource_tmp_path(),
+		         (unsigned long long)Utilities::OS::ltime(),
+		         (unsigned long long)(++snd_counter));
+		d._ciphertext_path = path;
+
+		try {
+			microStore::File f = Utilities::OS::open_file(
+				d._ciphertext_path.c_str(), microStore::File::ModeReadWrite);
+			if (!f) {
+				ERRORF("Resource: failed to open ciphertext temp '%s'",
+				       d._ciphertext_path.c_str());
+				d._ciphertext_path.clear();
+				return false;
+			}
+			const size_t wrote = f.write(encrypted.data(), encrypted.size());
+			f.flush();
+			f.close();
+			if (wrote != encrypted.size()) {
+				ERRORF("Resource: ciphertext write short %zu/%zu",
+				       wrote, encrypted.size());
+				Utilities::OS::remove_file(d._ciphertext_path.c_str());
+				d._ciphertext_path.clear();
+				return false;
+			}
+		}
+		catch (const std::exception& e) {
+			ERRORF("Resource: ciphertext spill failed: %s", e.what());
+			d._ciphertext_path.clear();
+			return false;
+		}
+		Utilities::OS::reset_watchdog();
+	}
+
 	for (uint16_t i = 0; i < n_parts; ++i) {
 		const size_t offset = (size_t)i * sdu;
 		const size_t length = std::min((size_t)sdu, (size_t)(d._transfer_size - offset));
@@ -444,7 +493,9 @@ bool Resource::_build_outgoing(uint16_t link_mdu) {
 		const Bytes map_hash =
 			Identity::full_hash(part_data + random_hash).left(Type::Resource::MAPHASH_LEN);
 
-		d._parts.push_back(part_data);
+		// Only retain per-part bytes in memory when we're NOT spilling
+		// — under spill, _load_part reads the chunk from disk on demand.
+		if (!spill_to_disk) d._parts.push_back(part_data);
 		d._map_hashes.push_back(map_hash);
 		d._map_full.append(map_hash);
 
@@ -453,7 +504,76 @@ bool Resource::_build_outgoing(uint16_t link_mdu) {
 		if ((i & 0x07) == 0) Utilities::OS::reset_watchdog();
 	}
 
+	// Drop the in-memory ciphertext now that it's safely on disk; we
+	// only need _hash + _expected_proof + _map_hashes from here on, and
+	// the per-part bytes come from the file via _load_part.
+	if (spill_to_disk) {
+		d._encrypted = Bytes();
+	}
+
 	return true;
+}
+
+bool Resource::_load_part(uint16_t index, Bytes& out) const {
+	assert(_object);
+	auto& d = *_object;
+	if (index >= d._parts_count) return false;
+
+	// In-memory path: trivial copy out of the pre-sliced vector.
+	if (d._ciphertext_path.empty()) {
+		if (index >= d._parts.size()) return false;
+		out = d._parts[index];
+		return true;
+	}
+
+	// Disk-backed path: open the spilled ciphertext, seek to the part
+	// offset, read SDU-sized chunk. The final part may be short.
+	const size_t offset = (size_t)index * (size_t)d._sdu;
+	if (offset >= d._transfer_size) return false;
+	const size_t length = std::min((size_t)d._sdu,
+	                               (size_t)(d._transfer_size - offset));
+	try {
+		microStore::File f = Utilities::OS::open_file(
+			d._ciphertext_path.c_str(), microStore::File::ModeRead);
+		if (!f) {
+			ERRORF("Resource::_load_part: open '%s' failed",
+			       d._ciphertext_path.c_str());
+			return false;
+		}
+		if (f.seek((uint32_t)offset, microStore::SeekModeSet) < 0) {
+			ERRORF("Resource::_load_part: seek to %zu failed", offset);
+			return false;
+		}
+		uint8_t* dst = out.writable(length);
+		if (dst == nullptr) return false;
+		const size_t got = f.read(dst, length);
+		f.close();
+		if (got != length) {
+			ERRORF("Resource::_load_part: read short %zu/%zu", got, length);
+			return false;
+		}
+		return true;
+	}
+	catch (const std::exception& e) {
+		ERRORF("Resource::_load_part: %s", e.what());
+		return false;
+	}
+}
+
+void Resource::_release_ciphertext_file() {
+	assert(_object);
+	auto& d = *_object;
+	if (d._ciphertext_path.empty()) return;
+	try {
+		if (Utilities::OS::file_exists(d._ciphertext_path.c_str())) {
+			Utilities::OS::remove_file(d._ciphertext_path.c_str());
+		}
+	}
+	catch (const std::exception& e) {
+		WARNINGF("Resource: unlink '%s' threw: %s",
+		         d._ciphertext_path.c_str(), e.what());
+	}
+	d._ciphertext_path.clear();
 }
 
 void Resource::_send_advertisement() {
@@ -843,6 +963,9 @@ void Resource::on_proof(const Bytes& proof) {
 			}
 		}
 	}
+	// Either way, the spilled ciphertext is no longer useful — the
+	// receiver has either acknowledged everything or rejected us.
+	_release_ciphertext_file();
 }
 
 const Bytes& Resource::plaintext() const {
@@ -1013,8 +1136,13 @@ void Resource::on_request(const Bytes& body) {
 		cursor += MAPLEN;
 		for (uint16_t i = 0; i < d._parts_count; ++i) {
 			if (d._map_hashes[i] == req_map_hash) {
+				Bytes part_data;
+				if (!_load_part(i, part_data)) {
+					ERRORF("on_request: _load_part(%u) failed", (unsigned)i);
+					break;
+				}
 				try {
-					Packet part_packet(d._link, d._parts[i],
+					Packet part_packet(d._link, part_data,
 					                   Type::Packet::DATA, Type::Packet::RESOURCE);
 					part_packet.send();
 					resent++;
@@ -1109,6 +1237,8 @@ void Resource::cancel() {
 	}
 	d._status = Type::Resource::FAILED;
 	if (d._buffer) d._buffer->discard();
+	// Sender's spilled ciphertext (if any) is no longer needed.
+	_release_ciphertext_file();
 	DEBUGF("Resource: cancelled (%s side) hash=%s",
 	       d._initiator ? "sender" : "receiver", d._hash.toHex().c_str());
 

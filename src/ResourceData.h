@@ -94,6 +94,17 @@ private:
 	double   _rtt              = 0.0;             // seconds; populated from Link.rtt at construction
 	double   _timeout          = 0.0;             // seconds; full-resource watchdog
 
+	// --- Sender-side ciphertext spill (steps 7/8) ---
+	// Once the encrypted blob exceeds RAM_BUFFER_THRESHOLD,
+	// _build_outgoing writes it to a temp file under the configured
+	// resource-tmp directory and leaves _encrypted empty. _send_part
+	// (via _get_part) seeks into that file by part index instead of
+	// indexing _parts, so the full ciphertext doesn't dwell in PSRAM
+	// for the entire (potentially minutes-long) Resource transfer.
+	// Empty string indicates in-memory mode; cleared back to empty on
+	// COMPLETE / FAILED / cancel after the underlying file is unlinked.
+	std::string _ciphertext_path;
+
 	// --- Rate tracking for airtime-aware window timeout ---
 	// `_eifr_bps` is the Effective Interface Rate in bits/sec — the
 	// observed throughput of the underlying link, including any duty-
