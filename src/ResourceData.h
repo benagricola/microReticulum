@@ -94,6 +94,22 @@ private:
 	double   _rtt              = 0.0;             // seconds; populated from Link.rtt at construction
 	double   _timeout          = 0.0;             // seconds; full-resource watchdog
 
+	// --- Rate tracking for airtime-aware window timeout ---
+	// `_eifr_bps` is the Effective Interface Rate in bits/sec — the
+	// observed throughput of the underlying link, including any duty-
+	// cycle / airtime throttling at the radio. The watchdog scales the
+	// window timeout to `expected_tof = outstanding_parts * sdu * 8 /
+	// eifr_bps`, so a tightly-capped link (e.g. EU 1% sub-band) gets a
+	// proportionally longer timeout instead of failing fast.
+	// `_rtt_rxd_bytes` is the cumulative bytes received during this
+	// resource's lifetime; `_rtt_rxd_bytes_at_part_req` snapshots that
+	// counter at the last REQ send, so each window's observed rate is
+	// (delta_bytes * 8) / (now - _req_sent_ms). Ported from upstream
+	// Resource.py's req_data_rtt_rate + update_eifr() logic.
+	double   _eifr_bps                  = 0.0;
+	uint64_t _rtt_rxd_bytes             = 0;
+	uint64_t _rtt_rxd_bytes_at_part_req = 0;
+
 	// --- State ---
 	Type::Resource::status _status = Type::Resource::NONE;
 	bool _initiator = false;                      // true on sender, false on receiver

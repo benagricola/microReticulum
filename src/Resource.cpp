@@ -645,9 +645,58 @@ void Resource::send_part_request() {
 	d._req_sent_ms      = Utilities::OS::ltime();
 	d._last_activity_ms = d._req_sent_ms;
 	d._outstanding_parts = asked;
+	// Snapshot the cumulative-bytes counter so the next on_part() that
+	// completes the window can compute observed throughput as
+	// (bytes_since_req / wall_time_since_req).
+	d._rtt_rxd_bytes_at_part_req = d._rtt_rxd_bytes;
 	DEBUGF("Resource: sent REQ (asking for %u parts, exhausted=%s)",
 	       (unsigned)asked,
 	       exhausted == Type::Resource::HASHMAP_IS_EXHAUSTED ? "yes" : "no");
+}
+
+// Receiver-only. Recompute EIFR from the last completed window's
+// observation, or bootstrap from the underlying Link's
+// establishment_cost / rtt when no window has completed yet.
+//
+// Floor at 50 bps so a degenerate observation (e.g. a single late
+// part on a hostile link) doesn't pin the window timeout near
+// infinity. Cap at 1 Mbps so an early observation on a fast probe
+// doesn't shrink the window timeout below useful levels.
+void Resource::update_eifr() {
+	assert(_object);
+	auto& d = *_object;
+	double rtt_s = const_cast<Link&>(d._link).rtt();
+	if (rtt_s <= 0.0) rtt_s = 2.0;
+
+	// Observed-rate path: we have at least one completed window's worth
+	// of (bytes, time) data. Trust it.
+	if (d._req_sent_ms > 0 && d._rtt_rxd_bytes > d._rtt_rxd_bytes_at_part_req) {
+		const uint64_t now_ms = Utilities::OS::ltime();
+		const uint64_t window_ms = now_ms - d._req_sent_ms;
+		const uint64_t delta_bytes = d._rtt_rxd_bytes - d._rtt_rxd_bytes_at_part_req;
+		if (window_ms > 0) {
+			d._eifr_bps = (double)(delta_bytes * 8ULL) * 1000.0 / (double)window_ms;
+		}
+	}
+
+	// Bootstrap path: first window, no observation. Use link's
+	// establishment cost / rtt as a rough rate estimate.
+	if (d._eifr_bps <= 0.0) {
+		const uint16_t est_cost = const_cast<Link&>(d._link).establishment_cost();
+		if (est_cost > 0) {
+			d._eifr_bps = (double)(est_cost * 8) / rtt_s;
+		} else {
+			// No establishment cost recorded — assume a pessimistic
+			// 100 bps so first-window timeout is generous (typical
+			// LoRa at SF7 BW250k is ~10 kbps so this errs on the
+			// safe side of over-waiting).
+			d._eifr_bps = 100.0;
+		}
+	}
+
+	// Floor + ceiling so pathological samples don't break timeout math.
+	if (d._eifr_bps < 50.0) d._eifr_bps = 50.0;
+	if (d._eifr_bps > 1000000.0) d._eifr_bps = 1000000.0;
 }
 
 // --------------------------------------------------------------------------
@@ -688,6 +737,9 @@ void Resource::on_part(const Packet& part_packet) {
 	d._received_count++;
 	if (d._outstanding_parts > 0) d._outstanding_parts--;
 	d._last_activity_ms = Utilities::OS::ltime();
+	// Cumulative bytes seen — feeds update_eifr() on window completion
+	// so the receiver's window_timeout adapts to airtime throttling.
+	d._rtt_rxd_bytes += part_data.size();
 	// (#60) Reset receiver retry budget on each successful part. The
 	// retry counter only matters when the transfer stalls entirely; as
 	// long as parts keep arriving we should keep going, even on a
@@ -715,7 +767,10 @@ void Resource::on_part(const Packet& part_packet) {
 		_assemble_and_deliver();
 	}
 	else if (d._outstanding_parts == 0) {
-		// Window done; request the next batch.
+		// Window done; recompute EIFR from observed throughput before
+		// firing the next REQ so future window timeouts reflect the
+		// link's real (possibly airtime-throttled) rate.
+		update_eifr();
 		send_part_request();
 	}
 }
@@ -1113,20 +1168,26 @@ void Resource::tick(uint64_t now_ms) {
 	    d._status == Type::Resource::FAILED ||
 	    d._status == Type::Resource::CORRUPT) return;
 
-	// Compute the per-window timeout. RTT defaults to a generous fallback
-	// when the Link hasn't measured one yet (link just established).
 	double rtt = const_cast<Link&>(d._link).rtt();
 	if (rtt <= 0.0) rtt = 2.0;
-	const uint64_t window_timeout_ms =
-		(uint64_t)(rtt * Type::Resource::PART_TIMEOUT_FACTOR_AFTER_RTT * 1000.0);
 	const uint64_t adv_timeout_ms =
 		(uint64_t)(rtt * Type::Resource::PART_TIMEOUT_FACTOR * 1000.0);
 	const uint64_t elapsed = now_ms - d._last_activity_ms;
 
 	if (d._initiator) {
 		// Sender. ADVERTISED waiting for REQ: re-send ADV up to
-		// MAX_ADV_RETRIES. TRANSFERRING / AWAITING_PROOF: just count
-		// retries; receiver is responsible for re-REQing.
+		// MAX_ADV_RETRIES. TRANSFERRING / AWAITING_PROOF: trust the
+		// receiver to drive REQ retries — the receiver's window
+		// timeout is now EIFR-adapted, so it will keep REQing on
+		// airtime-throttled links until either the transfer completes
+		// or its own MAX_RETRIES exhausts. Sender's max_wait is
+		// generous (MAX_RETRIES * SENDER_GRACE_TIME) so a slow
+		// receiver doesn't trigger a premature sender abort while
+		// the receiver is still patiently waiting for parts to
+		// dribble out of an airtime-capped queue.
+		const uint64_t sender_max_wait_ms =
+			(uint64_t)(Type::Resource::SENDER_GRACE_TIME * 1000.0) *
+			Type::Resource::MAX_RETRIES;
 		if (d._status == Type::Resource::ADVERTISED && elapsed > adv_timeout_ms) {
 			if (d._adv_retries_left > 0) {
 				d._adv_retries_left--;
@@ -1141,26 +1202,53 @@ void Resource::tick(uint64_t now_ms) {
 		}
 		else if ((d._status == Type::Resource::TRANSFERRING ||
 		          d._status == Type::Resource::AWAITING_PROOF) &&
-		         elapsed > window_timeout_ms * Type::Resource::MAX_RETRIES) {
-			NOTICEF("Resource: transfer timeout, FAILED hash=%s",
-			        d._hash.toHex().c_str());
+		         elapsed > sender_max_wait_ms) {
+			NOTICEF("Resource: transfer timeout, FAILED hash=%s (no receiver activity for %u ms)",
+			        d._hash.toHex().c_str(), (unsigned)elapsed);
 			cancel();
 		}
 	}
 	else {
-		// Receiver. Re-request the current window if we've been waiting
-		// too long; FAIL if MAX_RETRIES rounds have been exhausted.
-		if (d._status == Type::Resource::TRANSFERRING && elapsed > window_timeout_ms) {
+		// Receiver. Window timeout is EIFR-based — scales with the
+		// observed (or bootstrap-estimated) link rate so airtime-
+		// throttled links get proportionally longer waits instead
+		// of failing fast.
+		//
+		// expected_tof = outstanding_parts * sdu * 8 / eifr_bps
+		// window_timeout = PART_TIMEOUT_FACTOR_AFTER_RTT * expected_tof
+		//                + RETRY_GRACE + retries_used * PER_RETRY_DELAY
+		//
+		// Ported from upstream RNS Resource.py:596-617. On a 1%-capped
+		// EU sub-band carrying a 4 KB body (18 parts, ~250 ms airtime
+		// each), this yields ~115 s expected window TOF and a ~230 s
+		// timeout. Without EIFR the receiver would fail in 4 s.
+		if (d._status != Type::Resource::TRANSFERRING) return;
+
+		if (d._eifr_bps <= 0.0) update_eifr();
+		const double sdu_bits = (double)d._sdu * 8.0;
+		const double outstanding = (double)d._outstanding_parts;
+		const double expected_tof_s = (outstanding * sdu_bits) / d._eifr_bps;
+		const double retries_used = (double)(Type::Resource::MAX_RETRIES - d._retries_left);
+		const double extra_wait_s = retries_used * Type::Resource::PER_RETRY_DELAY;
+		const double window_timeout_s =
+			Type::Resource::PART_TIMEOUT_FACTOR_AFTER_RTT * expected_tof_s
+			+ Type::Resource::RETRY_GRACE_TIME
+			+ extra_wait_s;
+		const uint64_t window_timeout_ms = (uint64_t)(window_timeout_s * 1000.0);
+
+		if (elapsed > window_timeout_ms) {
 			if (d._retries_left > 0) {
 				d._retries_left--;
-				DEBUGF("Resource: REQ retry (%u left)", (unsigned)d._retries_left);
-				// outstanding_parts is reset by send_part_request itself
+				DEBUGF("Resource: REQ retry (%u left, window_timeout=%u ms, eifr=%.0f bps)",
+				       (unsigned)d._retries_left,
+				       (unsigned)window_timeout_ms, d._eifr_bps);
 				d._outstanding_parts = 0;
 				send_part_request();
 			}
 			else {
-				NOTICEF("Resource: receive timeout, FAILED hash=%s",
-				        d._hash.toHex().c_str());
+				NOTICEF("Resource: receive timeout, FAILED hash=%s (eifr=%.0f bps, window=%u ms)",
+				        d._hash.toHex().c_str(), d._eifr_bps,
+				        (unsigned)window_timeout_ms);
 				cancel();
 			}
 		}

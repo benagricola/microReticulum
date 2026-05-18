@@ -91,6 +91,14 @@ namespace RNS {
 		// initial request), then again after each window completes.
 		void send_part_request();
 
+		// Receiver: recompute the Effective Interface Rate from the bytes
+		// received during the last completed window. Bootstrap (first
+		// window, no observation yet) uses the underlying Link's
+		// establishment_cost / rtt; clamped to a 50 bps floor so a
+		// pathologically low rate doesn't pin window_timeout at infinity.
+		// Called from on_part() when outstanding_parts == 0.
+		void update_eifr();
+
 		// Receiver: ingest an incoming RESOURCE part packet. Computes the
 		// part's map_hash, locates the corresponding slot, writes data
 		// into the ResourceBuffer at part_index*sdu. If the window is now
