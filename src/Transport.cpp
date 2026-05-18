@@ -4303,16 +4303,16 @@ TRACEF("Transport::write_path_table: buffer size %lu bytes", Persistence::_buffe
 
 			uint16_t count = 0;
 			for (const auto& [timestamp, destination_hash] : sorted_keys) {
-				TRACEF("Transport::cull_announce_table: Removing destination %s from path table", destination_hash.toHex().c_str());
+				TRACEF("Transport::cull_announce_table: Removing destination %s from announce table", destination_hash.toHex().c_str());
 				if (_announce_table.erase(destination_hash) < 1) {
-					WARNINGF("Failed to remove destination %s from path table", destination_hash.toHex().c_str());
+					WARNINGF("Failed to remove destination %s from announce table", destination_hash.toHex().c_str());
 				}
 				++count;
-				if (_announce_table.size() <= _path_table_maxsize) {
+				if (_announce_table.size() <= _announce_table_maxsize) {
 					break;
 				}
 			}
-			DEBUGF("Removed %d path(s) from path table", count);
+			DEBUGF("Removed %d entry/ies from announce table", count);
 		}
 		catch (const std::bad_alloc& e) {
 			ERROR("cull_announce_table: bad_alloc - out of memory building sort index, falling back to single erase");
