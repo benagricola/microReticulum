@@ -1214,9 +1214,7 @@ std::string Resource::toString() const {
 	if (!_object) {
 		return "";
 	}
-    //return "<"+RNS.hexrep(self.hash,delimit=False)+"/"+RNS.hexrep(self.link.link_id,delimit=False)+">"
-	//return "{Resource:" + _object->_hash.toHex() + "}";
-	return "{Resource: unknown}";
+	return "{Resource:" + _object->_hash.toHex() + "}";
 }
 
 // getters
