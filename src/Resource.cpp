@@ -1167,7 +1167,18 @@ void Resource::tick(uint64_t now_ms) {
 :returns: The current progress of the resource transfer as a *float* between 0.0 and 1.0.
 */
 float Resource::get_progress() const {
+	assert(_object);
+	const auto& d = *_object;
+	if (d._parts_count == 0) return 0.0f;
+	const uint16_t done = d._initiator ? d._sent_parts : d._received_count;
+	if (done >= d._parts_count) return 1.0f;
+	return (float)done / (float)d._parts_count;
+}
 /*
+	// Original (Python-style) implementation kept for reference. Single-
+	// segment only is the firmware's stance, so the segment-index +
+	// total_size math is unused; the simple done/total ratio above is
+	// equivalent for our s=1, non-split case.
 	assert(_object);
 	if (_object->_initiator) {
 		_object->_processed_parts = (_object->_segment_index-1)*math.ceil(Type::Resource::MAX_EFFICIENT_SIZE/Type::Resource::SDU);
@@ -1187,8 +1198,6 @@ float Resource::get_progress() const {
 
 	return (float)_object->processed_parts / (float)_object->progress_total_parts;
 */
-	return 0.0;
-}
 
 void Resource::set_concluded_callback(Callbacks::concluded callback) {
 	assert(_object);
