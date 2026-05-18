@@ -83,10 +83,19 @@ namespace RNS { namespace Utilities {
 #endif
 		//inline static void sleep(uint32_t milliseconds) { ::sleep((float)milliseconds / 1000.0); }
 
-		// round decimal number to specified precision
-		//inline static float round(float value, uint8_t precision) { return std::round(value / precision) * precision; }
-		//inline static double round(double value, uint8_t precision) { return std::round(value / precision) * precision; }
-		inline static double round(double value, uint8_t precision) { return std::round(value / precision) * precision; }
+		// Round `value` to `precision` decimal places. E.g.
+		// round(0.6, 3) == 0.600. The old implementation divided by
+		// precision instead of pow(10, precision), so it actually
+		// snapped values to multiples of `precision` — round(0.6, 3)
+		// returned 0.0 because 0.6/3 rounds to 0 — making every
+		// RTT log line display "RTT is 0.000 s" for any link with
+		// RTT < 1.5 s and burning a debugging session chasing a
+		// non-existent timer bug.
+		inline static double round(double value, uint8_t precision) {
+			double factor = 1.0;
+			for (uint8_t i = 0; i < precision; ++i) factor *= 10.0;
+			return std::round(value * factor) / factor;
+		}
 
 		inline static uint64_t from_bytes_big_endian(const uint8_t* data, size_t len) {
 			uint64_t result = 0;
