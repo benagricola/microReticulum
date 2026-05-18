@@ -25,27 +25,39 @@ size_t g_flash_pending_bytes = 0;
 // populated lazily from Reticulum's storagepath if not explicitly set.
 std::string g_resource_tmp_path;
 
+// Optional per-open() resolver; SD-aware in the firmware. When set,
+// returns the directory for the current allocation; when null, the
+// static path above is used.
+ResourceTmpPathResolver g_resource_tmp_path_resolver = nullptr;
+
 // Monotonic counter to ensure temp filenames are unique within a boot.
 uint64_t g_resource_tmp_counter = 0;
 
-void ensure_tmp_path_default() {
-    if (!g_resource_tmp_path.empty()) return;
-    // We can't depend on Reticulum::storagepath() here without coupling
-    // Reticulum.h, so default to a hidden directory at the FS root that the
-    // firmware is expected to override via set_resource_tmp_path() if it
-    // wants something inside its own storage tree.
-    g_resource_tmp_path = "/resources_tmp";
+const char* current_tmp_path() {
+    if (g_resource_tmp_path_resolver) {
+        const char* p = g_resource_tmp_path_resolver();
+        if (p && *p) return p;
+    }
+    if (g_resource_tmp_path.empty()) {
+        // We can't depend on Reticulum::storagepath() here without
+        // coupling Reticulum.h, so default to a hidden directory at the
+        // FS root that the firmware is expected to override via
+        // set_resource_tmp_path[_resolver] if it wants something inside
+        // its own storage tree.
+        g_resource_tmp_path = "/resources_tmp";
+    }
+    return g_resource_tmp_path.c_str();
 }
 
 bool ensure_tmp_dir_exists() {
-    ensure_tmp_path_default();
+    const char* dir = current_tmp_path();
     try {
-        if (OS::directory_exists(g_resource_tmp_path.c_str())) return true;
-        return OS::create_directory(g_resource_tmp_path.c_str());
+        if (OS::directory_exists(dir)) return true;
+        return OS::create_directory(dir);
     }
     catch (const std::exception& e) {
         ERRORF("ResourceBuffer: failed to create tmp dir '%s': %s",
-               g_resource_tmp_path.c_str(), e.what());
+               dir, e.what());
         return false;
     }
 }
@@ -133,9 +145,12 @@ bool FlashResourceBuffer::open(size_t total_size) {
     if (!ensure_tmp_dir_exists()) return false;
 
     // Build a unique temp path: <tmp_dir>/res_<ltime_ms>_<counter>.bin
+    // Path resolved per-open() — SD-aware in the firmware via the
+    // optional ResourceTmpPathResolver, falling back to the static
+    // path otherwise. Picks up mid-session SD insert/eject.
     char path[256];
     snprintf(path, sizeof(path), "%s/res_%llu_%llu.bin",
-             g_resource_tmp_path.c_str(),
+             current_tmp_path(),
              (unsigned long long)OS::ltime(),
              (unsigned long long)(++g_resource_tmp_counter));
     _temp_path = path;
@@ -288,6 +303,11 @@ void RNS::set_resource_tmp_path(const char* directory_path) {
 }
 
 const char* RNS::resource_tmp_path() {
-    ensure_tmp_path_default();
-    return g_resource_tmp_path.c_str();
+    // Force evaluation of any resolver / default through the same path
+    // used at open() time so callers see consistent results.
+    return current_tmp_path();
+}
+
+void RNS::set_resource_tmp_path_resolver(ResourceTmpPathResolver resolver) {
+    g_resource_tmp_path_resolver = resolver;
 }

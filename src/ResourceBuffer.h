@@ -122,4 +122,18 @@ bool   flash_quota_can_allocate(size_t additional_bytes);
 void set_resource_tmp_path(const char* directory_path);
 const char* resource_tmp_path();
 
+// Optional resolver consulted per-FlashResourceBuffer::open(). When set,
+// returns the directory to use for that specific allocation; when null,
+// the static path from set_resource_tmp_path() (or its default) is used.
+// Firmware uses this for SD-aware routing: "/sd/lxmf_resource_tmp" when
+// the card is mounted, "/lxmf_resource_tmp" when it isn't. The resolver
+// is consulted at allocation time rather than once at boot so mid-session
+// card insert/eject is honoured on the next transfer.
+//
+// The directory itself must exist before open() runs — firmware should
+// pre-create both candidate paths at boot since microReticulum's
+// OS::create_directory only knows about microStore filesystem, not SD.
+using ResourceTmpPathResolver = const char* (*)();
+void set_resource_tmp_path_resolver(ResourceTmpPathResolver resolver);
+
 }  // namespace RNS
