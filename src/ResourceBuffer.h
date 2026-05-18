@@ -136,4 +136,16 @@ const char* resource_tmp_path();
 using ResourceTmpPathResolver = const char* (*)();
 void set_resource_tmp_path_resolver(ResourceTmpPathResolver resolver);
 
+// Optional resolver consulted whenever the receiver evaluates whether
+// to accept an inbound Resource. When set, returns the largest
+// per-resource size the firmware will currently accept; receivers
+// compare an ADV's transfer_size against this. When null,
+// Type::Resource::FIRMWARE_MAX_INCOMING (the raw protocol ceiling) is
+// used. Firmware installs a resolver that returns
+// Web::Storage::effective_max_receive() so the user-facing cap
+// dominates without recompiling.
+using ResourceMaxIncomingResolver = size_t (*)();
+void set_resource_max_incoming_resolver(ResourceMaxIncomingResolver resolver);
+size_t resource_max_incoming();
+
 }  // namespace RNS

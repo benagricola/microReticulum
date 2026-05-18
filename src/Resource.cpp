@@ -14,6 +14,7 @@
 
 #include "Resource.h"
 
+#include "ResourceBuffer.h"
 #include "ResourceData.h"
 #include "Reticulum.h"
 #include "Transport.h"
@@ -405,11 +406,14 @@ bool Resource::_build_outgoing(uint16_t link_mdu) {
 	d._transfer_size = (uint32_t)encrypted.size();
 	d._data_size     = d._transfer_size;   // _d == _t (no compression in this port)
 
-	if (d._transfer_size > Type::Resource::FIRMWARE_MAX_INCOMING) {
-		ERRORF("Resource: transfer size %u exceeds firmware cap %u",
-		       (unsigned)d._transfer_size,
-		       (unsigned)Type::Resource::FIRMWARE_MAX_INCOMING);
-		return false;
+	{
+		const size_t firmware_cap = RNS::resource_max_incoming();
+		if (d._transfer_size > firmware_cap) {
+			ERRORF("Resource: transfer size %u exceeds firmware cap %u",
+			       (unsigned)d._transfer_size,
+			       (unsigned)firmware_cap);
+			return false;
+		}
 	}
 
 	// Resource hash and the proof the receiver will return on completion.

@@ -1274,7 +1274,7 @@ void Link::receive(const Packet& packet) {
 					if (adv.transfer_size() == 0) {
 						send_rcl("zero-size resource"); break;
 					}
-					if (adv.transfer_size() > Type::Resource::FIRMWARE_MAX_INCOMING) {
+					if (adv.transfer_size() > RNS::resource_max_incoming()) {
 						send_rcl("transfer size exceeds firmware cap"); break;
 					}
 					// Flash quota check: only matters for >RAM_BUFFER_THRESHOLD

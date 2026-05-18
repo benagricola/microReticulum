@@ -30,6 +30,11 @@ std::string g_resource_tmp_path;
 // static path above is used.
 ResourceTmpPathResolver g_resource_tmp_path_resolver = nullptr;
 
+// Optional resolver consulted on each receive-cap check. Replaces the
+// static Type::Resource::FIRMWARE_MAX_INCOMING with a runtime value
+// driven by the firmware's StorageConfig.
+ResourceMaxIncomingResolver g_resource_max_incoming_resolver = nullptr;
+
 // Monotonic counter to ensure temp filenames are unique within a boot.
 uint64_t g_resource_tmp_counter = 0;
 
@@ -310,4 +315,16 @@ const char* RNS::resource_tmp_path() {
 
 void RNS::set_resource_tmp_path_resolver(ResourceTmpPathResolver resolver) {
     g_resource_tmp_path_resolver = resolver;
+}
+
+void RNS::set_resource_max_incoming_resolver(ResourceMaxIncomingResolver resolver) {
+    g_resource_max_incoming_resolver = resolver;
+}
+
+size_t RNS::resource_max_incoming() {
+    if (g_resource_max_incoming_resolver) {
+        const size_t v = g_resource_max_incoming_resolver();
+        if (v > 0) return v;
+    }
+    return (size_t)Type::Resource::FIRMWARE_MAX_INCOMING;
 }
