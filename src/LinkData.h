@@ -91,6 +91,15 @@ namespace RNS {
 
 		Cryptography::Token::Ptr _token;
 
+		// Consecutive Link::decrypt() failures on this link. Bumped by
+		// Link::decrypt on every empty return (Token threw); reset to
+		// 0 by the first successful decrypt. When it hits a small
+		// threshold we tear the link down so the remote stops blasting
+		// retransmits at us (each retransmit costs an esp-aes alloc on
+		// the receiver — under SRAM pressure those start failing and
+		// the firmware's low-memory watchdog reboots the device).
+		uint8_t _consecutive_decrypt_failures = 0;
+
 		Cryptography::X25519PrivateKey::Ptr _prv;
 		Bytes _prv_bytes;
 

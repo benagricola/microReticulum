@@ -1574,6 +1574,28 @@ const Bytes Link::encrypt(const Bytes& plaintext) {
 	}
 }
 
+// Consecutive-failure circuit breaker (ur-patches).
+//
+// When the underlying AES driver can't satisfy decrypt — most often
+// "esp-aes: Failed to allocate memory" on the ESP32-S3 once internal
+// SRAM is under pressure — Link::decrypt returns empty Bytes and the
+// caller in Link::receive() drops the packet. The remote interprets
+// the drop as a transient loss and retransmits with backoff. Each
+// retransmit is another decrypt attempt that fails the same way,
+// burning more SRAM and pushing the system closer to the firmware's
+// low-memory watchdog reboot.
+//
+// Break the cycle: after CONSECUTIVE_DECRYPT_FAILURE_LIMIT empty
+// returns we tear the link down. The LINKCLOSE packet sent by
+// teardown() tells the remote to stop retransmitting; a fresh link
+// can be established later when conditions are better.
+//
+// The threshold is small enough that a brief AES hiccup (1-2 lost
+// packets) doesn't kill an otherwise-healthy link, and large enough
+// that we don't tear down on the first stray ciphertext-corruption
+// glitch over LoRa.
+static constexpr uint8_t CONSECUTIVE_DECRYPT_FAILURE_LIMIT = 5;
+
 const Bytes Link::decrypt(const Bytes& ciphertext) {
 	assert(_object);
 	TRACE("Link::decrypt: decrypting data...");
@@ -1581,10 +1603,26 @@ const Bytes Link::decrypt(const Bytes& ciphertext) {
 		if (!_object->_token) {
 			_object->_token.reset(new Token(_object->_derived_key));
 		}
-		return _object->_token->decrypt(ciphertext);
+		const Bytes plaintext = _object->_token->decrypt(ciphertext);
+		// Reset the failure counter on the first successful decrypt
+		// since the last failure.
+		if (_object->_consecutive_decrypt_failures != 0) {
+			_object->_consecutive_decrypt_failures = 0;
+		}
+		return plaintext;
 	}
 	catch (const std::exception& e) {
 		ERRORF("Decryption failed on link %s. The contained exception was: %s", toString().c_str(), e.what());
+		if (_object->_consecutive_decrypt_failures < 255) {
+			_object->_consecutive_decrypt_failures++;
+		}
+		if (_object->_consecutive_decrypt_failures >= CONSECUTIVE_DECRYPT_FAILURE_LIMIT
+		    && _object->_status != Type::Link::CLOSED) {
+			WARNINGF("Link %s: %u consecutive decrypt failures — tearing down to stop retransmit cascade",
+			          toString().c_str(),
+			          (unsigned)_object->_consecutive_decrypt_failures);
+			teardown();
+		}
 		return {Bytes::NONE};
 	}
 }
