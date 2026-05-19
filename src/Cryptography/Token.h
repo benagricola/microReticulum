@@ -19,6 +19,9 @@
 #include "../Type.h"
 
 #include <stdint.h>
+#include <stdexcept>
+
+#include <mbedtls/aes.h>
 
 namespace RNS { namespace Cryptography {
 
@@ -31,6 +34,26 @@ namespace RNS { namespace Cryptography {
     not relevant to Reticulum. They are therefore stripped from this
     implementation, since they incur overhead and leak initiator metadata.
     */
+
+	// Thrown when the underlying AES driver fails to satisfy a crypt
+	// operation due to resource exhaustion (e.g. esp-aes DMA buffer alloc
+	// fail under internal-SRAM pressure). Caller (Link::decrypt /
+	// Link::encrypt) catches this distinctly from "Could not decrypt
+	// Token token" so the failure-counter and circuit breaker only fire
+	// for genuine protocol-corruption signals — transient AES resource
+	// failures don't tear down an otherwise-healthy link.
+	class aes_resource_exhausted : public std::runtime_error {
+	public:
+		aes_resource_exhausted(const char* op, int rc)
+			: std::runtime_error(std::string("AES ") + op +
+			                     " out of resources (mbedtls rc=" +
+			                     std::to_string(rc) + ")"),
+			  _rc(rc) {}
+		int rc() const { return _rc; }
+	private:
+		int _rc;
+	};
+
 	class Token {
 
 	public:
@@ -47,6 +70,11 @@ namespace RNS { namespace Cryptography {
 		Token(const Bytes& key, RNS::Type::Cryptography::Token::token_mode mode = RNS::Type::Cryptography::Token::MODE_AES);
 		~Token();
 
+		// mbedtls_aes_context is non-trivially copyable — disable copy
+		// to keep the cached engine state consistent with the key.
+		Token(const Token&) = delete;
+		Token& operator=(const Token&) = delete;
+
 	public:
 		bool verify_hmac(const Bytes& token);
 		const Bytes encrypt(const Bytes& data);
@@ -56,6 +84,18 @@ namespace RNS { namespace Cryptography {
 		RNS::Type::Cryptography::Token::token_mode _mode = RNS::Type::Cryptography::Token::MODE_AES_256_CBC;
 		Bytes _signing_key;
 		Bytes _encryption_key;
+
+		// AES engine state, set up once in the ctor (mbedtls_aes_setkey_*
+		// runs the key schedule expansion which is the expensive step).
+		// Per-call encrypt/decrypt just resets IV + runs the cipher.
+		// Previously every Token::encrypt/decrypt stack-constructed a
+		// fresh CBC<AES128> and called setKey() — that meant every
+		// Resource part on a Link re-expanded the round-key schedule and
+		// allocated a fresh esp-aes DMA buffer, which is what was failing
+		// under fragmented internal-SRAM and silently corrupting output.
+		mbedtls_aes_context _aes_enc;
+		mbedtls_aes_context _aes_dec;
+		bool _aes_ready = false;
 	};
 
 } }

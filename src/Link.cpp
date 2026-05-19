@@ -1617,7 +1617,26 @@ const Bytes Link::decrypt(const Bytes& ciphertext) {
 		}
 		return plaintext;
 	}
+	catch (const Cryptography::aes_resource_exhausted& e) {
+		// Transient: the AES driver couldn't satisfy this single decrypt
+		// (most commonly esp-aes DMA buffer alloc fail under SRAM
+		// fragmentation). The link itself is healthy — the same key
+		// will work next time the driver can grab a DMA buffer.
+		// Deliberately do NOT bump the circuit-breaker counter; the
+		// caller (Link::receive) drops the packet, the remote will
+		// retransmit, and the next attempt has a strong chance of
+		// succeeding once a freed allocation defragments the heap.
+		// Pre-mbedtls-refactor this case was indistinguishable from a
+		// genuine protocol corruption and would trip the breaker.
+		ERRORF("Link %s: AES resource exhausted (rc=%d) — transient, dropping packet",
+		       toString().c_str(), e.rc());
+		return {Bytes::NONE};
+	}
 	catch (const std::exception& e) {
+		// Genuine decrypt failure: HMAC valid but PKCS7 padding wrong,
+		// or HMAC itself failed, or some other unexpected error.
+		// Bumping the breaker is correct here — repeated failures of
+		// this kind mean the peer has the wrong key.
 		ERRORF("Decryption failed on link %s. The contained exception was: %s", toString().c_str(), e.what());
 		if (_object->_consecutive_decrypt_failures < 255) {
 			_object->_consecutive_decrypt_failures++;
