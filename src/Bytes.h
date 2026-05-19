@@ -56,9 +56,21 @@ namespace RNS {
 	class Bytes {
 
 	private:
+		// On ESP32 with PSRAM, route the underlying byte buffer through
+		// ContainerAllocator → ps_malloc so Bytes data lives in PSRAM
+		// instead of internal SRAM. Without this, sub-16-KiB allocations
+		// (every packet, every Token-decrypt scratch, every Resource
+		// part copy, every path-table codec value) compete with esp-aes
+		// DMA buffers for the ~30 KiB of internal SRAM that survives
+		// after WiFi/BLE/lwIP/Reticulum-state init — manifests as
+		// "Could not decrypt Token token" → low-memory WDT reboot under
+		// sustained Resource transfer load.
+		// Host/native test builds (no PSRAM) keep the default allocator.
+#if defined(BOARD_HAS_PSRAM) && BOARD_HAS_PSRAM == 1
+		using Data = std::vector<uint8_t, Utilities::Memory::ContainerAllocator<uint8_t>>;
+#else
 		using Data = std::vector<uint8_t>;
-		// CBA Need to fix msgpack serialize/deserialize before enabling ContainerAllocator
-		//using Data = std::vector<uint8_t, Utilities::Memory::ContainerAllocator<uint8_t>>;
+#endif
 		using SharedData = std::shared_ptr<Data>;
 
 	public:
@@ -90,6 +102,17 @@ MEM("Creating from data-move...");
 			assign(std::move(rdata));
 			MEMF("Bytes object created from data-move \"%s\", this: %lu, data: %lu", toString().c_str(), this, _data.get());
 		}
+#if defined(BOARD_HAS_PSRAM) && BOARD_HAS_PSRAM == 1
+		// When Data is the PSRAM-allocator variant, also accept
+		// default-allocator vectors so MsgPack::bin_t<uint8_t> (= std::vector<uint8_t>)
+		// and microStore codec output (also std::vector<uint8_t>) still
+		// flow into Bytes via the same implicit-conversion paths they
+		// used before the allocator change. Copies the bytes through the
+		// chunk-size assign which is allocator-agnostic.
+		Bytes(const std::vector<uint8_t>& v) {
+			if (!v.empty()) assign(v.data(), v.size());
+		}
+#endif
 		Bytes(const uint8_t* chunk, size_t size) {
 			assign(chunk, size);
 			MEMF("Bytes object created from chunk \"%s\", this: %lu, data: %lu", toString().c_str(), this, _data.get());
@@ -176,10 +199,16 @@ MEM("Creating from data-move...");
 		inline operator bool() const {
 			return (_data && !_data->empty());
 		}
-		inline operator const Data() const {
-			if (!_data)
-				return Data();
-			return *_data.get();
+		// Implicit conversion to a default-allocator std::vector<uint8_t>.
+		// This is what MsgPack::Packer, microStore::Codec, and other
+		// library code expect when they see a "binary blob". On builds
+		// where Bytes::Data is the PSRAM-allocator variant this conversion
+		// does a copy into a default-allocator vector; on host builds
+		// where Data is already default-allocator it's just a vector copy.
+		// Either way the caller gets the type they expect.
+		inline operator std::vector<uint8_t>() const {
+			if (!_data) return std::vector<uint8_t>();
+			return std::vector<uint8_t>(_data->begin(), _data->end());
 		}
 		// CBA NOTE: Following cast operators can cause issues with ambiguity from other libraries
 /*
@@ -475,7 +504,11 @@ struct Codec<RNS::Bytes>
 		return std::vector<uint8_t>(entry.collection().begin(), entry.collection().end());
 	}
 	inline static bool decode(const std::vector<uint8_t>& data, RNS::Bytes& entry) {
-		entry.assign(data);
+		// data is microStore's std::vector<uint8_t> (default allocator).
+		// Bytes::Data may be the PSRAM-allocator variant on ESP32 builds,
+		// so go through raw-pointer assign which works regardless of the
+		// underlying Data allocator.
+		entry.assign(data.data(), data.size());
 		return true;
 	}
 };

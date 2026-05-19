@@ -992,8 +992,10 @@ void Link::request_resource_concluded(const Resource& resource) {
 		unpacker.from_array(requested_at, path_hash, request_data);
 		ResourceRequest resource_request;
 		resource_request._requested_at = requested_at;
-		resource_request._path_hash = path_hash;
-		resource_request._request_data = request_data;
+		// Bytes::Data is allocator-flavoured under BOARD_HAS_PSRAM; go through
+		// the raw-pointer assign which is allocator-agnostic.
+		resource_request._path_hash.assign(path_hash.data(), path_hash.size());
+		resource_request._request_data.assign(request_data.data(), request_data.size());
         //p request_id        = RNS.Identity.truncated_hash(packed_request)
 		Bytes request_id(Identity::truncated_hash(resource.data()));
 		//p request_data = unpacked_request
@@ -1020,7 +1022,11 @@ void Link::response_resource_concluded(const Resource& resource) {
 		MsgPack::bin_t<uint8_t> response_data;
 		unpacker.from_array(request_id, response_data);
 
-		handle_response(request_id, response_data, resource.total_size(), resource.size());
+		// Wrap msgpack's default-allocator bin_t in Bytes via the raw-ptr ctor
+		// (Bytes::Data may be PSRAM-allocator under BOARD_HAS_PSRAM).
+		handle_response(Bytes(request_id.data(), request_id.size()),
+		                Bytes(response_data.data(), response_data.size()),
+		                resource.total_size(), resource.size());
 	}
 	else {
 		DEBUGF("Incoming response resource failed with status: %d", resource.status());
@@ -1149,8 +1155,8 @@ void Link::receive(const Packet& packet) {
 							unpacker.from_array(requested_at, path_hash, request_data);
 							ResourceRequest resource_request;
 							resource_request._requested_at = requested_at;
-							resource_request._path_hash = path_hash;
-							resource_request._request_data = request_data;
+							resource_request._path_hash.assign(path_hash.data(), path_hash.size());
+							resource_request._request_data.assign(request_data.data(), request_data.size());
 							handle_request(request_id, resource_request);
 						}
 					}
