@@ -558,21 +558,13 @@ namespace RNS { namespace Type {
 		// HeapResourceBuffer on receive and stay in PSRAM on send; larger
 		// ones stream into FlashResourceBuffer and spill to disk on send.
 		//
-		// 512 KiB (was 8 KiB): the original 8 KiB threshold was tuned to
-		// keep "even a single chat message" off PSRAM, but the spill
-		// path has a known stability bug (#166) that takes down both
-		// devices when triggered. Keeping medium-sized transfers (up to
-		// a typical image attachment, ~250 KiB) in PSRAM dodges the
-		// spill path entirely. ESP32-S3 with 8 MiB PSRAM has headroom
-		// for several concurrent 512 KiB blobs. Above 512 KiB we still
-		// need the spill path to work, tracked separately.
 		// FIRMWARE_MAX_INCOMING is the raw protocol ceiling — kept high so
 		// the runtime resolver (RNS::resource_max_incoming) can return the
 		// firmware's user-facing cap from StorageConfig without bumping
 		// against a hard-coded upper bound. FLASH_QUOTA_BYTES is the soft
 		// cap on total pending flash-backed bytes across all in-flight
 		// resources; bypassed when the firmware routes through SD.
-		static const uint32_t RAM_BUFFER_THRESHOLD = 512 * 1024;        // 512 KiB
+		static const uint32_t RAM_BUFFER_THRESHOLD = 8 * 1024;          //   8 KiB
 		static const uint32_t FIRMWARE_MAX_INCOMING = 256UL * 1024 * 1024; // 256 MiB
 		static const uint32_t FLASH_QUOTA_BYTES = 4 * 1024 * 1024;      //   4 MiB
 
