@@ -23,10 +23,90 @@
 #include <time.h>
 
 #include <mbedtls/aes.h>
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+#include <esp_heap_caps.h>
+#endif
 
 using namespace RNS;
 using namespace RNS::Cryptography;
 using namespace RNS::Type::Cryptography::Token;
+
+namespace {
+	// Shared process-wide AES staging scratch. Lazily allocated by
+	// Token::init_shared_scratch() from the firmware setup() before
+	// BLE/WiFi initialise. See the header for the rationale (it's
+	// our runtime equivalent of CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL).
+	//
+	// Access is serialised by the firmware's rns_lock; tests are
+	// single-threaded.
+	uint8_t* g_aes_scratch_in   = nullptr;
+	uint8_t* g_aes_scratch_out  = nullptr;
+	size_t   g_aes_scratch_size = 0;
+
+	// Stage an AES-CBC operation through the internal-SRAM scratch
+	// buffers in chunks of g_aes_scratch_size. mbedtls_aes_crypt_cbc
+	// updates iv[] to the last ciphertext block on each call, so CBC
+	// chaining across chunks is preserved without any intervention.
+	//
+	// Requires g_aes_scratch_size > 0 — caller MUST check this.
+	int aes_crypt_cbc_staged(mbedtls_aes_context* ctx, int mode,
+	                         size_t length,
+	                         unsigned char* iv,
+	                         const unsigned char* input,
+	                         unsigned char* output) {
+		size_t offset = 0;
+		while (offset < length) {
+			size_t this_chunk = length - offset;
+			if (this_chunk > g_aes_scratch_size) this_chunk = g_aes_scratch_size;
+			memcpy(g_aes_scratch_in, input + offset, this_chunk);
+			const int rc = mbedtls_aes_crypt_cbc(
+				ctx, mode, this_chunk, iv,
+				g_aes_scratch_in, g_aes_scratch_out);
+			if (rc != 0) return rc;
+			memcpy(output + offset, g_aes_scratch_out, this_chunk);
+			offset += this_chunk;
+		}
+		return 0;
+	}
+}
+
+bool Token::init_shared_scratch(size_t bytes_per_buffer) {
+	if (g_aes_scratch_in && g_aes_scratch_out && g_aes_scratch_size > 0) {
+		return true;
+	}
+	if (bytes_per_buffer == 0 || (bytes_per_buffer % 16) != 0) {
+		ERRORF("Token::init_shared_scratch: bytes_per_buffer must be a "
+		       "non-zero multiple of 16 (got %u)",
+		       (unsigned)bytes_per_buffer);
+		return false;
+	}
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+	g_aes_scratch_in = (uint8_t*)heap_caps_malloc(
+		bytes_per_buffer, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+	g_aes_scratch_out = (uint8_t*)heap_caps_malloc(
+		bytes_per_buffer, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+#else
+	g_aes_scratch_in  = (uint8_t*)malloc(bytes_per_buffer);
+	g_aes_scratch_out = (uint8_t*)malloc(bytes_per_buffer);
+#endif
+	if (!g_aes_scratch_in || !g_aes_scratch_out) {
+		if (g_aes_scratch_in)  { free(g_aes_scratch_in);  g_aes_scratch_in  = nullptr; }
+		if (g_aes_scratch_out) { free(g_aes_scratch_out); g_aes_scratch_out = nullptr; }
+		ERRORF("Token::init_shared_scratch: failed to allocate 2 x %u "
+		       "bytes of DMA-cap internal SRAM",
+		       (unsigned)bytes_per_buffer);
+		return false;
+	}
+	g_aes_scratch_size = bytes_per_buffer;
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+	INFOF("Token: AES scratch reservation %u + %u bytes (in=%p out=%p) "
+	      "dma_free_after=%u",
+	      (unsigned)bytes_per_buffer, (unsigned)bytes_per_buffer,
+	      g_aes_scratch_in, g_aes_scratch_out,
+	      (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
+#endif
+	return true;
+}
 
 Token::Token(const Bytes& key, token_mode mode /*= AES*/) {
 
@@ -116,17 +196,23 @@ const Bytes Token::encrypt(const Bytes& data) {
 		throw std::runtime_error("Token::encrypt: AES engine not initialised");
 	}
 
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+	const bool diag_bulk = true;
+	if (diag_bulk) {
+		NOTICEF("AES enc[ENTER] len=%u dma_free=%u dma_largest=%u sram_free=%u",
+		       (unsigned)data.size(),
+		       (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+		       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+		       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+	}
+#endif
 	DEBUGF("Token::encrypt: plaintext length: %lu", data.size());
 	Bytes iv = random(16);
 	TRACEF("Token::encrypt: iv:         %s", iv.toHex().c_str());
 	TRACEF("Token::encrypt: plaintext:  %s", data.toHex().c_str());
 
-	// PKCS7 pad the plaintext to a 16-byte boundary.
 	Bytes padded = PKCS7::pad(data);
 
-	// mbedtls_aes_crypt_cbc MUTATES the IV buffer (advances it to the
-	// last ciphertext block). We must pass a writable copy so the
-	// caller's iv stays intact.
 	uint8_t iv_buf[16];
 	memcpy(iv_buf, iv.data(), 16);
 
@@ -136,31 +222,44 @@ const Bytes Token::encrypt(const Bytes& data) {
 		throw std::runtime_error("Token::encrypt: failed to allocate ciphertext buffer");
 	}
 
-	const int rc = mbedtls_aes_crypt_cbc(
-		&_aes_enc,
-		MBEDTLS_AES_ENCRYPT,
-		padded.size(),
-		iv_buf,
-		padded.data(),
-		out);
+	const int rc = (g_aes_scratch_size > 0)
+		? aes_crypt_cbc_staged(&_aes_enc, MBEDTLS_AES_ENCRYPT,
+		                       padded.size(), iv_buf,
+		                       padded.data(), out)
+		: mbedtls_aes_crypt_cbc(&_aes_enc, MBEDTLS_AES_ENCRYPT,
+		                        padded.size(), iv_buf,
+		                        padded.data(), out);
 	if (rc != 0) {
-		// Most likely path: esp-aes returned ESP_ERR_NO_MEM because the
-		// internal DMA buffer alloc failed under SRAM fragmentation.
-		// Propagate as a typed exception so the caller can treat it as
-		// transient (retry next packet) rather than as a protocol-level
-		// decrypt-fail.
 		throw aes_resource_exhausted("encrypt", rc);
 	}
+
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+	if (diag_bulk) {
+		NOTICEF("AES enc[POST-CBC] len=%u dma_free=%u dma_largest=%u sram_free=%u",
+		       (unsigned)padded.size(),
+		       (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+		       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+		       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+	}
+#endif
 
 	DEBUGF("Token::encrypt: padded ciphertext length: %lu", ciphertext.size());
 	TRACEF("Token::encrypt: ciphertext: %s", ciphertext.toHex().c_str());
 
 	Bytes signed_parts = iv + ciphertext;
-
 	Bytes sig(HMAC::generate(_signing_key, signed_parts)->digest());
 	TRACEF("Token::encrypt: sig:        %s", sig.toHex().c_str());
 	Bytes token(signed_parts + sig);
 	DEBUGF("Token::encrypt: token length: %lu", token.size());
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+	if (diag_bulk) {
+		NOTICEF("AES enc[EXIT] token_len=%u dma_free=%u dma_largest=%u sram_free=%u",
+		       (unsigned)token.size(),
+		       (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+		       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+		       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+	}
+#endif
 	return token;
 }
 
@@ -198,18 +297,14 @@ const Bytes Token::decrypt(const Bytes& token) {
 		throw std::runtime_error("Token::decrypt: failed to allocate plaintext buffer");
 	}
 
-	const int rc = mbedtls_aes_crypt_cbc(
-		&_aes_dec,
-		MBEDTLS_AES_DECRYPT,
-		ciphertext.size(),
-		iv_buf,
-		ciphertext.data(),
-		out);
+	const int rc = (g_aes_scratch_size > 0)
+		? aes_crypt_cbc_staged(&_aes_dec, MBEDTLS_AES_DECRYPT,
+		                       ciphertext.size(), iv_buf,
+		                       ciphertext.data(), out)
+		: mbedtls_aes_crypt_cbc(&_aes_dec, MBEDTLS_AES_DECRYPT,
+		                        ciphertext.size(), iv_buf,
+		                        ciphertext.data(), out);
 	if (rc != 0) {
-		// Same transient-resource path as encrypt. Propagate as typed
-		// exception — distinct from genuine "Could not decrypt Token
-		// token" (which used to swallow this case and mask the real
-		// cause).
 		throw aes_resource_exhausted("decrypt", rc);
 	}
 

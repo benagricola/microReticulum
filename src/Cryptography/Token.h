@@ -75,6 +75,27 @@ namespace RNS { namespace Cryptography {
 		Token(const Token&) = delete;
 		Token& operator=(const Token&) = delete;
 
+		// Allocate process-wide internal-SRAM DMA-capable scratch buffers
+		// used by Token::encrypt/decrypt to stage their AES input/output
+		// when scratch is initialised. The firmware should call this
+		// EARLY in setup() — before BLE/WiFi init — so the allocation
+		// happens against a fresh DMA-cap heap and is large enough to
+		// matter. Once allocated, the buffers are pinned for the device
+		// lifetime: they double as a CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL
+		// equivalent (preventing WiFi/lwIP from monopolising the DMA-cap
+		// pool) and as the staging area for chunked AES-CBC.
+		//
+		// bytes_per_buffer is the size of EACH of the two buffers (in,
+		// out). Total reservation = 2 * bytes_per_buffer. Returns true
+		// on success, false on alloc failure (in which case Token falls
+		// back to direct mbedtls_aes_crypt_cbc calls with no staging —
+		// works for small messages, prone to esp-aes alloc failure
+		// for big Resource transfers).
+		//
+		// Idempotent: subsequent calls return true if scratch already
+		// allocated, regardless of the requested size.
+		static bool init_shared_scratch(size_t bytes_per_buffer);
+
 	public:
 		bool verify_hmac(const Bytes& token);
 		const Bytes encrypt(const Bytes& data);
