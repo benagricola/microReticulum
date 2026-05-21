@@ -50,13 +50,24 @@ private:
 	// this on the receiver. Empty before assembly completes.
 	Bytes _plaintext;
 	std::unique_ptr<ResourceBuffer> _buffer;
-	// Sender side: pre-packed RESOURCE packet bodies + their map_hashes, indexed by part.
+	// Sender side: pre-packed RESOURCE packet bodies, indexed by part.
 	std::vector<Bytes> _parts;
-	std::vector<Bytes> _map_hashes;
-	// Sender side: full hashmap blob (n * 4 bytes). _map_hashes is the
-	// per-part split form, _map_full is the concatenated form used to
-	// fill the ADV's `m` field and slice into HMU segments.
+	// Sender+receiver: full hashmap blob (n * 4 bytes). Single source of
+	// truth for every part's 4-byte map_hash. Sender builds it by
+	// appending each computed hash; receiver pre-sizes it to
+	// (parts_count * MAPHASH_LEN) zeros at accept time and fills slots
+	// via memcpy as ADV/HMU segments arrive. Slot i lives at offset
+	// i*MAPHASH_LEN. The previous parallel `std::vector<Bytes>`
+	// representation cost ~36 B of internal-SRAM per slot
+	// (vector<uint8_t> control block + shared_ptr control block) — at
+	// 125 parts that's ~4.5 KiB of DMA-cap-eligible heap drained per
+	// transfer, which starved esp-aes' per-call GDMA descriptor alloc.
 	Bytes _map_full;
+	// Receiver side: presence bitmap for `_map_full`. Bit i is true once
+	// slot i has been filled (from the ADV's first-segment hashmap or a
+	// later HMU). Sender doesn't use it (sender fills every slot during
+	// _build_outgoing). 1 bit per slot, ~16 B for 125 parts.
+	std::vector<bool>  _map_hashes_known;
 	// Receiver side: per-part received flag and sliding window state.
 	std::vector<bool>  _parts_received;
 

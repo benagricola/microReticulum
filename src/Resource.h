@@ -127,8 +127,9 @@ namespace RNS {
 		void on_request(const Bytes& body);
 
 		// Receiver: ingest an incoming RESOURCE_HMU body (16-byte hash
-		// prefix + msgpack[segment, hashmap_bytes]). Extends our
-		// _map_hashes vector with the additional segment's map_hashes.
+		// prefix + msgpack[segment, hashmap_bytes]). Fills the
+		// corresponding slot range in _map_full and flips
+		// _map_hashes_known[slot]=true for each newly-known slot.
 		void on_hashmap_update(const Bytes& body);
 
 		// Sender-only: handle an incoming RESOURCE_PRF (32 B SHA-256).

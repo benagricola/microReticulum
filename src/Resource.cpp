@@ -29,6 +29,24 @@
 #include <cstring>
 #include <string>
 
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+#include <esp_heap_caps.h>
+// Diagnostic: log dma_free/sram_free/largest at a Resource _build_outgoing
+// checkpoint so we can identify which step consumes the 11.5 KiB seen
+// drained between bulk encrypt EXIT and the first follow-up small encrypt.
+// One-liner so the timeline reads naturally against the AES enc[...] logs.
+#define BO_HEAP(label) do { \
+    NOTICEF("[BO] %s dma_free=%u dma_largest=%u sram_free=%u sram_largest=%u", \
+            (label), \
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA), \
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA), \
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), \
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)); \
+} while (0)
+#else
+#define BO_HEAP(label) do {} while (0)
+#endif
+
 using namespace RNS;
 using namespace RNS::Type::Resource;
 using namespace RNS::Utilities;
@@ -386,6 +404,8 @@ bool Resource::_build_outgoing(uint16_t link_mdu) {
 		return false;
 	}
 
+	BO_HEAP("enter");
+
 	// Random salt prepended to the plaintext before encryption. Makes the
 	// per-part map_hashes unpredictable to anyone without the Link key.
 	Bytes random_hash = Identity::get_random_hash().left(Type::Resource::RANDOM_HASH_SIZE);
@@ -396,6 +416,8 @@ bool Resource::_build_outgoing(uint16_t link_mdu) {
 	salted.append(random_hash);
 	salted.append(plaintext);
 
+	BO_HEAP("pre-encrypt");
+
 	// Encrypt via the Link's derived key (Fernet over AES-128-CBC).
 	// AES on a 12 KB blob takes tens of ms; the per-part loop below
 	// adds more. Same WDT story as the receive side. (#60)
@@ -405,6 +427,8 @@ bool Resource::_build_outgoing(uint16_t link_mdu) {
 	d._encrypted    = encrypted;
 	d._transfer_size = (uint32_t)encrypted.size();
 	d._data_size     = d._transfer_size;   // _d == _t (no compression in this port)
+
+	BO_HEAP("post-encrypt");
 
 	{
 		const size_t firmware_cap = RNS::resource_max_incoming();
@@ -432,9 +456,21 @@ bool Resource::_build_outgoing(uint16_t link_mdu) {
 	const uint16_t n_parts = (uint16_t)n_parts32;
 	d._parts_count = n_parts;
 
-	d._parts.clear();      d._parts.reserve(n_parts);
-	d._map_hashes.clear(); d._map_hashes.reserve(n_parts);
+	d._parts.clear();
+	// Only reserve _parts when we actually hold per-part bytes in memory
+	// (non-spill path). Under spill_to_disk each part comes from
+	// _load_part reading the spilled ciphertext file, so _parts stays
+	// empty and the reserve would just waste internal-heap.
 	d._map_full = Bytes();
+	// Pre-size _map_full to its final size so the parts loop below can
+	// memcpy each hash into place at offset i*MAPHASH_LEN instead of
+	// appending. Avoids vector growth-realloc churn through the loop.
+	uint8_t* map_full_dst = d._map_full.writable((size_t)n_parts * Type::Resource::MAPHASH_LEN);
+	if (map_full_dst == nullptr) {
+		ERROR("Resource: _map_full alloc failed");
+		return false;
+	}
+	d._map_hashes_known.assign(n_parts, true);  // sender fills all slots itself
 
 	// Spill decision: once the ciphertext is large enough that holding
 	// it in PSRAM for the entire (potentially minutes-long) Resource
@@ -458,6 +494,7 @@ bool Resource::_build_outgoing(uint16_t link_mdu) {
 		d._ciphertext_path = path;
 
 		try {
+			BO_HEAP("spill pre-open");
 			microStore::File f = Utilities::OS::open_file(
 				d._ciphertext_path.c_str(), microStore::File::ModeReadWrite);
 			if (!f) {
@@ -466,9 +503,13 @@ bool Resource::_build_outgoing(uint16_t link_mdu) {
 				d._ciphertext_path.clear();
 				return false;
 			}
+			BO_HEAP("spill post-open");
 			const size_t wrote = f.write(encrypted.data(), encrypted.size());
+			BO_HEAP("spill post-write");
 			f.flush();
+			BO_HEAP("spill post-flush");
 			f.close();
+			BO_HEAP("spill post-close");
 			if (wrote != encrypted.size()) {
 				ERRORF("Resource: ciphertext write short %zu/%zu",
 				       wrote, encrypted.size());
@@ -485,6 +526,10 @@ bool Resource::_build_outgoing(uint16_t link_mdu) {
 		Utilities::OS::reset_watchdog();
 	}
 
+	if (!spill_to_disk) d._parts.reserve(n_parts);
+
+	BO_HEAP("pre-parts-loop");
+
 	for (uint16_t i = 0; i < n_parts; ++i) {
 		const size_t offset = (size_t)i * sdu;
 		const size_t length = std::min((size_t)sdu, (size_t)(d._transfer_size - offset));
@@ -496,21 +541,28 @@ bool Resource::_build_outgoing(uint16_t link_mdu) {
 		// Only retain per-part bytes in memory when we're NOT spilling
 		// — under spill, _load_part reads the chunk from disk on demand.
 		if (!spill_to_disk) d._parts.push_back(part_data);
-		d._map_hashes.push_back(map_hash);
-		d._map_full.append(map_hash);
+
+		// Write the 4-byte hash directly into _map_full at slot i. The
+		// buffer was pre-sized via writable() above so the pointer is
+		// stable for the whole loop.
+		memcpy(map_full_dst + (size_t)i * Type::Resource::MAPHASH_LEN,
+		       map_hash.data(), Type::Resource::MAPHASH_LEN);
 
 		// SHA-256 per part + the vector growth. 30 iterations adds up
 		// to a few hundred ms total — keep the WDT happy. (#60)
 		if ((i & 0x07) == 0) Utilities::OS::reset_watchdog();
 	}
 
+	BO_HEAP("post-parts-loop");
+
 	// Drop the in-memory ciphertext now that it's safely on disk; we
-	// only need _hash + _expected_proof + _map_hashes from here on, and
+	// only need _hash + _expected_proof + _map_full from here on, and
 	// the per-part bytes come from the file via _load_part.
 	if (spill_to_disk) {
 		d._encrypted = Bytes();
 	}
 
+	BO_HEAP("exit");
 	return true;
 }
 
@@ -687,14 +739,23 @@ Resource Resource::accept(const ResourceAdvertisement& adv, const Link& link,
 		return r;
 	}
 
-	// Seed the hashmap with the ADV's first-segment map_hashes. Slots
-	// beyond first-segment stay empty until corresponding HMU arrives.
-	d._map_hashes.assign(d._parts_count, Bytes());
+	// Pre-size _map_full to (parts_count * MAPHASH_LEN) zeros so receiver
+	// slots can be filled by memcpy as ADV/HMU segments arrive. _map_hashes_known
+	// tracks which slots are populated.
+	uint8_t* map_full_dst = d._map_full.writable((size_t)d._parts_count * Type::Resource::MAPHASH_LEN);
+	if (map_full_dst == nullptr) {
+		ERROR("Resource::accept: _map_full alloc failed");
+		d._status = Type::Resource::FAILED;
+		return r;
+	}
+	d._map_hashes_known.assign(d._parts_count, false);
 	const Bytes& adv_map = adv.hashmap();
 	const size_t avail_hashes = adv_map.size() / Type::Resource::MAPHASH_LEN;
 	for (size_t i = 0; i < avail_hashes && i < d._parts_count; ++i) {
-		d._map_hashes[i] = Bytes(adv_map.data() + i * Type::Resource::MAPHASH_LEN,
-		                         Type::Resource::MAPHASH_LEN);
+		memcpy(map_full_dst + i * Type::Resource::MAPHASH_LEN,
+		       adv_map.data() + i * Type::Resource::MAPHASH_LEN,
+		       Type::Resource::MAPHASH_LEN);
+		d._map_hashes_known[i] = true;
 	}
 	d._parts_received.assign(d._parts_count, false);
 	d._received_count    = 0;
@@ -729,12 +790,13 @@ void Resource::send_part_request() {
 
 	while (asked < d._window && pn < d._parts_count) {
 		if (d._parts_received[pn]) { pn++; continue; }
-		if (d._map_hashes[pn].empty()) {
+		if (!d._map_hashes_known[pn]) {
 			// Hashmap exhausted at this position — ask sender for more.
 			exhausted = Type::Resource::HASHMAP_IS_EXHAUSTED;
 			break;
 		}
-		requested.append(d._map_hashes[pn]);
+		requested.append(d._map_full.data() + (size_t)pn * Type::Resource::MAPHASH_LEN,
+		                 Type::Resource::MAPHASH_LEN);
 		asked++;
 		pn++;
 	}
@@ -746,9 +808,10 @@ void Resource::send_part_request() {
 		// can derive which segment to send next.
 		uint16_t last_known = 0;
 		for (uint16_t i = 0; i < d._parts_count; ++i) {
-			if (!d._map_hashes[i].empty()) last_known = i;
+			if (d._map_hashes_known[i]) last_known = i;
 		}
-		body.append(d._map_hashes[last_known]);
+		body.append(d._map_full.data() + (size_t)last_known * Type::Resource::MAPHASH_LEN,
+		            Type::Resource::MAPHASH_LEN);
 	}
 	body.append(d._hash);
 	body.append(requested);
@@ -836,10 +899,15 @@ void Resource::on_part(const Packet& part_packet) {
 
 	// Match against not-yet-received slots whose map_hash we know.
 	uint16_t matched = 0xFFFF;
+	const uint8_t* candidate = map_hash.data();
 	for (uint16_t i = 0; i < d._parts_count; ++i) {
 		if (d._parts_received[i]) continue;
-		if (d._map_hashes[i].size() != Type::Resource::MAPHASH_LEN) continue;
-		if (d._map_hashes[i] == map_hash) { matched = i; break; }
+		if (!d._map_hashes_known[i]) continue;
+		if (memcmp(d._map_full.data() + (size_t)i * Type::Resource::MAPHASH_LEN,
+		           candidate, Type::Resource::MAPHASH_LEN) == 0) {
+			matched = i;
+			break;
+		}
 	}
 	if (matched == 0xFFFF) {
 		// Either a part for a different resource on the same link, or a
@@ -921,12 +989,15 @@ void Resource::on_hashmap_update(const Bytes& body) {
 	const uint16_t HMU_MAX = Type::Resource::ResourceAdvertisement::HASHMAP_MAX_LEN;
 	const size_t seg_start_index = (size_t)segment * HMU_MAX;
 	const size_t entries = hashmap_bytes.size() / Type::Resource::MAPHASH_LEN;
+	uint8_t* map_full_dst = d._map_full.writable(d._map_full.size());
 	for (size_t i = 0; i < entries; ++i) {
 		const size_t slot = seg_start_index + i;
 		if (slot >= d._parts_count) break;
-		if (d._map_hashes[slot].empty()) {
-			d._map_hashes[slot] = Bytes(hashmap_bytes.data() + i * Type::Resource::MAPHASH_LEN,
-			                            Type::Resource::MAPHASH_LEN);
+		if (!d._map_hashes_known[slot]) {
+			memcpy(map_full_dst + slot * Type::Resource::MAPHASH_LEN,
+			       hashmap_bytes.data() + i * Type::Resource::MAPHASH_LEN,
+			       Type::Resource::MAPHASH_LEN);
+			d._map_hashes_known[slot] = true;
 		}
 	}
 	DEBUGF("RESOURCE_HMU applied segment=%u (%u hashes)",
@@ -1080,8 +1151,9 @@ void Resource::_send_proof() {
 // Sender REQ handling (plan step 8)
 //
 // Receiver has asked for a set of parts identified by map_hash. We scan
-// our pre-built _map_hashes to find each requested hash, then send the
-// matching part as a RESOURCE packet. If the receiver's REQ also signals
+// our pre-built _map_full (one 4-byte slot per part) to find each
+// requested hash, then send the matching part as a RESOURCE packet. If
+// the receiver's REQ also signals
 // hashmap-exhausted, we figure out which HMU segment they need next and
 // emit it. Robustness: receivers may legitimately re-request parts
 // (proof timeout, retry) — we don't track sent_parts as a hard mutex,
@@ -1110,13 +1182,13 @@ void Resource::on_request(const Bytes& body) {
 
 	const uint8_t exhausted = body[0];
 	size_t cursor = 1;
-	Bytes last_map_hash;
+	const uint8_t* last_map_hash = nullptr;
 	if (exhausted == Type::Resource::HASHMAP_IS_EXHAUSTED) {
 		if (body.size() < 1 + MAPLEN + HASHLEN) {
 			WARNING("on_request: exhausted REQ truncated");
 			return;
 		}
-		last_map_hash = Bytes(body.data() + cursor, MAPLEN);
+		last_map_hash = body.data() + cursor;
 		cursor += MAPLEN;
 	}
 	Bytes peer_hash(body.data() + cursor, HASHLEN);
@@ -1132,10 +1204,11 @@ void Resource::on_request(const Bytes& body) {
 	// queue is also draining. (#60)
 	uint16_t resent = 0;
 	while (cursor + MAPLEN <= body.size()) {
-		Bytes req_map_hash(body.data() + cursor, MAPLEN);
+		const uint8_t* req_map_hash = body.data() + cursor;
 		cursor += MAPLEN;
 		for (uint16_t i = 0; i < d._parts_count; ++i) {
-			if (d._map_hashes[i] == req_map_hash) {
+			if (memcmp(d._map_full.data() + (size_t)i * MAPLEN,
+			           req_map_hash, MAPLEN) == 0) {
 				Bytes part_data;
 				if (!_load_part(i, part_data)) {
 					ERRORF("on_request: _load_part(%u) failed", (unsigned)i);
@@ -1163,11 +1236,15 @@ void Resource::on_request(const Bytes& body) {
 	// need next and emit it. last_map_hash sits at the boundary between
 	// what they have and what they don't; find which index it maps to,
 	// then the next HMU segment is floor(index / HASHMAP_MAX_LEN) + 1.
-	if (exhausted == Type::Resource::HASHMAP_IS_EXHAUSTED) {
+	if (exhausted == Type::Resource::HASHMAP_IS_EXHAUSTED && last_map_hash != nullptr) {
 		const uint16_t HMU_MAX = Type::Resource::ResourceAdvertisement::HASHMAP_MAX_LEN;
 		uint16_t last_index = 0;
 		for (uint16_t i = 0; i < d._parts_count; ++i) {
-			if (d._map_hashes[i] == last_map_hash) { last_index = i; break; }
+			if (memcmp(d._map_full.data() + (size_t)i * MAPLEN,
+			           last_map_hash, MAPLEN) == 0) {
+				last_index = i;
+				break;
+			}
 		}
 		const uint8_t next_seg = (uint8_t)((last_index / HMU_MAX) + 1);
 		const size_t next_start = (size_t)next_seg * HMU_MAX * Type::Resource::MAPHASH_LEN;
