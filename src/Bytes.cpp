@@ -14,7 +14,28 @@
 
 #include "Bytes.h"
 
+#include "Utilities/Memory.h"
+
 using namespace RNS;
+
+#if defined(BOARD_HAS_PSRAM) && BOARD_HAS_PSRAM == 1
+namespace {
+	// PSRAM-aware allocator for Bytes::Data + its shared_ptr control block.
+	// Without this, every Bytes that owns its data leaves a ~36-byte residue
+	// on internal SRAM: the std::vector<uint8_t> control block (12 B) plus
+	// the std::shared_ptr control block (~24 B). The byte storage already
+	// lives in PSRAM via ContainerAllocator, so this is purely overhead —
+	// but at 125 part-hash Bytes per Resource it works out to ~4.5 KiB of
+	// DMA-cap-eligible internal heap consumed per transfer, which starves
+	// esp-aes' per-call GDMA descriptor alloc and produces the "AES encrypt
+	// out of resources" failure the Resource transfer kept hitting.
+	//
+	// std::allocate_shared<Data>(allocator) places BOTH the Data object and
+	// the shared_ptr control block in one combined allocation drawn from
+	// the supplied allocator — so we get the control block in PSRAM too.
+	Utilities::Memory::ContainerAllocator<uint8_t> s_data_alloc_seed;
+}
+#endif
 
 // Creates new shared data for instance
 // - If capacity is specified (>0) then create empty shared data with initial reserved capacity
@@ -22,6 +43,18 @@ using namespace RNS;
 void Bytes::newData(size_t capacity /*= 0*/) {
 //MEMF("Bytes is creating own data with capacity %u", capacity);
 //MEM("newData: Creating new data...");
+#if defined(BOARD_HAS_PSRAM) && BOARD_HAS_PSRAM == 1
+	try {
+		_data = std::allocate_shared<Data>(s_data_alloc_seed);
+	}
+	catch (const std::bad_alloc&) {
+		ERROR("Bytes failed to allocate empty data buffer (PSRAM)");
+		throw std::runtime_error("Failed to allocate empty data buffer");
+	}
+	if (capacity > 0) {
+		_data->reserve(capacity);
+	}
+#else
 	Data* data = new Data();
 	if (data == nullptr) {
 		ERROR("Bytes failed to allocate empty data buffer");
@@ -36,6 +69,7 @@ void Bytes::newData(size_t capacity /*= 0*/) {
 //MEM("newData: Assigning data to shared data pointer...");
 	_data = SharedData(data);
 //MEM("newData: Assigned data to shared data pointer");
+#endif
 	_exclusive = true;
 }
 
@@ -50,30 +84,38 @@ void Bytes::exclusiveData(bool copy /*= true*/, size_t capacity /*= 0*/) {
 	}
 	else if (!_exclusive) {
 		if (copy && !_data->empty()) {
-			//TRACE("Bytes is creating a writable copy of its shared data");
-			//Data* data = new Data(*_data.get());
-//MEM("exclusiveData: Creating new data...");
+#if defined(BOARD_HAS_PSRAM) && BOARD_HAS_PSRAM == 1
+			SharedData fresh;
+			try {
+				fresh = std::allocate_shared<Data>(s_data_alloc_seed);
+			}
+			catch (const std::bad_alloc&) {
+				ERROR("Bytes failed to duplicate data buffer (PSRAM)");
+				throw std::runtime_error("Failed to duplicate data buffer");
+			}
+			if (capacity > 0) {
+				fresh->reserve((capacity > _data->size()) ? capacity : _data->size());
+			}
+			else {
+				fresh->reserve(_data->size());
+			}
+			fresh->insert(fresh->begin(), _data->begin(), _data->end());
+			_data = fresh;
+#else
 			Data* data = new Data();
 			if (data == nullptr) {
 				ERROR("Bytes failed to duplicate data buffer");
 				throw std::runtime_error("Failed to duplicate data buffer");
 			}
-//MEM("exclusiveData: Created new data");
 			if (capacity > 0) {
-//MEMF("exclusiveData: Reserving data capacity of %u...", capacity);
-				// if requested capacity < existing size then reserve capacity for existing size instead
 				data->reserve((capacity > _data->size()) ? capacity : _data->size());
-//MEM("exclusiveData: Reserved data capacity");
 			}
 			else {
 				data->reserve(_data->size());
 			}
-//MEM("exclusiveData: Copying existing data...");
 			data->insert(data->begin(), _data->begin(), _data->end());
-//MEM("exclusiveData: Copied existing data");
-//MEM("exclusiveData: Assigning data to shared data pointer...");
 			_data = SharedData(data);
-//MEM("exclusiveData: Assigned data to shared data pointer");
+#endif
 			_exclusive = true;
 		}
 		else {
