@@ -75,23 +75,12 @@ namespace RNS {
 
 		virtual inline std::string toString() const { return "Interface[" + _name + "]"; }
 
-	public:
-		// Cross-interface discoverability flag, consumed by the
-		// Discovery::Announcer (in the application layer) to decide
-		// which interfaces should emit `rnstransport.discovery.interface`
-		// announces. Per-instance + driven from JSON persistence at
-		// boot — see /reticulum/interfaces.json. Defaults to false:
-		// privacy-by-design, nothing announces until explicitly toggled.
-		inline bool discoverable() const     { return _discoverable; }
-		inline void set_discoverable(bool b) { _discoverable = b;    }
-
 	protected:
 		Interface* _parent = nullptr;
 		bool _IN  = false;
 		bool _OUT = false;
 		bool _FWD = false;
 		bool _RPT = false;
-		bool _discoverable = false;
 		std::string _name;
 		size_t _rxb = 0;
 		size_t _txb = 0;
