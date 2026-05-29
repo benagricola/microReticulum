@@ -4200,10 +4200,17 @@ TRACEF("Transport::write_path_table: buffer size %lu bytes", Persistence::_buffe
 	_last_psram = psram;
 	_last_flash = flash;
 
+	// The per-segment dumpInfo() walks all 8 segment files (~768 KB) and
+	// prints a multi-line report. Under the announce flood with a serial
+	// monitor attached, that burst can block the USB-CDC write long enough
+	// to stall loopTask and trip the task watchdog. Gate it behind the
+	// verbose-diag flag; the cheap size summary above is always emitted.
+#if defined(RNS_VERBOSE_DIAG)
 	if (_path_store) {
 		HEAD("Path Store Stats", LOG_TRACE);
 		_path_store.dumpInfo();
 	}
+#endif
 
 }
 
