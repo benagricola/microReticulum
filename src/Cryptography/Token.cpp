@@ -196,15 +196,15 @@ const Bytes Token::encrypt(const Bytes& data) {
 		throw std::runtime_error("Token::encrypt: AES engine not initialised");
 	}
 
-#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
-	const bool diag_bulk = true;
-	if (diag_bulk) {
-		NOTICEF("AES enc[ENTER] len=%u dma_free=%u dma_largest=%u sram_free=%u",
-		       (unsigned)data.size(),
-		       (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
-		       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
-		       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-	}
+	// Per-encrypt heap trace. Investigation-only; fires three NOTICEF log
+	// lines per ciphertext on the hot path, so compiled out unless the
+	// firmware build defines RNS_VERBOSE_DIAG.
+#if defined(RNS_VERBOSE_DIAG) && (defined(ARDUINO_ARCH_ESP32) || defined(ESP32))
+	NOTICEF("AES enc[ENTER] len=%u dma_free=%u dma_largest=%u sram_free=%u",
+	       (unsigned)data.size(),
+	       (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+	       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+	       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 #endif
 	DEBUGF("Token::encrypt: plaintext length: %lu", data.size());
 	Bytes iv = random(16);
@@ -233,14 +233,12 @@ const Bytes Token::encrypt(const Bytes& data) {
 		throw aes_resource_exhausted("encrypt", rc);
 	}
 
-#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
-	if (diag_bulk) {
-		NOTICEF("AES enc[POST-CBC] len=%u dma_free=%u dma_largest=%u sram_free=%u",
-		       (unsigned)padded.size(),
-		       (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
-		       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
-		       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-	}
+#if defined(RNS_VERBOSE_DIAG) && (defined(ARDUINO_ARCH_ESP32) || defined(ESP32))
+	NOTICEF("AES enc[POST-CBC] len=%u dma_free=%u dma_largest=%u sram_free=%u",
+	       (unsigned)padded.size(),
+	       (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+	       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+	       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 #endif
 
 	DEBUGF("Token::encrypt: padded ciphertext length: %lu", ciphertext.size());
@@ -251,14 +249,12 @@ const Bytes Token::encrypt(const Bytes& data) {
 	TRACEF("Token::encrypt: sig:        %s", sig.toHex().c_str());
 	Bytes token(signed_parts + sig);
 	DEBUGF("Token::encrypt: token length: %lu", token.size());
-#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
-	if (diag_bulk) {
-		NOTICEF("AES enc[EXIT] token_len=%u dma_free=%u dma_largest=%u sram_free=%u",
-		       (unsigned)token.size(),
-		       (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
-		       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
-		       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-	}
+#if defined(RNS_VERBOSE_DIAG) && (defined(ARDUINO_ARCH_ESP32) || defined(ESP32))
+	NOTICEF("AES enc[EXIT] token_len=%u dma_free=%u dma_largest=%u sram_free=%u",
+	       (unsigned)token.size(),
+	       (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+	       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+	       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 #endif
 	return token;
 }

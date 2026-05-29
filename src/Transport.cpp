@@ -2266,10 +2266,11 @@ DestinationEntry empty_destination_entry;
 							else {
 								ttl = DESTINATION_TIMEOUT;
 							}
-							// [PATHDBG] Pre-put diagnostics — establish whether the
-							// inputs and the store are in a state that could plausibly
-							// produce a successful put. Tags every line so the noise
-							// can be grepped or ripped out once the bug is found. (#98)
+							// Pre-put diagnostics. Investigation-only: each HEADF emits
+							// at NOTICE and the codec encode is a full serialize+alloc on
+							// the announce path, so the block is compiled out unless the
+							// firmware build defines RNS_VERBOSE_DIAG.
+#if defined(RNS_VERBOSE_DIAG)
 							{
 								const bool iface_valid = (bool)packet.receiving_interface();
 								const bool pkt_valid   = (bool)packet;
@@ -2283,25 +2284,24 @@ DestinationEntry empty_destination_entry;
 									store_valid, typed_valid, (unsigned long)ttl);
 								auto codec_bytes = microStore::Codec<DestinationEntry>::encode(destination_table_entry);
 								HEADF(LOG_NOTICE,
-									"[PATHDBG] codec-encoded value_len=%u (USTORE_MAX_VALUE_LEN=1024)",
+									"[PATHDBG] codec-encoded value_len=%u",
 									(unsigned)codec_bytes.size());
 								auto key_bytes = packet.destination_hash().collection();
 								HEADF(LOG_NOTICE,
-									"[PATHDBG] key_len=%u (USTORE_MAX_KEY_LEN=64)",
+									"[PATHDBG] key_len=%u",
 									(unsigned)key_bytes.size());
 							}
+#endif
 							if (_new_path_table.put(packet.destination_hash().collection(), destination_table_entry, ttl)) {
 								TRACEF("Added destination %s to path table!", packet.destination_hash().toHex().c_str());
 								++_destinations_added;
-								HEADF(LOG_NOTICE, "[PATHDBG] put OK for %s",
-									packet.destination_hash().toHex().c_str());
 							}
 							else {
 								ERRORF("Failed to add destination %s to path table!", packet.destination_hash().toHex().c_str());
-								// [PATHDBG] DO NOT call _path_store.dumpInfo() when
-								// the store is invalid — it dereferences a null
-								// active_file and crashes (LoadProhibited). Only
-								// dump when the store is at least registered.
+#if defined(RNS_VERBOSE_DIAG)
+								// dumpInfo() walks every segment file; only safe when the
+								// store is registered (else it derefs a null active_file
+								// and crashes with LoadProhibited).
 								if (_path_store.isValid()) {
 									RNS::head("[PATHDBG] post-fail dumpInfo follows:", RNS::LOG_NOTICE);
 									_path_store.dumpInfo();
@@ -2310,6 +2310,7 @@ DestinationEntry empty_destination_entry;
 									          "(was Transport::start called with transport_enabled=true?)",
 									          RNS::LOG_NOTICE);
 								}
+#endif
 							}
 						}
 						catch (const std::bad_alloc&) {

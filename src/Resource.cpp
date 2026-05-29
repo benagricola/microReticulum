@@ -29,12 +29,12 @@
 #include <cstring>
 #include <string>
 
-#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+// Per-checkpoint heap trace through _build_outgoing. Investigation-only:
+// each call formats a NOTICEF (a heap-allocated log line) on the hot
+// outbound path, so it is compiled out unless RNS_VERBOSE_DIAG is defined
+// by the firmware build. Define it to bring the [BO] timeline back.
+#if defined(RNS_VERBOSE_DIAG) && (defined(ARDUINO_ARCH_ESP32) || defined(ESP32))
 #include <esp_heap_caps.h>
-// Diagnostic: log dma_free/sram_free/largest at a Resource _build_outgoing
-// checkpoint so we can identify which step consumes the 11.5 KiB seen
-// drained between bulk encrypt EXIT and the first follow-up small encrypt.
-// One-liner so the timeline reads naturally against the AES enc[...] logs.
 #define BO_HEAP(label) do { \
     NOTICEF("[BO] %s dma_free=%u dma_largest=%u sram_free=%u sram_largest=%u", \
             (label), \
