@@ -247,10 +247,25 @@ DestinationEntry empty_destination_entry;
 	// CBA microStore
 	if (Utilities::OS::get_filesystem()) {
 		INFOF("FileSystem available: %lu", Utilities::OS::get_filesystem().storageAvailable());
+		// Feed the host watchdog from inside microStore's long blocking ops
+		// (compaction record copy, boot index rebuild) so a large compaction
+		// cannot trip the task WDT. Only resets the watchdog - deliberately NOT
+		// run_loop(), which would process announces (puts) and mutate the index
+		// mid-compaction. reset_watchdog() is a no-op off-ESP32.
+		microStore::set_yield_callback([]{ OS::reset_watchdog(); });
 		// CBA Must pass time offset into microStore for accurate timestamps on devices without a real-time clock
 #if defined(ARDUINO)
 		microStore::set_time_offset(Utilities::OS::getTimeOffset() / 1000);
+		// URTN_PATH_STORE_CLEAR_ONCE: build flag that wipes the path store on
+		// boot. microStore has no on-disk format-version check, so when the
+		// segment layout (size/count) changes a stale store written with the
+		// old geometry must be cleared once or its first compaction walks the
+		// old segments. Build with this defined, flash, then rebuild without it.
+#if defined(URTN_PATH_STORE_CLEAR_ONCE)
+		_path_store.init(Utilities::OS::get_filesystem(), "/path_store", true, _path_store_segment_size, _path_store_segment_count);
+#else
 		_path_store.init(Utilities::OS::get_filesystem(), "/path_store", false, _path_store_segment_size, _path_store_segment_count);
+#endif
 #else
 		_path_store.init(Utilities::OS::get_filesystem(), "path_store", false, _path_store_segment_size, _path_store_segment_count);
 #endif
