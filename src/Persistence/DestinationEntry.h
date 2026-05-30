@@ -40,7 +40,7 @@ public:
 		_received_from(received_from),
 		_hops(announce_hops),
 		_expires(expires),
-		_random_blobs(random_blobs),
+		_random_blobs(random_blobs.begin(), random_blobs.end()),
 		_receiving_interface(receiving_interface),
 		_announce_packet(announce_packet)
 	{
@@ -63,7 +63,12 @@ public:
 	RNS::Bytes _received_from;
 	uint8_t _hops = 0;
 	double _expires = 0;
-	std::set<RNS::Bytes> _random_blobs;
+	// PSRAM-backed: path entries live in the flash-backed _new_path_table, so a
+	// DestinationEntry is constructed transiently every time the table is read,
+	// written or iterated under the announce feed (e.g. rmap.world). Routing the
+	// random_blobs set nodes to PSRAM via the same ContainerAllocator the rest
+	// of the entry uses keeps that per-(de)serialise churn off internal SRAM.
+	std::set<RNS::Bytes, std::less<RNS::Bytes>, Utilities::Memory::ContainerAllocator<RNS::Bytes>> _random_blobs;
 	Interface _receiving_interface = {Type::NONE};
 	Packet _announce_packet = {Type::NONE};
 public:

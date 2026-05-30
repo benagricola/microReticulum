@@ -66,7 +66,6 @@ using namespace RNS::Persistence;
 /*static*/ std::list<PacketReceipt> Transport::_receipts;
 
 /*static*/ Transport::AnnounceTable Transport::_announce_table;
-/*static*/ PathTable Transport::_path_table;
 /*static*/ std::map<Bytes, Transport::ReverseEntry> Transport::_reverse_table;
 /*static*/ std::map<Bytes, Transport::LinkEntry> Transport::_link_table;
 /*static*/ Transport::AnnounceTable Transport::_held_announces;
@@ -106,7 +105,6 @@ using namespace RNS::Persistence;
 // CBA MCU
 /*static*/ //float Transport::_tables_cull_interval		= 5.0;
 /*static*/ float Transport::_tables_cull_interval		= 60.0;
-/*static*/ bool Transport::_saving_path_table			= false;
 // CBA ACCUMULATES
 // CBA MCU
 /*static*/ uint16_t Transport::_hashlist_maxsize		= RNS_HASHLIST_MAX;
@@ -118,10 +116,8 @@ using namespace RNS::Persistence;
 // CBA ACCUMULATES
 /*static*/ uint16_t Transport::_path_table_maxsize		= RNS_PATH_TABLE_MAX;
 // CBA ACCUMULATES
-/*static*/ uint16_t Transport::_path_table_maxpersist	= RNS_PATH_TABLE_MAX;
 /*static*/ double Transport::_last_saved				= 0.0;
 /*static*/ float Transport::_save_interval				= 3600.0;
-/*static*/ uint32_t Transport::_path_table_crc	= 0;
 /*static*/ uint16_t Transport::_announce_table_maxsize	= RNS_ANNOUNCE_TABLE_MAX;
 
 /*static*/ Reticulum Transport::_owner({Type::NONE});
@@ -645,42 +641,6 @@ DestinationEntry empty_destination_entry;
 					ERRORF("jobs: failed to cull link table: %s", e.what());
 				}
 
-				// CBA TODO perform path expiry in microStore!!!
-				// Cull the path table
-				DEBUG("Culling path table...");
-				try {
-					std::vector<Bytes> stale_paths;
-					stale_paths.reserve(_path_table.size());
-					for (auto& [destination_hash, destination_entry] : _path_table) {
-						const Interface& attached_interface = destination_entry.receiving_interface();
-						double destination_expiry;
-						if (attached_interface && attached_interface.mode() == Type::Interface::MODE_ACCESS_POINT) {
-							destination_expiry = destination_entry._timestamp + AP_PATH_TIME;
-						}
-						else if (attached_interface && attached_interface.mode() == Type::Interface::MODE_ROAMING) {
-							destination_expiry = destination_entry._timestamp + ROAMING_PATH_TIME;
-						}
-						else {
-							destination_expiry = destination_entry._timestamp + DESTINATION_TIMEOUT;
-						}
-
-						if (OS::time() > destination_expiry) {
-							stale_paths.push_back(destination_hash);
-							DEBUGF("Path to %s timed out and was removed", destination_hash.toHex().c_str());
-						}
-						else if (_interfaces.count(attached_interface.get_hash()) == 0) {
-							stale_paths.push_back(destination_hash);
-							DEBUGF("Path to %s was removed since the attached interface no longer exists", destination_hash.toHex().c_str());
-						}
-					}
-					remove_paths(stale_paths);
-				}
-				catch (const std::bad_alloc&) {
-					ERROR("jobs: bad_alloc - out of memory culling path table");
-				}
-				catch (const std::exception& e) {
-					ERRORF("jobs: failed to cull path table: %s", e.what());
-				}
 
 				// Cull the pending discovery path requests table
 				try {
@@ -1913,7 +1873,7 @@ DestinationEntry empty_destination_entry;
 					_new_path_table.get(packet.destination_hash(), destination_entry);
 					if (destination_entry) {
 						//p random_blobs = Transport.destination_table[packet.destination_hash][4]
-						random_blobs = destination_entry._random_blobs;
+						random_blobs.insert(destination_entry._random_blobs.begin(), destination_entry._random_blobs.end());
 
 						// If we already have a path to the announced
 						// destination, but the hop count is equal or
@@ -2969,23 +2929,6 @@ Deregisters an announce handler.
 	}
 }
 
-/*static*/ DestinationEntry& Transport::get_path(const Bytes& destination_hash) {
-	auto iter = _path_table.find(destination_hash);
-	if (iter == _path_table.end()) return empty_destination_entry;
-	DestinationEntry& destination_entry = (*iter).second;
-	if (!destination_entry.announce_packet()) {
-		DEBUGF("Entry for destination %s found but is missing announce packet, discarding", destination_hash.toHex().c_str());
-		remove_path(destination_hash);
-		return empty_destination_entry;
-	}
-	if (!destination_entry.receiving_interface()) {
-		DEBUGF("Entry for destination %s found but is missing receiving interface, discarding", destination_hash.toHex().c_str());
-		remove_path(destination_hash);
-		return empty_destination_entry;
-	}
-	return destination_entry;
-}
-
 /*static*/ bool Transport::remove_path(const Bytes& destination_hash) {
 // CBA microStore
 /*
@@ -3144,6 +3087,26 @@ Deregisters an announce handler.
 	else {
 		return false;
 	}
+}
+
+/*static*/ uint16_t Transport::drop_all_via(const Bytes& transport_hash) {
+	// Collect matching destinations first, then expire them: expire_path()
+	// reads _new_path_table, so it must not run while we iterate the (flash-
+	// backed) table.
+	std::vector<Bytes> matched;
+	for (auto entry : _new_path_table) {
+		if (entry.value._received_from == transport_hash) {
+			matched.push_back(entry.key);
+		}
+		OS::run_loop();
+	}
+	uint16_t dropped_count = 0;
+	for (const auto& destination_hash : matched) {
+		if (expire_path(destination_hash)) {
+			++dropped_count;
+		}
+	}
+	return dropped_count;
 }
 
 /*p
@@ -3696,255 +3659,6 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 
 //#define CUSTOM 1
 
-/*static*/ bool Transport::read_path_table() {
-	DEBUG("Transport::read_path_table");
-#if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
-	char destination_table_path[Type::Reticulum::FILEPATH_MAXSIZE];
-	snprintf(destination_table_path, Type::Reticulum::FILEPATH_MAXSIZE, "%s/destination_table", Reticulum::_storagepath);
-	if (!_owner.is_connected_to_shared_instance() && OS::file_exists(destination_table_path)) {
-		try {
-#if CUSTOM
-TRACEF("Transport::read_path_table: buffer capacity %d bytes", Persistence::_buffer.capacity());
-			if (RNS::Utilities::OS::read_file(destination_table_path, Persistence::_buffer) > 0) {
-				TRACEF("Transport::read_path_table: read: %d bytes", Persistence::_buffer.size());
-#ifndef NDEBUG
-				// CBA DEBUG Dump path table
-TRACEF("Transport::read_path_table: buffer addr: 0x%X", Persistence::_buffer.data());
-TRACEF("Transport::read_path_table: buffer size %d bytes", Persistence::_buffer.size());
-				//TRACE("SERIALIZED: destination_table");
-				//TRACE(Persistence::_buffer.toString().c_str());
-#endif
-#ifdef USE_MSGPACK
-				DeserializationError error = deserializeMsgPack(Persistence::_document, Persistence::_buffer.data());
-#else
-				DeserializationError error = deserializeJson(Persistence::_document, Persistence::_buffer.data());
-#endif
-				TRACEF("Transport::read_path_table: doc size: %d bytes", Persistence::_buffer.size());
-				if (!error) {
-					// Calculate crc for dirty-checking before write
-					_path_table_crc = Crc::crc32(0, Persistence::_buffer.data(), Persistence::_buffer.size());
-					_path_table = Persistence::_document.as<PathTable>();
-#else	// CUSTOM
-				// Calculate crc for dirty-checking before later write
-				if (Persistence::deserialize(_path_table, destination_table_path, _path_table_crc) > 0) {
-#endif	// CUSTOM
-
-					TRACEF("Transport::read_path_table: successfully deserialized path table with %d entries", _path_table.size());
-					std::vector<Bytes> invalid_paths;
-					for (auto& [destination_hash, destination_entry] : _path_table) {
-#ifndef NDEBUG
-						TRACEF("Transport::read_path_table: hash: %s entry: {%s}", destination_hash.toHex().c_str(), destination_entry.debugString().c_str());
-#endif
-						// CBA Avoid accessing announce_packet() and receiving_interface() until actually needed in order to
-						// take advantage of lazy loading and avoid incurring memory hit to store if not actually needed.
-
-						// CBA Optimized to not check for a valid cached announce packet,
-						// and instead checking if/when the path is actually used.
-						/*
-						// CBA If announce packet is not cached then remove destination entry (it's useless without announce packet)
-						if (!is_cached_packet(destination_entry.announce_packet_hash())) {
-							// remove destination
-							WARNINGF("Transport::read_path_table: removing invalid path to %s due to missing announce packet", destination_hash.toHex().c_str());
-							invalid_paths.push_back(destination_hash);
-							continue;
-						}
-						*/
-						// CBA If receiving interface is not present then remove destination entry (it's useless without receiving interface)
-						if (!is_interface_from_hash(destination_entry.receiving_interface_hash())) {
-							// remove destination
-							WARNINGF("Transport::read_path_table: removing invalid path to %s due to missing receiving interface", destination_hash.toHex().c_str());
-							invalid_paths.push_back(destination_hash);
-							continue;
-						}
-						DEBUGF("Loaded path table entry for %s from storage", destination_hash.toHex().c_str());
-						OS::reset_watchdog();
-					}
-					for (const auto& destination_hash : invalid_paths) {
-						_path_table.erase(destination_hash);
-					}
-                    VERBOSEF("Loaded %lu path table entries from storage", _path_table.size());
-					return true;
-				}
-				else {
-					TRACE("Transport::read_path_table: failed to deserialize");
-				}
-#if CUSTOM
-			}
-			else {
-				TRACE("Transport::read_path_table: destination table read failed");
-			}
-#else	// CUSTOM
-#endif	// CUSTOM
-		}
-		catch (const std::exception& e) {
-			ERRORF("Could not load destination table from storage, the contained exception was: %s", e.what());
-		}
-	}
-#endif
-	return false;
-}
-
-/*static*/ bool Transport::write_path_table() {
-	DEBUG("Transport::write_path_table");
-
-	if (Transport::_owner.is_connected_to_shared_instance()) {
-		return true;
-	}
-
-	bool success = false;
-#if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
-	if (_saving_path_table) {
-		double wait_interval = 0.2;
-		double wait_timeout = 5;
-		double wait_start = OS::time();
-		while (_saving_path_table) {
-			OS::sleep(wait_interval);
-			if (OS::time() > (wait_start + wait_timeout)) {
-				ERROR("Could not save path table to storage, waiting for previous save operation timed out.");
-				return false;
-			}
-		}
-	}
-
-	try {
-		_saving_path_table = true;
-		double save_start = OS::time();
-
-/*p
-		serialised_destinations = []
-		for destination_hash in Transport.destination_table:
-			// Get the destination entry from the destination table
-			de = Transport.destination_table[destination_hash]
-			interface_hash = de[5].get_hash()
-
-			// Only store destination table entry if the associated
-			// interface is still active
-			interface = Transport.find_interface_from_hash(interface_hash)
-			if interface != None:
-				// Get the destination entry from the destination table
-				de = Transport.destination_table[destination_hash]
-				timestamp = de[0]
-				received_from = de[1]
-				hops = de[2]
-				expires = de[3]
-				random_blobs = de[4]
-				packet_hash = de[6].get_hash()
-
-				serialised_entry = [
-					destination_hash,
-					timestamp,
-					received_from,
-					hops,
-					expires,
-					random_blobs,
-					interface_hash,
-					packet_hash
-				]
-
-				serialised_destinations.append(serialised_entry)
-
-				Transport.cache(de[6], force_cache=True)
-
-		destination_table_path = RNS.Reticulum.storagepath+"/destination_table"
-		file = open(destination_table_path, "wb")
-		file.write(umsgpack.packb(serialised_destinations))
-		file.close()
-*/
-
-#if CUSTOM
-		{
-			Persistence::_document.set(_path_table);
-			TRACEF("Transport::write_path_table: doc size %d bytes", Persistence::_document.memoryUsage());
-
-			//size_t size = 8192;
-			size_t size = Persistence::_buffer.capacity();
-TRACEF("Transport::write_path_table: obtaining buffer size %lu bytes", size);
-			uint8_t* buffer = Persistence::_buffer.writable(size);
-TRACEF("Transport::write_path_table: buffer addr: %ld", (long)buffer);
-#ifdef USE_MSGPACK
-			size_t length = serializeMsgPack(Persistence::_document, buffer, size);
-#else
-			size_t length = serializeJson(Persistence::_document, buffer, size);
-#endif
-			TRACEF("Transport::write_path_table: serialized %d bytes", length);
-			if (length < size) {
-				Persistence::_buffer.resize(length);
-			}
-		}
-		if (Persistence::_buffer.size() > 0) {
-#ifndef NDEBUG
-			// CBA DEBUG Dump path table
-TRACEF("Transport::write_path_table: buffer addr: %ld", (long)Persistence::_buffer.data());
-TRACEF("Transport::write_path_table: buffer size %lu bytes", Persistence::_buffer.size());
-			//TRACE("SERIALIZED: destination_table");
-			//TRACE(Persistence::_buffer.toString().c_str());
-#endif
-			// Check crc to see if data has changed before writing
-			uint32_t crc = Crc::crc32(0, Persistence::_buffer.data(), Persistence::_buffer.size());
-			if (_path_table_crc > 0 && crc == _path_table_crc) {
-				TRACE("Transport::write_path_table: no change detected, skipping write");
-			}
-			else {
-				TRACE("Transport::write_path_table: change detected, writing...");
-				DEBUGF("Saving %d path table entries to storage...", _path_table.size());
-				char destination_table_path[Type::Reticulum::FILEPATH_MAXSIZE];
-				snprintf(destination_table_path, Type::Reticulum::FILEPATH_MAXSIZE, "%s/destination_table", Reticulum::_storagepath);
-				if (RNS::Utilities::OS::write_file(destination_table_path, Persistence::_buffer) == Persistence::_buffer.size()) {
-					TRACEF("Transport::write_path_table: wrote %d entries, %d bytes", _path_table.size(), Persistence::_buffer.size());
-					_path_table_crc = crc;
-					success = true;
-
-#ifndef NDEBUG
-					// CBA DEBUG Dump path table
-					//TRACE("FILE: destination_table");
-					//if (OS::read_file("/destination_table", Persistence::_buffer) > 0) {
-					//	TRACE(Persistence::_buffer.toString().c_str());
-					//}
-#endif
-				}
-				else {
-					ERROR("Transport::write_path_table: write failed");
-				}
-			}
-		}
-		else {
-			ERROR("Transport::write_path_table: failed to serialize");
-		}
-#else	// CUSTOM
-		uint32_t crc = Persistence::crc(_path_table);
-		if (_path_table_crc > 0 && crc == _path_table_crc) {
-			TRACE("Transport::write_path_table: no change detected, skipping write");
-		}
-		else {
-			TRACE("Transport::write_path_table: change detected, writing...");
-			DEBUGF("Saving %d path table entries to storage...", _path_table.size());
-			char destination_table_path[Type::Reticulum::FILEPATH_MAXSIZE];
-			snprintf(destination_table_path, Type::Reticulum::FILEPATH_MAXSIZE, "%s/destination_table", Reticulum::_storagepath);
-			size_t len = Persistence::serialize(_path_table, destination_table_path, _path_table_crc);
-			if (len > 0) {
-				TRACEF("Transport::write_path_table: wrote %d entries, %d bytes", _path_table.size(), len);
-				success = true;
-			}
-			else {
-				ERROR("Transport::write_path_table: serialize failed");
-			}
-		}
-#endif	// CUSTOM
-
-		if (success) {
-			DEBUGF("Saved %lu path table entries in %.3f seconds", _path_table.size(), OS::round(OS::time() - save_start, 3));
-		}
-	}
-	catch (const std::exception& e) {
-		ERRORF("Could not save path table to storage, the contained exception was: %s", e.what());
-	}
-#endif
-
-	_saving_path_table = false;
-
-	return success;
-}
-
 /*static*/ void Transport::read_tunnel_table() {
 	DEBUG("Transport::read_tunnel_table");
 #if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
@@ -4081,7 +3795,6 @@ TRACEF("Transport::write_path_table: buffer size %lu bytes", Persistence::_buffe
 /*static*/ void Transport::persist_data() {
 	TRACE("Transport::persist_data()");
 	write_packet_hashlist();
-	write_path_table();
 	write_tunnel_table();
 }
 
@@ -4096,29 +3809,28 @@ TRACEF("Transport::write_path_table: buffer size %lu bytes", Persistence::_buffe
 
 	TRACE("Transport::clean_caches()");
 #if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
-	// CBA Remove cached packets no longer in path list
+	// The packet cache is currently inert: should_cache_packet() returns false,
+	// and since path storage moved to inline microStore records nothing
+	// force-caches announce packets to _cachepath either (the only force-cache
+	// caller was the old write_path_table JSON path, now removed). So no live
+	// path references a cache file and there is nothing to preserve.
+	//
+	// Do NOT cross-reference _new_path_table here: it is flash-backed and
+	// decoding all of its entries (up to the 2000 cap) to recompute their
+	// announce-packet hashes blocks loopTask long enough to trip the task
+	// watchdog. Just sweep any stale files cheaply (normally none). If packet
+	// caching is re-enabled in should_cache_packet(), this GC must be reworked
+	// to cross-reference live references again.
 	std::list<std::string> remove_list;
 	OS::list_directory(Reticulum::_cachepath, [&remove_list](const char* file_name) {
-		TRACEF("Transport::clean_caches: Checking for use of cached packet %s", file_name);
-		bool found = false;
-		for (auto& [destination_hash, destination_entry] : _path_table) {
-			if (strcasecmp(file_name, destination_entry.announce_packet_hash().toHex().c_str()) == 0) {
-				found = true;
-				break;
-			}
-		}
-		if (!found) {
-			remove_list.push_back(file_name);
-		}
-		//OS::reset_watchdog();
+		remove_list.push_back(file_name);
 		OS::run_loop();
 	});
-    for (auto& file_name : remove_list) {
-		TRACEF("Transport::clean_caches: No matching path found, removing cached packet %s", file_name.c_str());
+	for (auto& file_name : remove_list) {
+		TRACEF("Transport::clean_caches: removing stale cached packet %s", file_name.c_str());
 		char packet_cache_path[Type::Reticulum::FILEPATH_MAXSIZE];
 		snprintf(packet_cache_path, Type::Reticulum::FILEPATH_MAXSIZE, "%s/%s", Reticulum::_cachepath, file_name.c_str());
 		OS::remove_file(packet_cache_path);
-		//OS::reset_watchdog();
 		OS::run_loop();
 	}
 #endif
@@ -4230,68 +3942,6 @@ TRACEF("Transport::write_path_table: buffer size %lu bytes", Persistence::_buffe
 	}
 
 	return {Type::NONE};
-}
-
-/*static*/ void Transport::cull_path_table() {
-	TRACE("Transport::cull_path_table()");
-	if (_path_table.size() > _path_table_maxsize) {
-		try {
-			// Build lightweight (timestamp, key) index to avoid copying full DestinationEntry
-			// objects (which contain nested std::set<Bytes>) — prevents OOM on heap-constrained
-			// devices when the table hits max capacity.
-			std::vector<std::pair<double, Bytes>> sorted_keys;
-			sorted_keys.reserve(_path_table.size());
-			for (const auto& [key, entry] : _path_table) {
-				sorted_keys.emplace_back(entry._timestamp, key);
-			}
-			// Sort ascending by timestamp so oldest entries are removed first
-			std::sort(sorted_keys.begin(), sorted_keys.end());
-
-			uint16_t count = 0;
-			for (const auto& [timestamp, destination_hash] : sorted_keys) {
-				TRACEF("Transport::cull_path_table: Removing destination %s from path table", destination_hash.toHex().c_str());
-#if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
-				// CBA microStore
-				//auto& destination_entry = get_path(destination_hash);
-				DestinationEntry destination_entry;
-				_new_path_table.get(destination_hash, destination_entry);
-				if (destination_entry) {
-					// Remove cached packet file associated with this destination
-					char packet_cache_path[Type::Reticulum::FILEPATH_MAXSIZE];
-					snprintf(packet_cache_path, Type::Reticulum::FILEPATH_MAXSIZE, "%s/%s", Reticulum::_cachepath, destination_entry.announce_packet_hash().toHex().c_str());
-					if (OS::file_exists(packet_cache_path)) {
-						OS::remove_file(packet_cache_path);
-					}
-				}
-#endif
-				if (_path_table.erase(destination_hash) < 1) {
-					WARNINGF("Failed to remove destination %s from path table", destination_hash.toHex().c_str());
-				}
-				++count;
-				if (_path_table.size() <= _path_table_maxsize) {
-					break;
-				}
-			}
-			DEBUGF("Removed %d path(s) from path table", count);
-		}
-		catch (const std::bad_alloc& e) {
-			ERROR("cull_path_table: bad_alloc - out of memory building sort index, falling back to single erase");
-			// Fallback: std::min_element does no heap allocation — erase one oldest entry
-			auto oldest = std::min_element(
-				_path_table.begin(), _path_table.end(),
-				[](const std::pair<const Bytes, DestinationEntry>& a,
-			   const std::pair<const Bytes, DestinationEntry>& b) {
-				return a.second._timestamp < b.second._timestamp;
-			}
-			);
-			if (oldest != _path_table.end()) {
-				_path_table.erase(oldest);
-			}
-		}
-		catch (const std::exception& e) {
-			ERRORF("cull_path_table: exception: %s", e.what());
-		}
-	}
 }
 
 /*static*/ void Transport::cull_announce_table() {

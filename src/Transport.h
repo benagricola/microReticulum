@@ -300,7 +300,6 @@ namespace RNS {
 		static bool clear_cached_packet(const Bytes& packet_hash);
 		static bool cache_request_packet(const Packet& packet);
 		static void cache_request(const Bytes& packet_hash, const Destination& destination);
-		static DestinationEntry& get_path(const Bytes& destination_hash);
 		static bool remove_path(const Bytes& destination_hash);
 		static bool has_path(const Bytes& destination_hash);
 		static uint8_t hops_to(const Bytes& destination_hash);
@@ -313,6 +312,7 @@ namespace RNS {
 		static double first_hop_timeout(const Bytes& destination_hash);
 		static double extra_link_proof_timeout(const Interface& interface);
 		static bool expire_path(const Bytes& destination_hash);
+		static uint16_t drop_all_via(const Bytes& transport_hash);
 		//static void request_path(const Bytes& destination_hash, const Interface& on_interface = {Type::NONE}, const Bytes& tag = {}, bool recursive = false);
 		static void request_path(const Bytes& destination_hash, const Interface& on_interface, const Bytes& tag = {}, bool recursive = false);
 		static void request_path(const Bytes& destination_hash);
@@ -327,8 +327,6 @@ namespace RNS {
 		static void drop_announce_queues();
 		static uint64_t announce_emitted(const Packet& packet);
 		static void write_packet_hashlist();
-		static bool read_path_table();
-		static bool write_path_table();
 		static void read_tunnel_table();
 		static void write_tunnel_table();
 		static void persist_data();
@@ -345,7 +343,6 @@ namespace RNS {
 		static Destination find_destination_from_hash(const Bytes& destination_hash);
 
 		// CBA
-		static void cull_path_table();
 		static void cull_announce_table();
 
 		// getters/setters
@@ -362,8 +359,6 @@ namespace RNS {
 		inline static void hashlist_maxsize(uint16_t hashlist_maxsize) { _hashlist_maxsize = hashlist_maxsize; }
 		inline static uint16_t max_pr_tags() { return _max_pr_tags; }
 		inline static void max_pr_tags(uint16_t max_pr_tags) { _max_pr_tags = max_pr_tags; }
-		inline static uint16_t path_table_maxpersist() { return _path_table_maxpersist; }
-		inline static void path_table_maxpersist(uint16_t value) { _path_table_maxpersist = value; }
 		inline static uint32_t path_store_segment_size() { return _path_store_segment_size; }
 		inline static void path_store_segment_size(uint32_t value) { _path_store_segment_size = value; }
 		inline static uint8_t path_store_segment_count() { return _path_store_segment_count; }
@@ -371,7 +366,6 @@ namespace RNS {
 		// CBA TEST
 		static inline void identity(Identity& identity) { _identity = identity; }
 
-		inline static const PathTable& get_path_table() { return _path_table; }
 		inline static const RateTable& get_announce_rate_table() { return _announce_rate_table; }
 		inline static const LinkTable& get_link_table() { return _link_table; }
 
@@ -397,7 +391,6 @@ namespace RNS {
 		static std::list<PacketReceipt> _receipts;	// Receipts of all outgoing packets for proof processing
 
 		static AnnounceTable _announce_table;	// A table for storing announces currently waiting to be retransmitted
-		static PathTable _path_table;			// A lookup table containing the next hop to a given destination
 		static ReverseTable _reverse_table;		// A lookup table for storing packet hashes used to return proofs and replies
 		static LinkTable _link_table;			// A lookup table containing hops for links
 		static AnnounceTable _held_announces;	// A table containing temporarily held announce-table entries
@@ -442,16 +435,13 @@ namespace RNS {
 		static float _announces_check_interval;
 		static double _tables_last_culled;
 		static float _tables_cull_interval;
-		static bool _saving_path_table;
 		static uint16_t _hashlist_maxsize;
 		static uint16_t _max_pr_tags;
 
 		// CBA
 		static uint16_t _path_table_maxsize;
-		static uint16_t _path_table_maxpersist;
 		static double _last_saved;
 		static float _save_interval;
-		static uint32_t _path_table_crc;
 		static uint16_t _announce_table_maxsize;
 
 		static Reticulum _owner;

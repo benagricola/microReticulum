@@ -472,25 +472,6 @@ void Reticulum::get_interface_stats() const {
 }
 */
 
-const PathTable& Reticulum::get_path_table() const {
-/*
-	path_table = []
-	for dst_hash in Transport::destination_table:
-		entry = {
-			"hash": dst_hash,
-			"timestamp": Transport::destination_table[dst_hash][0],
-			"via": Transport::destination_table[dst_hash][1],
-			"hops": Transport::destination_table[dst_hash][2],
-			"expires": Transport::destination_table[dst_hash][3],
-			"interface": str(Transport::destination_table[dst_hash][5]),
-		}
-		path_table.append(entry)
-
-	return path_table
-*/
-	return Transport::get_path_table();
-}
-
 const std::map<Bytes, Transport::RateEntry>& Reticulum::get_rate_table() const {
 /*
 	rate_table = []
@@ -514,15 +495,7 @@ bool Reticulum::drop_path(const Bytes& destination) {
 }
 
 uint16_t Reticulum::drop_all_via(const Bytes& transport_hash) {
-	uint16_t dropped_count = 0;
-	//for (auto& destination_hash : Transport::get_path_table()) {
-	for (const auto& [destination_hash, destination_entry] : Transport::get_path_table()) {
-		if (destination_entry._received_from == transport_hash) {
-			Transport::expire_path(destination_hash);
-			++dropped_count;
-		}
-	}
-	return dropped_count;
+	return Transport::drop_all_via(transport_hash);
 }
 
 void Reticulum::drop_announce_queues() {
