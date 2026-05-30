@@ -47,6 +47,7 @@ namespace RNS { namespace Utilities {
 		struct allocator_info {
 			uint32_t alloc_count = 0;
 			uint32_t alloc_fault = 0;
+			uint64_t alloc_fault_bytes = 0;   // cumulative bytes that fell back to internal malloc (ps_malloc returned null)
 			uint32_t free_count = 0;
 			uint32_t free_fault = 0;
 			uint64_t alloc_size = 0;
@@ -123,6 +124,7 @@ namespace RNS { namespace Utilities {
 				void* p = ps_malloc(size);
 				if (p == nullptr) {
 					++container_allocator_info.alloc_fault;
+					container_allocator_info.alloc_fault_bytes += size;
 					p = malloc(size);
 				}
 #elif RNS_CONTAINER_ALLOCATOR == RNS_PSRAM_POOL_ALLOCATOR

@@ -335,7 +335,7 @@ void tlsf_mem_walker(void* ptr, size_t size, int used, void* user)
 	//	container_allocator_info.last_size = container_allocator_info.alloc_size;
 	//}
 
-	VERBOSEF("dflt_alloc: %llu [%d] cntr_alloc: %llu [%d]", default_allocator_info.alloc_size, dflt_diff, container_allocator_info.alloc_size, cntr_diff);
+	VERBOSEF("dflt_alloc: %llu [%d] cntr_alloc: %llu [%d] cntr_fault: %u faultbytes: %llu", default_allocator_info.alloc_size, dflt_diff, container_allocator_info.alloc_size, cntr_diff, container_allocator_info.alloc_fault, container_allocator_info.alloc_fault_bytes);
 
 	default_allocator_info.last_size = default_allocator_info.alloc_size;
 	container_allocator_info.last_size = container_allocator_info.alloc_size;
