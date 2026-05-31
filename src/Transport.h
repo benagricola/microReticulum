@@ -292,6 +292,10 @@ namespace RNS {
 		static void register_announce_handler(HAnnounceHandler handler);
 		static void deregister_announce_handler(HAnnounceHandler handler);
 		static bool is_interface_from_hash(const Bytes& interface_hash);
+		// True if `interface` is still registered. Compares the shared impl
+		// pointer rather than hashing, so it is cheap to call per table entry
+		// during culling (get_hash() recomputes an Identity::full_hash).
+		static bool is_interface_registered(const Interface& interface);
 		static Interface find_interface_from_hash(const Bytes& interface_hash);
 		static bool should_cache_packet(const Packet& packet);
 		static bool cache_packet(const Packet& packet, bool force_cache = false);

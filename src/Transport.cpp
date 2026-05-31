@@ -569,7 +569,15 @@ DestinationEntry empty_destination_entry;
 					std::vector<Bytes> stale_reverse_entries;
 					stale_reverse_entries.reserve(_reverse_table.size());
 					for (const auto& [packet_hash, reverse_entry] : _reverse_table) {
+						// Cull by timeout, or when either interface has been
+						// deregistered (mirrors RNS Transport.py:663-665).
 						if (OS::time() > (reverse_entry._timestamp + REVERSE_TIMEOUT)) {
+							stale_reverse_entries.push_back(packet_hash);
+						}
+						else if (!is_interface_registered(reverse_entry._outbound_interface)) {
+							stale_reverse_entries.push_back(packet_hash);
+						}
+						else if (!is_interface_registered(reverse_entry._receiving_interface)) {
 							stale_reverse_entries.push_back(packet_hash);
 						}
 					}
@@ -588,7 +596,15 @@ DestinationEntry empty_destination_entry;
 					stale_links.reserve(_link_table.size());
 					for (const auto& [link_id, link_entry] : _link_table) {
 						if (link_entry._validated) {
+							// Cull by timeout, or when either interface has been
+							// deregistered (mirrors RNS Transport.py:674-676).
 							if (OS::time() > (link_entry._timestamp + LINK_TIMEOUT)) {
+								stale_links.push_back(link_id);
+							}
+							else if (!is_interface_registered(link_entry._outbound_interface)) {
+								stale_links.push_back(link_id);
+							}
+							else if (!is_interface_registered(link_entry._receiving_interface)) {
 								stale_links.push_back(link_id);
 							}
 						}
@@ -2845,6 +2861,21 @@ Deregisters an announce handler.
 		return true;
 	}
 
+	return false;
+}
+
+/*static*/ bool Transport::is_interface_registered(const Interface& interface) {
+	if (!interface) {
+		return false;
+	}
+	// Table entries hold a copy of the Interface that shares the registered
+	// interface's impl, so operator== (impl-pointer identity) tells us whether
+	// the interface is still in _interfaces without recomputing its hash.
+	for (const auto& [interface_hash, registered] : _interfaces) {
+		if (registered == interface) {
+			return true;
+		}
+	}
 	return false;
 }
 
