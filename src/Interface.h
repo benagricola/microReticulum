@@ -99,6 +99,13 @@ namespace RNS {
 		// draining) would let a second same-tick announce strand permanently.
 		float _announce_cap = (float)Type::Reticulum::ANNOUNCE_CAP / 100.0f;
 		std::list<AnnounceEntry> _announce_queue;
+		// Announce flood protection (opt-in; 0 target = disabled, the default).
+		// Minimum seconds between announces from a single destination on this
+		// interface; repeated violations beyond the grace count block rebroadcast
+		// until target+penalty seconds have passed.
+		double _announce_rate_target = 0;
+		uint32_t _announce_rate_grace = 0;
+		double _announce_rate_penalty = 0;
 		bool _is_connected_to_shared_instance = false;
 		bool _is_local_shared_instance = false;
 		//Bytes _hash;
@@ -220,6 +227,12 @@ namespace RNS {
 		inline bool FIXED_MTU() const { assert(_impl); return _impl->_FIXED_MTU; }
 		inline double announce_allowed_at() const { assert(_impl); return _impl->_announce_allowed_at; }
 		inline float announce_cap() const { assert(_impl); return _impl->_announce_cap; }
+		inline double announce_rate_target() const { assert(_impl); return _impl->_announce_rate_target; }
+		inline void announce_rate_target(double target) { assert(_impl); _impl->_announce_rate_target = target; }
+		inline uint32_t announce_rate_grace() const { assert(_impl); return _impl->_announce_rate_grace; }
+		inline void announce_rate_grace(uint32_t grace) { assert(_impl); _impl->_announce_rate_grace = grace; }
+		inline double announce_rate_penalty() const { assert(_impl); return _impl->_announce_rate_penalty; }
+		inline void announce_rate_penalty(double penalty) { assert(_impl); _impl->_announce_rate_penalty = penalty; }
 		inline size_t rxb() const { assert(_impl); return _impl->_rxb; }
 		inline size_t txb() const { assert(_impl); return _impl->_txb; }
 		inline std::list<AnnounceEntry>& announce_queue() const { assert(_impl); return _impl->_announce_queue; }

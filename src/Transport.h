@@ -348,6 +348,7 @@ namespace RNS {
 
 		// CBA
 		static void cull_announce_table();
+		static void cull_announce_rate_table();
 
 		// getters/setters
 		static inline void set_receive_packet_callback(Callbacks::receive_packet callback) { _callbacks._receive_packet = callback; }
@@ -359,6 +360,8 @@ namespace RNS {
 		inline static void path_table_maxsize(uint16_t path_table_maxsize) { _path_table_maxsize = path_table_maxsize; _path_store.set_max_recs(_path_table_maxsize); }
 		inline static uint16_t announce_table_maxsize() { return _announce_table_maxsize; }
 		inline static void announce_table_maxsize(uint16_t announce_table_maxsize) { _announce_table_maxsize = announce_table_maxsize; }
+		inline static uint16_t announce_rate_table_maxsize() { return _announce_rate_table_maxsize; }
+		inline static void announce_rate_table_maxsize(uint16_t announce_rate_table_maxsize) { _announce_rate_table_maxsize = announce_rate_table_maxsize; }
 		inline static uint16_t hashlist_maxsize() { return _hashlist_maxsize; }
 		inline static void hashlist_maxsize(uint16_t hashlist_maxsize) { _hashlist_maxsize = hashlist_maxsize; }
 		inline static uint16_t max_pr_tags() { return _max_pr_tags; }
@@ -385,6 +388,8 @@ namespace RNS {
 		// Inbound safety drops (malformed/misflagged packets rejected before parsing).
 		inline static uint32_t runt_drops()         { return _runt_drops; }
 		inline static uint32_t ifac_flagged_drops() { return _ifac_flagged_drops; }
+		// Announce rebroadcasts suppressed by per-interface flood protection.
+		inline static uint32_t announce_rate_blocks() { return _announce_rate_blocks; }
 
 	private:
 		// CBA MUST use references to interfaces here in order for virtul overrides for send/receive to work
@@ -450,6 +455,7 @@ namespace RNS {
 		static double _last_saved;
 		static float _save_interval;
 		static uint16_t _announce_table_maxsize;
+		static uint16_t _announce_rate_table_maxsize;
 
 		static Reticulum _owner;
 		static Identity _identity;
@@ -462,6 +468,7 @@ namespace RNS {
 		static uint32_t _packets_received;
 		static uint32_t _runt_drops;
 		static uint32_t _ifac_flagged_drops;
+		static uint32_t _announce_rate_blocks;
 		static uint32_t _destinations_added;
 		static size_t _last_memory;
 		static size_t _last_psram;

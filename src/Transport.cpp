@@ -53,6 +53,13 @@ using namespace RNS::Persistence;
 #define RNS_ANNOUNCE_TABLE_MAX 100
 #endif
 
+// Embedded divergence from upstream: RNS keeps announce_rate_table unbounded.
+// On a memory-constrained device under an announce firehose that is itself a
+// leak, so we cap it and LRU-cull by last-seen time.
+#ifndef RNS_ANNOUNCE_RATE_TABLE_MAX
+#define RNS_ANNOUNCE_RATE_TABLE_MAX 100
+#endif
+
 #ifndef RNS_HASHLIST_MAX
 #define RNS_HASHLIST_MAX 100
 #endif
@@ -122,6 +129,7 @@ using namespace RNS::Persistence;
 /*static*/ double Transport::_last_saved				= 0.0;
 /*static*/ float Transport::_save_interval				= 3600.0;
 /*static*/ uint16_t Transport::_announce_table_maxsize	= RNS_ANNOUNCE_TABLE_MAX;
+/*static*/ uint16_t Transport::_announce_rate_table_maxsize	= RNS_ANNOUNCE_RATE_TABLE_MAX;
 
 /*static*/ Reticulum Transport::_owner({Type::NONE});
 /*static*/ Identity Transport::_identity({Type::NONE});
@@ -134,6 +142,7 @@ using namespace RNS::Persistence;
 /*static*/ uint32_t Transport::_packets_received = 0;
 /*static*/ uint32_t Transport::_runt_drops = 0;
 /*static*/ uint32_t Transport::_ifac_flagged_drops = 0;
+/*static*/ uint32_t Transport::_announce_rate_blocks = 0;
 /*static*/ uint32_t Transport::_destinations_added = 0;
 /*static*/ size_t Transport::_last_memory = 0;
 /*static*/ size_t Transport::_last_psram = 0;
@@ -2012,41 +2021,54 @@ DestinationEntry empty_destination_entry;
 
 						bool rate_blocked = false;
 
-// TODO
-/*p
-						if packet.context != RNS.Packet.PATH_RESPONSE and packet.receiving_interface.announce_rate_target != None:
-							if not packet.destination_hash in Transport.announce_rate_table:
-								rate_entry = { "last": now, "rate_violations": 0, "blocked_until": 0, "timestamps": [now]}
-								Transport.announce_rate_table[packet.destination_hash] = rate_entry
+						// Announce flood protection (ported from RNS Transport.py).
+						// Opt-in: only active on an interface with announce_rate_target
+						// set. A destination announcing faster than the target rate
+						// accrues violations; past the grace count its rebroadcast is
+						// blocked until target+penalty seconds have elapsed.
+						const Interface& rate_interface = packet.receiving_interface();
+						if (packet.context() != Type::Packet::PATH_RESPONSE
+								&& rate_interface && rate_interface.announce_rate_target() > 0) {
+							auto rate_iter = _announce_rate_table.find(packet.destination_hash());
+							if (rate_iter == _announce_rate_table.end()) {
+								// First announce from this destination: bound the table
+								// (embedded divergence from upstream's unbounded dict)
+								// before inserting, then allow this announce through.
+								cull_announce_rate_table();
+								_announce_rate_table.insert({packet.destination_hash(), RateEntry(now)});
+							}
+							else {
+								RateEntry& rate_entry = rate_iter->second;
+								rate_entry._timestamps.push_back(now);
+								while (rate_entry._timestamps.size() > Type::Transport::MAX_RATE_TIMESTAMPS) {
+									rate_entry._timestamps.erase(rate_entry._timestamps.begin());
+								}
 
-							else:
-								rate_entry = Transport.announce_rate_table[packet.destination_hash]
-								rate_entry["timestamps"].append(now)
+								double current_rate = now - rate_entry._last;
 
-								while len(rate_entry["timestamps"]) > Transport.MAX_RATE_TIMESTAMPS:
-									rate_entry["timestamps"].pop(0)
+								if (now > rate_entry._blocked_until) {
+									if (current_rate < rate_interface.announce_rate_target()) {
+										rate_entry._rate_violations += 1;
+									}
+									else {
+										rate_entry._rate_violations = std::max(0.0, rate_entry._rate_violations - 1);
+									}
 
-								current_rate = now - rate_entry["last"]
-
-								if now > rate_entry["blocked_until"]:
-
-									if current_rate < packet.receiving_interface.announce_rate_target:
-										rate_entry["rate_violations"] += 1
-
-									else:
-										rate_entry["rate_violations"] = std::max(0, rate_entry["rate_violations"]-1)
-
-									if rate_entry["rate_violations"] > packet.receiving_interface.announce_rate_grace:
-										rate_target = packet.receiving_interface.announce_rate_target
-										rate_penalty = packet.receiving_interface.announce_rate_penalty
-										rate_entry["blocked_until"] = rate_entry["last"] + rate_target + rate_penalty
-										rate_blocked = True
-									else:
-										rate_entry["last"] = now
-
-								else:
-									rate_blocked = True
-*/
+									if (rate_entry._rate_violations > rate_interface.announce_rate_grace()) {
+										rate_entry._blocked_until = rate_entry._last
+											+ rate_interface.announce_rate_target()
+											+ rate_interface.announce_rate_penalty();
+										rate_blocked = true;
+									}
+									else {
+										rate_entry._last = now;
+									}
+								}
+								else {
+									rate_blocked = true;
+								}
+							}
+						}
 
 						uint8_t retries = 0;
 						uint8_t announce_hops = packet.hops();
@@ -2087,6 +2109,7 @@ DestinationEntry empty_destination_entry;
 							// Insert announce into announce table for retransmission
 
 							if (rate_blocked) {
+								++_announce_rate_blocks;
 								DEBUGF("Blocking rebroadcast of announce from %s due to excessive announce rate", packet.destination_hash().toHex().c_str());
 							}
 							else {
@@ -4075,6 +4098,43 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 		catch (const std::exception& e) {
 			ERRORF("cull_announce_table: exception: %s", e.what());
 		}
+	}
+}
+
+/*static*/ void Transport::cull_announce_rate_table() {
+	if (_announce_rate_table.size() <= _announce_rate_table_maxsize) {
+		return;
+	}
+	try {
+		// LRU cull: drop the entries seen longest ago first.
+		std::vector<std::pair<double, Bytes>> sorted_keys;
+		sorted_keys.reserve(_announce_rate_table.size());
+		for (const auto& [key, entry] : _announce_rate_table) {
+			sorted_keys.emplace_back(entry._last, key);
+		}
+		std::sort(sorted_keys.begin(), sorted_keys.end());
+		for (const auto& [last, key] : sorted_keys) {
+			_announce_rate_table.erase(key);
+			if (_announce_rate_table.size() <= _announce_rate_table_maxsize) {
+				break;
+			}
+		}
+	}
+	catch (const std::bad_alloc&) {
+		ERROR("cull_announce_rate_table: bad_alloc - falling back to single erase");
+		auto oldest = std::min_element(
+			_announce_rate_table.begin(), _announce_rate_table.end(),
+			[](const std::pair<const Bytes, RateEntry>& a,
+			   const std::pair<const Bytes, RateEntry>& b) {
+				return a.second._last < b.second._last;
+			}
+		);
+		if (oldest != _announce_rate_table.end()) {
+			_announce_rate_table.erase(oldest);
+		}
+	}
+	catch (const std::exception& e) {
+		ERRORF("cull_announce_rate_table: exception: %s", e.what());
 	}
 }
 
