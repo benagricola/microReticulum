@@ -378,6 +378,9 @@ namespace RNS {
 		inline static uint32_t packets_sent()       { return _packets_sent; }
 		inline static uint32_t packets_received()   { return _packets_received; }
 		inline static uint32_t destinations_added() { return _destinations_added; }
+		// Inbound safety drops (malformed/misflagged packets rejected before parsing).
+		inline static uint32_t runt_drops()         { return _runt_drops; }
+		inline static uint32_t ifac_flagged_drops() { return _ifac_flagged_drops; }
 
 	private:
 		// CBA MUST use references to interfaces here in order for virtul overrides for send/receive to work
@@ -453,6 +456,8 @@ namespace RNS {
 		// CBA Stats
 		static uint32_t _packets_sent;
 		static uint32_t _packets_received;
+		static uint32_t _runt_drops;
+		static uint32_t _ifac_flagged_drops;
 		static uint32_t _destinations_added;
 		static size_t _last_memory;
 		static size_t _last_psram;

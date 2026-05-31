@@ -132,6 +132,8 @@ using namespace RNS::Persistence;
 // CBA Stats
 /*static*/ uint32_t Transport::_packets_sent = 0;
 /*static*/ uint32_t Transport::_packets_received = 0;
+/*static*/ uint32_t Transport::_runt_drops = 0;
+/*static*/ uint32_t Transport::_ifac_flagged_drops = 0;
 /*static*/ uint32_t Transport::_destinations_added = 0;
 /*static*/ size_t Transport::_last_memory = 0;
 /*static*/ size_t Transport::_last_psram = 0;
@@ -1357,6 +1359,27 @@ DestinationEntry empty_destination_entry;
 		catch (const std::exception& e) {
 			DEBUGF("Error while executing receive packet callback. The contained exception was: %s", e.what());
 		}
+	}
+
+	// Inbound safety drops, ported from the non-IFAC branch of
+	// RNS Transport.py:1384-1435. The full IFAC authentication path (the
+	// commented block below) is not yet ported; until an interface can carry
+	// IFAC, every interface is non-IFAC, so:
+	//   - a packet too short to hold even a header is malformed; and
+	//   - a packet arriving with the IFAC flag (raw[0] & 0x80) set does not
+	//     belong on a non-IFAC interface (misflagged, corrupted, or leaked
+	//     from another network).
+	// Both are dropped before unpack(). rmap is an open (non-IFAC) network, so
+	// its header bit 7 is always clear and ifac_flagged_drops should stay ~0.
+	if (raw.size() <= 2) {
+		++_runt_drops;
+		DEBUGF("Transport::inbound: dropping runt packet (%u bytes)", (unsigned)raw.size());
+		return;
+	}
+	if ((raw.data()[0] & 0x80) == 0x80) {
+		++_ifac_flagged_drops;
+		DEBUG("Transport::inbound: dropping IFAC-flagged packet on non-IFAC interface");
+		return;
 	}
 // TODO
 /*p
