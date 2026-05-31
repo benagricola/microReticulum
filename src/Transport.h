@@ -177,7 +177,7 @@ namespace RNS {
 			bool _validated = false;
 			double _proof_timeout = 0;
 		};
-		using LinkTable = std::map<Bytes, LinkEntry>;
+		using LinkTable = Utilities::Memory::ContainerMap<Bytes, LinkEntry>;
 
 		// CBA TODO Analyze safety of using Inrerface references here
 		class ReverseEntry {
@@ -193,7 +193,7 @@ namespace RNS {
 			const Interface _outbound_interface = {Type::NONE};
 			double _timestamp = 0;
 		};
-		using ReverseTable = std::map<Bytes, ReverseEntry>;
+		using ReverseTable = Utilities::Memory::ContainerMap<Bytes, ReverseEntry>;
 
 		// CBA TODO Analyze safety of using Inrerface references here
 		class PathRequestEntry {
@@ -209,7 +209,7 @@ namespace RNS {
 			double _timeout = 0;
 			const Interface _requesting_interface = {Type::NONE};
 		};
-		using PathRequestTable = std::map<Bytes, PathRequestEntry>;
+		using PathRequestTable = Utilities::Memory::ContainerMap<Bytes, PathRequestEntry>;
 
 /*
 		// CBA TODO Analyze safety of using Inrerface references here
@@ -267,7 +267,7 @@ namespace RNS {
 			double _blocked_until = 0.0;
 			std::vector<double> _timestamps;
 		};
-		using RateTable = std::map<Bytes, RateEntry>;
+		using RateTable = Utilities::Memory::ContainerMap<Bytes, RateEntry>;
 
 	public:
 		static void start(const Reticulum& reticulum_instance);
@@ -362,6 +362,9 @@ namespace RNS {
 		inline static void announce_table_maxsize(uint16_t announce_table_maxsize) { _announce_table_maxsize = announce_table_maxsize; }
 		inline static uint16_t announce_rate_table_maxsize() { return _announce_rate_table_maxsize; }
 		inline static void announce_rate_table_maxsize(uint16_t announce_rate_table_maxsize) { _announce_rate_table_maxsize = announce_rate_table_maxsize; }
+		inline static uint16_t path_requests_maxsize() { return _path_requests_maxsize; }
+		inline static void path_requests_maxsize(uint16_t path_requests_maxsize) { _path_requests_maxsize = path_requests_maxsize; }
+		inline static size_t path_requests_size() { return _path_requests.size(); }
 		inline static uint16_t hashlist_maxsize() { return _hashlist_maxsize; }
 		inline static void hashlist_maxsize(uint16_t hashlist_maxsize) { _hashlist_maxsize = hashlist_maxsize; }
 		inline static uint16_t max_pr_tags() { return _max_pr_tags; }
@@ -399,7 +402,7 @@ namespace RNS {
 		// CBA TODO: Reconsider using std::set for enforcing uniqueness. Maybe consider std::map keyed on hash instead
 		static std::set<Link> _pending_links;		// Links that are being established
 		static std::set<Link> _active_links;		// Links that are active
-		static std::set<Bytes> _packet_hashlist;	// A list of packet hashes for duplicate detection
+		static Utilities::Memory::ContainerSet<Bytes> _packet_hashlist;	// A list of packet hashes for duplicate detection
 		static std::list<PacketReceipt> _receipts;	// Receipts of all outgoing packets for proof processing
 
 		static AnnounceTable _announce_table;	// A table for storing announces currently waiting to be retransmitted
@@ -409,10 +412,10 @@ namespace RNS {
 		static TunnelTable _tunnels;			// A table storing tunnels to other transport instances
 		static RateTable _announce_rate_table;	// A table for keeping track of announce rates
 		static std::set<HAnnounceHandler> _announce_handlers;	// A table storing externally registered announce handlers
-		static std::map<Bytes, double> _path_requests;	// A table for storing path request timestamps
+		static Utilities::Memory::ContainerMap<Bytes, double> _path_requests;	// A table for storing path request timestamps
 
 		static PathRequestTable _discovery_path_requests;	// A table for keeping track of path requests on behalf of other nodes
-		static std::set<Bytes> _discovery_pr_tags;	// A table for keeping track of tagged path requests
+		static Utilities::Memory::ContainerSet<Bytes> _discovery_pr_tags;	// A table for keeping track of tagged path requests
 
 		// Transport control destinations are used
 		// for control purposes like path requests
@@ -425,7 +428,7 @@ namespace RNS {
 		//static std::set<Interface> _local_client_interfaces;
 		static std::set<std::reference_wrapper<const Interface>, std::less<const Interface>> _local_client_interfaces;
 
-		static std::map<Bytes, const Interface> _pending_local_path_requests;
+		static Utilities::Memory::ContainerMap<Bytes, const Interface> _pending_local_path_requests;
 
 		// CBA
 		static PacketTable _packet_table;           // A lookup table containing announce packets for known paths
@@ -456,6 +459,7 @@ namespace RNS {
 		static float _save_interval;
 		static uint16_t _announce_table_maxsize;
 		static uint16_t _announce_rate_table_maxsize;
+		static uint16_t _path_requests_maxsize;
 
 		static Reticulum _owner;
 		static Identity _identity;

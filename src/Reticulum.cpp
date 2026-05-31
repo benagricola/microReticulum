@@ -479,7 +479,7 @@ void Reticulum::get_interface_stats() const {
 }
 */
 
-const std::map<Bytes, Transport::RateEntry>& Reticulum::get_rate_table() const {
+const Transport::RateTable& Reticulum::get_rate_table() const {
 /*
 	rate_table = []
 	for dst_hash in Transport::announce_rate_table:

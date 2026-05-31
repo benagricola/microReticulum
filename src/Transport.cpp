@@ -61,6 +61,16 @@ using namespace RNS::Persistence;
 #define RNS_ANNOUNCE_RATE_TABLE_MAX 100
 #endif
 
+// Embedded divergence from upstream: RNS only culls path-request timestamps
+// after DESTINATION_TIMEOUT (a day), so under a high-cardinality announce
+// firehose _path_requests grows toward tens of thousands of nodes. Those nodes
+// now live in PSRAM (ContainerMap), so this cap is a generous safety bound on
+// PSRAM footprint + map-traversal cost rather than an internal-SRAM necessity;
+// the oldest request is LRU-evicted when full.
+#ifndef RNS_PATH_REQUESTS_MAX
+#define RNS_PATH_REQUESTS_MAX 2000
+#endif
+
 #ifndef RNS_HASHLIST_MAX
 #define RNS_HASHLIST_MAX 100
 #endif
@@ -73,20 +83,20 @@ using namespace RNS::Persistence;
 /*static*/ Transport::DestinationTable Transport::_destinations;
 /*static*/ std::set<Link> Transport::_pending_links;
 /*static*/ std::set<Link> Transport::_active_links;
-/*static*/ std::set<Bytes> Transport::_packet_hashlist;
+/*static*/ Utilities::Memory::ContainerSet<Bytes> Transport::_packet_hashlist;
 /*static*/ std::list<PacketReceipt> Transport::_receipts;
 
 /*static*/ Transport::AnnounceTable Transport::_announce_table;
-/*static*/ std::map<Bytes, Transport::ReverseEntry> Transport::_reverse_table;
-/*static*/ std::map<Bytes, Transport::LinkEntry> Transport::_link_table;
+/*static*/ Transport::ReverseTable Transport::_reverse_table;
+/*static*/ Transport::LinkTable Transport::_link_table;
 /*static*/ Transport::AnnounceTable Transport::_held_announces;
 /*static*/ std::set<HAnnounceHandler> Transport::_announce_handlers;
 /*static*/ std::map<Bytes, Transport::TunnelEntry> Transport::_tunnels;
-/*static*/ std::map<Bytes, Transport::RateEntry> Transport::_announce_rate_table;
-/*static*/ std::map<Bytes, double> Transport::_path_requests;
+/*static*/ Transport::RateTable Transport::_announce_rate_table;
+/*static*/ Utilities::Memory::ContainerMap<Bytes, double> Transport::_path_requests;
 
-/*static*/ std::map<Bytes, Transport::PathRequestEntry> Transport::_discovery_path_requests;
-/*static*/ std::set<Bytes> Transport::_discovery_pr_tags;
+/*static*/ Transport::PathRequestTable Transport::_discovery_path_requests;
+/*static*/ Utilities::Memory::ContainerSet<Bytes> Transport::_discovery_pr_tags;
 
 /*static*/ std::set<Destination> Transport::_control_destinations;
 /*static*/ std::set<Bytes> Transport::_control_hashes;
@@ -94,7 +104,7 @@ using namespace RNS::Persistence;
 ///*static*/ std::set<Interface> Transport::_local_client_interfaces;
 /*static*/ std::set<std::reference_wrapper<const Interface>, std::less<const Interface>> Transport::_local_client_interfaces;
 
-/*static*/ std::map<Bytes, const Interface> Transport::_pending_local_path_requests;
+/*static*/ Utilities::Memory::ContainerMap<Bytes, const Interface> Transport::_pending_local_path_requests;
 
 // CBA
 /*static*/ std::map<Bytes, Transport::PacketEntry> Transport::_packet_table;
@@ -131,6 +141,7 @@ using namespace RNS::Persistence;
 /*static*/ float Transport::_save_interval				= 3600.0;
 /*static*/ uint16_t Transport::_announce_table_maxsize	= RNS_ANNOUNCE_TABLE_MAX;
 /*static*/ uint16_t Transport::_announce_rate_table_maxsize	= RNS_ANNOUNCE_RATE_TABLE_MAX;
+/*static*/ uint16_t Transport::_path_requests_maxsize	= RNS_PATH_REQUESTS_MAX;
 
 /*static*/ Reticulum Transport::_owner({Type::NONE});
 /*static*/ Identity Transport::_identity({Type::NONE});
@@ -3298,6 +3309,22 @@ will announce it.
 	}
 
 	packet.send();
+	// Bound _path_requests (embedded divergence: upstream relies solely on the
+	// DESTINATION_TIMEOUT cull, which is a day long and so unbounded in practice
+	// under a high-cardinality firehose). When at capacity, evict the oldest
+	// request before recording a new destination. The throttle these timestamps
+	// provide is only an optimisation, so dropping the oldest is harmless.
+	if (_path_requests.size() >= _path_requests_maxsize
+			&& _path_requests.find(destination_hash) == _path_requests.end()) {
+		auto oldest = std::min_element(
+			_path_requests.begin(), _path_requests.end(),
+			[](const std::pair<const Bytes, double>& a, const std::pair<const Bytes, double>& b) {
+				return a.second < b.second;
+			});
+		if (oldest != _path_requests.end()) {
+			_path_requests.erase(oldest);
+		}
+	}
 	_path_requests[destination_hash] = OS::time();
 }
 

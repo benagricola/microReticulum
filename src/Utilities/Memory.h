@@ -19,6 +19,8 @@
 #include "tlsf.h"
 
 #include <memory>
+#include <map>
+#include <set>
 
 #define RNS_HEAP_ALLOCATOR 0		 // Use HEAP for allocator
 #define RNS_HEAP_POOL_ALLOCATOR 1	 // Use HEAP pool for allocator
@@ -182,6 +184,16 @@ namespace RNS { namespace Utilities {
 			//template <class T, class U>
 			//bool operator!=(const MyAllocator<T>&, const MyAllocator<U>&) { return false; }
 		};
+
+		// std::map / std::set whose tree NODES live in the container-allocator
+		// arena (PSRAM when RNS_CONTAINER_ALLOCATOR=RNS_PSRAM_ALLOCATOR). The
+		// HEAP_EXTMEM_THRESHOLD knob only routes large allocations off-chip, so a
+		// container's small ~40-byte nodes otherwise stay in scarce internal SRAM
+		// even when its Bytes payloads do not. Use these for growth-prone tables.
+		template <typename K, typename V>
+		using ContainerMap = std::map<K, V, std::less<K>, ContainerAllocator<std::pair<const K, V>>>;
+		template <typename T>
+		using ContainerSet = std::set<T, std::less<T>, ContainerAllocator<T>>;
 
 	};
 
