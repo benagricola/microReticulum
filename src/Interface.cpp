@@ -16,11 +16,15 @@
 
 #include "Identity.h"
 #include "Transport.h"
+#include "Utilities/OS.h"
 
 using namespace RNS;
 using namespace RNS::Type::Interface;
+using namespace RNS::Utilities;
 
 /*static*/ uint8_t Interface::DISCOVER_PATHS_FOR = MODE_ACCESS_POINT | MODE_GATEWAY;
+
+/*static*/ uint32_t Interface::_drained_announces = 0;
 
 void InterfaceImpl::handle_outgoing(const Bytes& data) {
 	//TRACEF("InterfaceImpl.handle_outgoing: data: %s", data.toHex().c_str());
@@ -89,50 +93,73 @@ void Interface::handle_incoming(const Bytes& data) {
 }
 
 void Interface::process_announce_queue() {
-/*
-	if not hasattr(self, "announce_cap"):
-		self.announce_cap = RNS.Reticulum.ANNOUNCE_CAP
+	assert(_impl);
 
-	if hasattr(self, "announce_queue"):
-		try:
-			now = time.time()
-			stale = []
-			for a in self.announce_queue:
-				if now > a["time"]+RNS.Reticulum.QUEUED_ANNOUNCE_LIFE:
-					stale.append(a)
+	// Cooperative announce-egress drain. Ported from RNS
+	// Interfaces/Interface.py:323-364. Embedded divergence: upstream arms a
+	// threading.Timer per send; on the ESP32 we instead poll this from
+	// Reticulum::loop() once per main-loop iteration and self-gate on
+	// _announce_allowed_at, draining at most one announce per rate window.
+	// Unlike upstream's process_outgoing(raw) — which would send a queued
+	// announce unmasked even on an IFAC interface — we route through
+	// Transport::transmit() so a queued announce is masked consistently with
+	// an immediate send.
+	std::list<AnnounceEntry>& queue = _impl->_announce_queue;
+	if (queue.empty()) {
+		return;
+	}
 
-			for s in stale:
-				if s in self.announce_queue:
-					self.announce_queue.remove(s)
+	try {
+		double now = OS::time();
 
-			if len(self.announce_queue) > 0:
-				min_hops = min(entry["hops"] for entry in self.announce_queue)
-				entries = list(filter(lambda e: e["hops"] == min_hops, self.announce_queue))
-				entries.sort(key=lambda e: e["time"])
-				selected = entries[0]
+		// Expire entries older than QUEUED_ANNOUNCE_LIFE.
+		for (auto it = queue.begin(); it != queue.end(); ) {
+			if (now > it->_time + (double)Type::Reticulum::QUEUED_ANNOUNCE_LIFE) {
+				it = queue.erase(it);
+			}
+			else {
+				++it;
+			}
+		}
+		if (queue.empty()) {
+			return;
+		}
 
-				double now = OS::time();
-				uint32_t wait_time = 0;
-				if (_impl->_bitrate > 0 && _impl->_announce_cap > 0) {
-					uint32_t tx_time = (len(selected["raw"])*8) / _impl->_bitrate;
-					wait_time = (tx_time / _impl->_announce_cap);
-				}
-				_impl->_announce_allowed_at = now + wait_time;
+		// One send per rate window.
+		if (now < _impl->_announce_allowed_at) {
+			return;
+		}
 
-				self.on_outgoing(selected["raw"])
+		// Prefer the lowest-hop announce, tie-broken by the oldest queued time.
+		auto selected = queue.begin();
+		for (auto it = queue.begin(); it != queue.end(); ++it) {
+			if (it->_hops < selected->_hops ||
+				(it->_hops == selected->_hops && it->_time < selected->_time)) {
+				selected = it;
+			}
+		}
 
-				if selected in self.announce_queue:
-					self.announce_queue.remove(selected)
+		// Next send is allowed after the selected announce's time-on-air
+		// divided by the announce capacity (fraction of airtime for announces).
+		double wait_time = 0;
+		if (_impl->_bitrate > 0 && _impl->_announce_cap > 0) {
+			double tx_time = (double)(selected->_raw.size() * 8) / (double)_impl->_bitrate;
+			wait_time = tx_time / _impl->_announce_cap;
+		}
+		_impl->_announce_allowed_at = now + wait_time;
 
-				if len(self.announce_queue) > 0:
-					timer = threading.Timer(wait_time, self.process_announce_queue)
-					timer.start()
-
-		except Exception as e:
-			self.announce_queue = []
-			RNS.log("Error while processing announce queue on "+str(self)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
-			RNS.log("The announce queue for this interface has been cleared.", RNS.LOG_ERROR)
-*/
+		TRACEF("Interface.process_announce_queue: draining queued announce (%u remaining) on %s",
+			(unsigned)(queue.size() - 1), toString().c_str());
+		Transport::transmit(*this, selected->_raw);
+		queue.erase(selected);
+		_drained_announces++;
+	}
+	catch (const std::exception& e) {
+		// Match upstream: a failure clears the whole queue rather than
+		// retrying a poison entry forever.
+		ERRORF("Interface::process_announce_queue: %s - clearing announce queue", e.what());
+		queue.clear();
+	}
 }
 
 /*

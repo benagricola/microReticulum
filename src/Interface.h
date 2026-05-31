@@ -92,7 +92,12 @@ namespace RNS {
 		bool _AUTOCONFIGURE_MTU = false;
 		bool _FIXED_MTU = false;
 		double _announce_allowed_at = 0;
-		float _announce_cap = 0.0;
+		// Fraction of interface airtime allotted to announce egress. Upstream
+		// reads this per-interface from config (default Reticulum.ANNOUNCE_CAP%);
+		// we default every interface to that 2% so the queue-drain wait-time
+		// math stays active. A 0.0 cap skips the math and (with the queue now
+		// draining) would let a second same-tick announce strand permanently.
+		float _announce_cap = (float)Type::Reticulum::ANNOUNCE_CAP / 100.0f;
 		std::list<AnnounceEntry> _announce_queue;
 		bool _is_connected_to_shared_instance = false;
 		bool _is_local_shared_instance = false;
@@ -109,6 +114,11 @@ namespace RNS {
 		// Which interface modes a Transport Node
 		// should actively discover paths for.
 		static uint8_t DISCOVER_PATHS_FOR;
+
+		// Total announces drained from interface egress queues since boot (one
+		// per process_announce_queue() send). A climbing value confirms queued
+		// re-broadcasts are reaching the wire; flat-at-zero means they are not.
+		static uint32_t drained_announces() { return _drained_announces; }
 
 	public:
 		Interface(Type::NoneConstructor none) {
@@ -188,7 +198,6 @@ namespace RNS {
 		inline void FWD(bool FWD) { assert(_impl); _impl->_FWD = FWD; }
 		inline void RPT(bool RPT) { assert(_impl); _impl->_RPT = RPT; }
 		inline void name(const char* name) { assert(_impl); _impl->_name = name; }
-		inline void bitrate(uint32_t bitrate) { assert(_impl); _impl->_bitrate = bitrate; }
 		inline void online(bool online) { assert(_impl); _impl->_online = online; }
 		inline void announce_allowed_at(double announce_allowed_at) { assert(_impl); _impl->_announce_allowed_at = announce_allowed_at; }
 	public:
@@ -203,6 +212,9 @@ namespace RNS {
 		inline Type::Interface::modes mode() const { assert(_impl); return _impl->_mode; }
 		inline void mode(Type::Interface::modes mode) { assert(_impl); _impl->_mode = mode; }
 		inline uint32_t bitrate() const { assert(_impl); return _impl->_bitrate; }
+		// Public so the firmware can seed the interface from the radio's
+		// computed on-air bitrate (announce-egress shaping, airtime estimates).
+		inline void bitrate(uint32_t bitrate) { assert(_impl); _impl->_bitrate = bitrate; }
 		inline uint16_t HW_MTU() const { assert(_impl); return _impl->_HW_MTU; }
 		inline bool AUTOCONFIGURE_MTU() const { assert(_impl); return _impl->_AUTOCONFIGURE_MTU; }
 		inline bool FIXED_MTU() const { assert(_impl); return _impl->_FIXED_MTU; }
@@ -227,6 +239,8 @@ namespace RNS {
 
 	protected:
 		std::shared_ptr<InterfaceImpl> _impl;
+
+		static uint32_t _drained_announces;
 
 	friend class Transport;
 	};

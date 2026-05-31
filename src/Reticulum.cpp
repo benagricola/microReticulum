@@ -259,6 +259,13 @@ void Reticulum::loop() {
 			// and into Link/Resource callbacks; non-trivial work.
 			for (auto& [hash, interface] : Transport::get_interfaces()) {
 				interface.loop();
+				// Cooperative announce-egress drain (replaces upstream's
+				// per-interface threading.Timer). Cheap no-op when the queue
+				// is empty; otherwise drains at most one announce per rate
+				// window, self-gated on announce_allowed_at.
+				if (!interface.announce_queue().empty()) {
+					interface.process_announce_queue();
+				}
 				OS::reset_watchdog();
 			}
 

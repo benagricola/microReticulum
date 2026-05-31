@@ -24,6 +24,9 @@
 #include "Cryptography/Random.h"
 #include "Utilities/OS.h"
 #include "Utilities/Persistence.h"
+#if defined(URTN_REBROADCAST_DIAG)
+#include "Utilities/RebroadcastDiag.h"
+#endif
 
 #include <algorithm>
 #include <unistd.h>
@@ -505,6 +508,10 @@ DestinationEntry empty_destination_entry;
 							}
 							
 							outgoing.push_back(new_packet);
+#if defined(URTN_REBROADCAST_DIAG)
+							RNS::RebroadcastDiag::on_alloc(RNS::RebroadcastDiag::SITE_DEST, announce_destination.obj_id(), destination_hash);
+							RNS::RebroadcastDiag::on_alloc(RNS::RebroadcastDiag::SITE_PACKET, new_packet.obj_id(), destination_hash);
+#endif
 
 							// This handles an edge case where a peer sends a past
 							// request for a destination just after an announce for
@@ -1053,10 +1060,14 @@ DestinationEntry empty_destination_entry;
 
 								bool queued_announces = (interface.announce_queue().size() > 0);
 								if (!queued_announces && outbound_time > interface.announce_allowed_at()) {
-									uint16_t wait_time = 0;
+									// Float math, matching upstream and process_announce_queue():
+									// integer tx_time truncates to 0 for small announces on slow
+									// links (e.g. 1200 bits / 3125 bps), which would leave
+									// announce_allowed_at unmoved and defeat egress shaping.
+									double wait_time = 0;
 									if (interface.bitrate() > 0 && interface.announce_cap() > 0) {
-										uint16_t tx_time = (packet.raw().size() * 8) / interface.bitrate();
-										wait_time = (tx_time / interface.announce_cap());
+										double tx_time = (double)(packet.raw().size() * 8) / (double)interface.bitrate();
+										wait_time = tx_time / interface.announce_cap();
 									}
 									interface.announce_allowed_at(outbound_time + wait_time);
 								}
@@ -2059,6 +2070,9 @@ DestinationEntry empty_destination_entry;
 								);
 								// CBA ACCUMULATES
 								_announce_table.insert({packet.destination_hash(), announce_entry});
+#if defined(URTN_REBROADCAST_DIAG)
+								RNS::RebroadcastDiag::on_alloc(RNS::RebroadcastDiag::SITE_ENTRY, announce_entry._packet.obj_id(), packet.destination_hash());
+#endif
 								// CBA IMMEDIATE CULL
 								cull_announce_table();
 							}
@@ -2090,6 +2104,9 @@ DestinationEntry empty_destination_entry;
 								);
 								// CBA ACCUMULATES
 								_announce_table.insert({packet.destination_hash(), announce_entry});
+#if defined(URTN_REBROADCAST_DIAG)
+								RNS::RebroadcastDiag::on_alloc(RNS::RebroadcastDiag::SITE_ENTRY, announce_entry._packet.obj_id(), packet.destination_hash());
+#endif
 								// CBA IMMEDIATE CULL
 								cull_announce_table();
 							}

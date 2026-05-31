@@ -21,6 +21,9 @@
 #include "Log.h"
 #include "Type.h"
 #include "Utilities/OS.h"
+#if defined(URTN_REBROADCAST_DIAG)
+#include "Utilities/RebroadcastDiag.h"
+#endif
 
 #include <memory>
 #include <cassert>
@@ -236,6 +239,9 @@ namespace RNS {
 		void update_hash();
 		const Bytes get_hash() const;
 		const Bytes getTruncatedHash() const;
+#if defined(URTN_REBROADCAST_DIAG)
+		inline const void* obj_id() const { return _object.get(); }
+#endif
 		const Bytes get_hashable_part() const;
 
 		inline std::string toString() const { if (!_object) return ""; return "{Packet:" + _object->_packet_hash.toHex() + "}"; }
@@ -296,7 +302,12 @@ namespace RNS {
 			// CBA LINK
 			//Object(const Destination& destination, const Link& destination_link) : _destination(destination), _destination_link(destination_link) { MEMF("Packet::Data object created, this: %p", (void*)this); }
 			//Object(const Link& link) : _destination(link.destination()), _destination_link(link) { MEMF("Packet::Data object created, this: %p", (void*)this); }
-			virtual ~Object() { MEMF("Packet::Data object destroyed, this: %p", (void*)this); }
+			virtual ~Object() {
+#if defined(URTN_REBROADCAST_DIAG)
+				RNS::RebroadcastDiag::on_free(this);
+#endif
+				MEMF("Packet::Data object destroyed, this: %p", (void*)this);
+			}
 		private:
 			Destination _destination = {Type::NONE};
 

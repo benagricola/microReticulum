@@ -20,6 +20,9 @@
 #include "Identity.h"
 #include "Bytes.h"
 #include "Type.h"
+#if defined(URTN_REBROADCAST_DIAG)
+#include "Utilities/RebroadcastDiag.h"
+#endif
 
 #include <memory>
 #include <string>
@@ -203,6 +206,9 @@ namespace RNS {
 		inline Type::Destination::directions direction() const { assert(_object); return _object->_direction; }
 		inline Type::Destination::proof_strategies proof_strategy() const { assert(_object); return _object->_proof_strategy; }
 		inline const Bytes& hash() const { assert(_object); return _object->_hash; }
+#if defined(URTN_REBROADCAST_DIAG)
+		inline const void* obj_id() const { return _object.get(); }
+#endif
 		inline uint16_t mtu() const { assert(_object); return _object->_mtu; }
 		// CBA LINK
 		//inline const Bytes& link_id() const { assert(_object); return _object->_link_id; }
@@ -227,7 +233,12 @@ namespace RNS {
 		class Object {
 		public:
 			Object(const Identity& identity) : _identity(identity) { MEMF("Destination::Data object created, this: %p", (void*)this); }
-			virtual ~Object() { MEMF("Destination::Data object destroyed, this: %p", (void*)this); }
+			virtual ~Object() {
+#if defined(URTN_REBROADCAST_DIAG)
+				RNS::RebroadcastDiag::on_free(this);
+#endif
+				MEMF("Destination::Data object destroyed, this: %p", (void*)this);
+			}
 		private:
 			bool _accept_link_requests = true;
 			Callbacks _callbacks;
