@@ -538,6 +538,16 @@ Recall last heard app_data for a destination hash.
 /*static*/ bool Identity::validate_announce(const Packet& packet) {
 	try {
 		if (packet.packet_type() == Type::Packet::ANNOUNCE) {
+			// Reject runt/truncated announces before any crypto. A short data
+			// buffer yields a short public key, and Ed25519 verify then reads a
+			// fixed 32-byte point past the (possibly empty) key buffer — an
+			// uncatchable LoadProhibited fault, not a C++ exception the validate()
+			// try/catch could absorb. Minimum is the no-ratchet announce layout.
+			const size_t min_announce_size = KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8 + SIGLENGTH/8;
+			if (packet.data().size() < min_announce_size) {
+				DEBUGF("Identity::validate_announce: dropping runt announce (%u < %u bytes)", (unsigned)packet.data().size(), (unsigned)min_announce_size);
+				return false;
+			}
 			Bytes destination_hash = packet.destination_hash();
 			//TRACEF("Identity::validate_announce: destination_hash: %s", packet.destination_hash().toHex().c_str());
 			Bytes public_key = packet.data().left(KEYSIZE/8);
@@ -775,6 +785,13 @@ Validates the signature of a signed message.
 bool Identity::validate(const Bytes& signature, const Bytes& message) const {
 	assert(_object);
 	if (_object->_pub) {
+		// Guard against a short/empty signing key (e.g. a truncated public key
+		// from a malformed announce). Ed25519 verify reads a fixed 32-byte
+		// point and would deref past the buffer — an uncatchable hardware
+		// fault, so the try/catch below cannot save us.
+		if (!_object->_sig_pub || _object->_sig_pub_bytes.size() != Type::Identity::KEYSIZE/8/2) {
+			return false;
+		}
 		try {
 			TRACEF("Identity::validate: Attempting to verify signature: %s and message: %s", signature.toHex().c_str(), message.toHex().c_str());
 			return _object->_sig_pub->verify(signature, message);
