@@ -85,7 +85,13 @@ namespace RNS {
 		size_t _rxb = 0;
 		size_t _txb = 0;
 		bool _online = false;
-		Bytes _ifac_identity;
+		// Interface access codes (IFAC). When _ifac_identity is set, this is a
+		// private interface: outbound packets are masked + signed and inbound
+		// packets must carry a valid access code. _ifac_key is the HKDF salt for
+		// the per-packet mask; _ifac_size is the access-code length in bytes.
+		Identity _ifac_identity = {Type::NONE};
+		Bytes _ifac_key;
+		uint16_t _ifac_size = 0;
 		Type::Interface::modes _mode = Type::Interface::MODE_NONE;
 		uint32_t _bitrate = 0;
 		uint16_t _HW_MTU = 0;
@@ -188,6 +194,11 @@ namespace RNS {
 		inline const Bytes get_hash() const { assert(_impl); return _impl->get_hash(); }
 		void process_announce_queue();
 
+		// Derive and install IFAC parameters from a network name/passphrase,
+		// turning this into a private interface (matches RNS setup in
+		// Reticulum.py). Either netname or netkey may be null but not both.
+		void configure_ifac(const char* netname, const char* netkey, uint16_t ifac_size);
+
 		// CBA ACCUMULATES
 		inline void add_announce(AnnounceEntry& entry) { assert(_impl); _impl->_announce_queue.push_back(entry); }
 
@@ -215,7 +226,9 @@ namespace RNS {
 		inline bool RPT() const { assert(_impl); return _impl->_RPT; }
 		inline bool online() const { assert(_impl); return _impl->_online; }
 		inline std::string name() const { assert(_impl); return _impl->_name; }
-		inline const Bytes& ifac_identity() const { assert(_impl); return _impl->_ifac_identity; }
+		inline const Identity& ifac_identity() const { assert(_impl); return _impl->_ifac_identity; }
+		inline const Bytes& ifac_key() const { assert(_impl); return _impl->_ifac_key; }
+		inline uint16_t ifac_size() const { assert(_impl); return _impl->_ifac_size; }
 		inline Type::Interface::modes mode() const { assert(_impl); return _impl->_mode; }
 		inline void mode(Type::Interface::modes mode) { assert(_impl); _impl->_mode = mode; }
 		inline uint32_t bitrate() const { assert(_impl); return _impl->_bitrate; }

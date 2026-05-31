@@ -22,6 +22,7 @@
 #include "Interface.h"
 #include "Log.h"
 #include "Cryptography/Random.h"
+#include "Cryptography/HKDF.h"
 #include "Utilities/OS.h"
 #include "Utilities/Persistence.h"
 #if defined(URTN_REBROADCAST_DIAG)
@@ -812,45 +813,42 @@ DestinationEntry empty_destination_entry;
 		}
 	}
 	try {
-		//if hasattr(interface, "ifac_identity") and interface.ifac_identity != None:
 		if (interface.ifac_identity()) {
-// TODO
-/*p
-			// Calculate packet access code
-			ifac = interface.ifac_identity.sign(raw)[-interface.ifac_size:]
+			// IFAC outbound masking, ported byte-for-byte from RNS
+			// Transport.py:1038-1073. raw is always at least a 2-byte header here.
+			const uint16_t ifac_size = interface.ifac_size();
 
-			// Generate mask
-			mask = RNS.Cryptography.hkdf(
-				length=len(raw)+interface.ifac_size,
-				derive_from=ifac,
-				salt=interface.ifac_key,
-				context=None,
-			)
+			// Access code: the last ifac_size bytes of the signature over raw.
+			const Bytes ifac = interface.ifac_identity().sign(raw).right(ifac_size);
 
-			// Set IFAC flag
-			new_header = bytes([raw[0] | 0x80, raw[1]])
+			// Per-packet mask covering the whole IFAC-wrapped packet.
+			const Bytes mask = Cryptography::hkdf(raw.size() + ifac_size, ifac, interface.ifac_key());
 
-			// Assemble new payload with IFAC
-			new_raw    = new_header+ifac+raw[2:]
-			
-			// Mask payload
-			i = 0; masked_raw = b""
-			for byte in new_raw:
-				if i == 0:
-					// Mask first header byte, but make sure the
-					// IFAC flag is still set
-					masked_raw += bytes([byte ^ mask[i] | 0x80])
-				elif i == 1 or i > interface.ifac_size+1:
-					// Mask second header byte and payload
-					masked_raw += bytes([byte ^ mask[i]])
-				else:
-					// Don't mask the IFAC itself
-					masked_raw += bytes([byte])
-				i += 1
+			// new_raw = [raw[0]|0x80, raw[1]] + ifac + raw[2:]
+			Bytes new_raw;
+			new_raw << (uint8_t)(raw.data()[0] | 0x80);
+			new_raw << raw.data()[1];
+			new_raw << ifac;
+			new_raw << raw.mid(2);
 
-			// Send it
-			interface.on_outgoing(masked_raw)
-*/
+			// Mask byte 0 (preserving the IFAC flag), byte 1, and the payload
+			// after the IFAC; leave the IFAC bytes themselves unmasked.
+			const uint8_t* nr = new_raw.data();
+			const uint8_t* mk = mask.data();
+			const size_t n = new_raw.size();
+			std::vector<uint8_t> masked(n);
+			for (size_t i = 0; i < n; ++i) {
+				if (i == 0) {
+					masked[i] = (uint8_t)((nr[i] ^ mk[i]) | 0x80);
+				}
+				else if (i == 1 || i > (size_t)(ifac_size + 1)) {
+					masked[i] = (uint8_t)(nr[i] ^ mk[i]);
+				}
+				else {
+					masked[i] = nr[i];
+				}
+			}
+			interface.send_outgoing(Bytes(masked.data(), masked.size()));
 		}
 		else {
 			interface.send_outgoing(raw);
@@ -1386,93 +1384,73 @@ DestinationEntry empty_destination_entry;
 		}
 	}
 
-	// Inbound safety drops, ported from the non-IFAC branch of
-	// RNS Transport.py:1384-1435. The full IFAC authentication path (the
-	// commented block below) is not yet ported; until an interface can carry
-	// IFAC, every interface is non-IFAC, so:
-	//   - a packet too short to hold even a header is malformed; and
-	//   - a packet arriving with the IFAC flag (raw[0] & 0x80) set does not
-	//     belong on a non-IFAC interface (misflagged, corrupted, or leaked
-	//     from another network).
-	// Both are dropped before unpack(). rmap is an open (non-IFAC) network, so
-	// its header bit 7 is always clear and ifac_flagged_drops should stay ~0.
+	// Inbound safety + IFAC authentication, ported from RNS Transport.py:1384-1435.
+	// A packet too short to hold even a header is always malformed.
 	if (raw.size() <= 2) {
 		++_runt_drops;
 		DEBUGF("Transport::inbound: dropping runt packet (%u bytes)", (unsigned)raw.size());
 		return;
 	}
-	if ((raw.data()[0] & 0x80) == 0x80) {
-		++_ifac_flagged_drops;
-		DEBUG("Transport::inbound: dropping IFAC-flagged packet on non-IFAC interface");
-		return;
-	}
-// TODO
-/*p
-	// If interface access codes are enabled,
-	// we must authenticate each packet.
-	//if len(raw) > 2:
-	if (raw.size() > 2) {
-		if interface != None and hasattr(interface, "ifac_identity") and interface.ifac_identity != None:
-			// Check that IFAC flag is set
-			if raw[0] & 0x80 == 0x80:
-				if len(raw) > 2+interface.ifac_size:
-					// Extract IFAC
-					ifac = raw[2:2+interface.ifac_size]
 
-					// Generate mask
-					mask = RNS.Cryptography.hkdf(
-						length=len(raw),
-						derive_from=ifac,
-						salt=interface.ifac_key,
-						context=None,
-					)
+	// effective_raw is what the rest of inbound processes: the original raw on
+	// an open interface, or the unmasked + access-code-verified payload on an
+	// IFAC interface.
+	Bytes ifac_unmasked;            // holds the reassembled payload when IFAC applies
+	const Bytes* effective_raw = &raw;
 
-					// Unmask payload
-					i = 0; unmasked_raw = b""
-					for byte in raw:
-						if i <= 1 or i > interface.ifac_size+1:
-							// Unmask header bytes and payload
-							unmasked_raw += bytes([byte ^ mask[i]])
-						else:
-							// Don't unmask IFAC itself
-							unmasked_raw += bytes([byte])
-						i += 1
-					raw = unmasked_raw
+	if (interface && interface.ifac_identity()) {
+		// Private interface: the IFAC flag must be set.
+		if ((raw.data()[0] & 0x80) != 0x80) {
+			DEBUG("Transport::inbound: dropping packet without IFAC flag on IFAC interface");
+			return;
+		}
+		const uint16_t ifac_size = interface.ifac_size();
+		if (raw.size() <= (size_t)(2 + ifac_size)) {
+			return;  // too short to carry the access code
+		}
 
-					// Unset IFAC flag
-					new_header = bytes([raw[0] & 0x7f, raw[1]])
+		// Extract the access code and regenerate the per-packet mask.
+		const Bytes ifac = raw.mid(2, ifac_size);
+		const Bytes mask = Cryptography::hkdf(raw.size(), ifac, interface.ifac_key());
 
-					// Re-assemble packet
-					new_raw = new_header+raw[2+interface.ifac_size:]
+		// Unmask the header bytes and payload; leave the IFAC bytes themselves.
+		const uint8_t* rd = raw.data();
+		const uint8_t* mk = mask.data();
+		const size_t n = raw.size();
+		std::vector<uint8_t> unmasked(n);
+		for (size_t i = 0; i < n; ++i) {
+			if (i <= 1 || i > (size_t)(ifac_size + 1)) {
+				unmasked[i] = (uint8_t)(rd[i] ^ mk[i]);
+			}
+			else {
+				unmasked[i] = rd[i];
+			}
+		}
 
-					// Calculate expected IFAC
-					expected_ifac = interface.ifac_identity.sign(new_raw)[-interface.ifac_size:]
+		// Reassemble without the IFAC and with the flag cleared, then verify the
+		// access code against the signature over the reassembled packet.
+		Bytes new_raw;
+		new_raw << (uint8_t)(unmasked[0] & 0x7f);
+		new_raw << unmasked[1];
+		new_raw.append(unmasked.data() + 2 + ifac_size, n - 2 - ifac_size);
 
-					// Check it
-					if ifac == expected_ifac:
-						raw = new_raw
-					else:
-						return
-
-				else:
-					return
-
-			else:
-				// If the IFAC flag is not set, but should be,
-				// drop the packet.
-				return
-
-		else:
-			// If the interface does not have IFAC enabled,
-			// check the received packet IFAC flag.
-			if raw[0] & 0x80 == 0x80:
-				// If the flag is set, drop the packet
-				return
+		const Bytes expected_ifac = interface.ifac_identity().sign(new_raw).right(ifac_size);
+		if (ifac != expected_ifac) {
+			DEBUG("Transport::inbound: dropping packet with invalid IFAC access code");
+			return;
+		}
+		ifac_unmasked = new_raw;
+		effective_raw = &ifac_unmasked;
 	}
 	else {
-		return;
+		// Open (non-IFAC) interface: a set IFAC flag means a misflagged, corrupted
+		// or foreign-network packet; drop it. rmap is open, so this stays ~0.
+		if ((raw.data()[0] & 0x80) == 0x80) {
+			++_ifac_flagged_drops;
+			DEBUG("Transport::inbound: dropping IFAC-flagged packet on non-IFAC interface");
+			return;
+		}
 	}
-*/
 
 	// (#60) Same reentrancy reasoning as Transport::outbound: rns_lock
 	// already serialises Transport access; spinning on `_jobs_running`
@@ -1484,7 +1462,7 @@ DestinationEntry empty_destination_entry;
 
 	_jobs_locked = true;
 
-	Packet packet(RNS::Destination(RNS::Type::NONE), raw);
+	Packet packet(RNS::Destination(RNS::Type::NONE), *effective_raw);
 	if (!packet.unpack()) {
 		WARNING("Transport::inbound: Packet unpack failed!");
 		return;

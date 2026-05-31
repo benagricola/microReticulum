@@ -17,6 +17,7 @@
 #include "Identity.h"
 #include "Transport.h"
 #include "Utilities/OS.h"
+#include "Cryptography/HKDF.h"
 
 using namespace RNS;
 using namespace RNS::Type::Interface;
@@ -160,6 +161,33 @@ void Interface::process_announce_queue() {
 		ERRORF("Interface::process_announce_queue: %s - clearing announce queue", e.what());
 		queue.clear();
 	}
+}
+
+void Interface::configure_ifac(const char* netname, const char* netkey, uint16_t ifac_size) {
+	assert(_impl);
+	// Ported from RNS Reticulum.py:898-916. ifac_origin is the concatenation of
+	// the network name and passphrase hashes; the IFAC key is HKDF-derived from
+	// its hash with the fixed IFAC salt; the IFAC identity (used to sign/verify
+	// per-packet access codes) is that key loaded as a private identity.
+	Bytes ifac_origin;
+	if (netname != nullptr && netname[0] != '\0') {
+		ifac_origin << Identity::full_hash(Bytes(netname));
+	}
+	if (netkey != nullptr && netkey[0] != '\0') {
+		ifac_origin << Identity::full_hash(Bytes(netkey));
+	}
+	Bytes ifac_origin_hash = Identity::full_hash(ifac_origin);
+
+	Bytes ifac_salt;
+	ifac_salt.assignHex(Type::Reticulum::IFAC_SALT);
+	_impl->_ifac_key = Cryptography::hkdf(64, ifac_origin_hash, ifac_salt);
+
+	Identity ifac_identity(false);
+	ifac_identity.load_private_key(_impl->_ifac_key);
+	_impl->_ifac_identity = ifac_identity;
+	_impl->_ifac_size = ifac_size;
+
+	TRACEF("Interface.configure_ifac: IFAC enabled (size %u) on %s", (unsigned)ifac_size, toString().c_str());
 }
 
 /*
