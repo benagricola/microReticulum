@@ -859,13 +859,19 @@ bool PacketReceipt::validate_link_proof(const Bytes& proof, const Link& link, co
 		Bytes proof_hash = proof.left(Type::Identity::HASHLENGTH/8);
 		Bytes signature = proof.mid(Type::Identity::HASHLENGTH/8, Type::Identity::SIGLENGTH/8);
 		if (proof_hash == _object->_hash) {
-			//z if (link.validate(signature, _object->_hash)) {
-			if (false) {
+			// Validate the LINKPROOF signature against the link. Previously
+			// hard-disabled (if(false)), which meant link/DIRECT-mode deliveries
+			// could never be confirmed DELIVERED and timed out to FAILED even
+			// when the packet arrived and was proven.
+			if (link.validate(signature, _object->_hash)) {
 				_object->_status = DELIVERED;
 				_object->_proved = true;
 				_object->_concluded_at = OS::time();
-				//z _object->_proof_packet = proof_packet;
-				//z link.last_proof(_object->_concluded_at);
+				//z _object->_proof_packet = proof_packet;   // member disabled to save RAM
+				// `link` is a const view of the shared LinkImpl (picked up via the
+				// const proof Packet); stamping its last-proof time mutates the real
+				// link, which is intended — a proven delivery counts as activity.
+				const_cast<Link&>(link).last_proof(_object->_concluded_at);
 
 				if (_object->_callbacks._delivery) {
 					try {

@@ -303,6 +303,27 @@ Recall identity for a destination hash.
 			return identity;
 		}
 		TRACEF("Identity::recall: Unable to find destination %s", destination_hash.toHex().c_str());
+
+		// The in-RAM identity cache may have evicted this destination under a
+		// high-cardinality announce feed even though we still hold a route to
+		// it. The path record stores the destination's announce inline (it
+		// carries the public key), so recover the identity from there.
+		// validate_announce re-verifies the signature + destination-hash binding
+		// and re-remember()s the key, so a subsequent recall hits the fast
+		// cache path. Makes "has a path => can recall the key" structurally true.
+		Packet stored_announce = Transport::path_announce(destination_hash);
+		if (stored_announce && validate_announce(stored_announce)) {
+			auto cached = _known_destinations.find(destination_hash);
+			if (cached != _known_destinations.end()) {
+				TRACEF("Identity::recall: recovered identity for %s from path-record announce", destination_hash.toHex().c_str());
+				const IdentityEntry& identity_data = (*cached).second;
+				Identity identity(false);
+				identity.load_public_key(identity_data._public_key);
+				identity.app_data(identity_data._app_data);
+				return identity;
+			}
+		}
+
 		return {Type::NONE};
 	}
 }

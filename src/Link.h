@@ -225,7 +225,8 @@ namespace RNS {
 		const Bytes encrypt(const Bytes& plaintext);
 		const Bytes decrypt(const Bytes& ciphertext);
 		const Bytes sign(const Bytes& message);
-		bool validate(const Bytes& signature, const Bytes& message);
+		bool validate(const Bytes& signature, const Bytes& message) const;
+		void last_proof(double proof_time);
 		void set_link_established_callback(Callbacks::established callback);
 		void set_link_closed_callback(Callbacks::closed callback);
 		void set_packet_callback(Callbacks::packet callback);

@@ -345,6 +345,10 @@ namespace RNS {
 		static uint16_t remove_tunnels(const std::vector<Bytes>& hashes);
 
 		static Destination find_destination_from_hash(const Bytes& destination_hash);
+		// Announce packet stored inline in a destination's path record (NONE if
+		// no path). Lets Identity::recall() recover a public key that the RAM
+		// identity cache evicted while a route is still held.
+		static Packet path_announce(const Bytes& destination_hash);
 
 		// CBA
 		static void cull_announce_table();

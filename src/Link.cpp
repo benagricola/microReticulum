@@ -1657,7 +1657,7 @@ const Bytes Link::sign(const Bytes& message) {
 	return _object->_sig_prv->sign(message);
 }
 
-bool Link::validate(const Bytes& signature, const Bytes& message) {
+bool Link::validate(const Bytes& signature, const Bytes& message) const {
 	assert(_object);
 	try {
 		_object->_peer_sig_pub->verify(signature, message);
@@ -1666,6 +1666,14 @@ bool Link::validate(const Bytes& signature, const Bytes& message) {
 	catch (const std::exception& e) {
 		return false;
 	}
+}
+
+// Record the time of the most recent valid delivery proof received over this
+// link. Feeds the link's last-activity calculation (see watchdog_tick), so a
+// proven in-link delivery counts as keepalive activity.
+void Link::last_proof(double proof_time) {
+	assert(_object);
+	_object->_last_proof = proof_time;
 }
 
 void Link::set_link_established_callback(Callbacks::established callback) {

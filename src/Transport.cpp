@@ -4058,6 +4058,18 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 	return {Type::NONE};
 }
 
+/*static*/ Packet Transport::path_announce(const Bytes& destination_hash) {
+	// Return the announce packet stored inline in this destination's path
+	// record (or NONE if we hold no path). The announce carries the peer's
+	// public key, so Identity::recall() can recover an evicted identity from
+	// it whenever has_path() is true. See Identity::recall().
+	DestinationEntry destination_entry;
+	if (_new_path_table.get(destination_hash, destination_entry)) {
+		return destination_entry.announce_packet();
+	}
+	return {Type::NONE};
+}
+
 /*static*/ void Transport::cull_announce_table() {
 	TRACE("Transport::cull_announce_table()");
 	if (_announce_table.size() > _announce_table_maxsize) {
