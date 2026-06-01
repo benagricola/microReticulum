@@ -18,17 +18,20 @@
 #include "Log.h"
 #include "Bytes.h"
 #include "Type.h"
+#include "Utilities/Memory.h"
 
 #include <ArduinoJson.h>
 
 #include <list>
 #include <memory>
+#include <array>
 #include <cassert>
 #include <stdint.h>
 
 namespace RNS {
 
 	class Interface;
+	class Packet;
 	using HInterface = std::shared_ptr<Interface>;
 
 	class AnnounceEntry {
@@ -46,6 +49,63 @@ namespace RNS {
 		uint8_t _hops = 0;
 		uint64_t _emitted = 0;
 		Bytes _raw;
+	};
+
+	// Ingress Control (ported from RNS Interfaces/Interface.py). When inbound
+	// announces arrive faster than a per-interface threshold, announces for
+	// unknown destinations are HELD in a bounded set and released slowly
+	// (lowest-hop first) instead of being processed/propagated immediately.
+	// This throttles an announce flood at ingress.
+
+	// A held inbound announce. Upstream stores the whole RNS.Packet keyed by
+	// destination hash; here we keep only what process_held_announces()/release
+	// needs: the raw frame to re-inject via Transport::inbound(), the hop count
+	// (for lowest-hop selection) and the destination hash (the map key + the
+	// pop key on release).
+	class HeldAnnounce {
+	public:
+		HeldAnnounce() {}
+		HeldAnnounce(const Bytes& destination_hash, uint8_t hops, const Bytes& raw) :
+			_destination_hash(destination_hash),
+			_hops(hops),
+			_raw(raw) {}
+	public:
+		Bytes _destination_hash;
+		uint8_t _hops = 0;
+		Bytes _raw;
+	};
+
+	// Fixed-capacity timestamp ring mirroring upstream's
+	// collections.deque(maxlen=IA_FREQ_SAMPLES). Append drops the oldest once
+	// full; front() peeks the oldest; pop_front() removes it. Backed by a plain
+	// std::array (IA_FREQ_SAMPLES doubles, ~384 B) — small + fixed, so it stays
+	// in SRAM rather than going through the PSRAM container allocator.
+	template <size_t N>
+	class TimestampRing {
+	public:
+		inline void append(double t) {
+			if (_count < N) {
+				_buf[(_head + _count) % N] = t;
+				++_count;
+			}
+			else {
+				// Full: overwrite oldest, advance head (deque maxlen semantics).
+				_buf[_head] = t;
+				_head = (_head + 1) % N;
+			}
+		}
+		inline void pop_front() {
+			if (_count > 0) {
+				_head = (_head + 1) % N;
+				--_count;
+			}
+		}
+		inline double front() const { return _buf[_head]; }
+		inline size_t size() const { return _count; }
+	private:
+		std::array<double, N> _buf {};
+		size_t _head = 0;
+		size_t _count = 0;
 	};
 
 	class InterfaceImpl : public std::enable_shared_from_this<InterfaceImpl> {
@@ -112,6 +172,22 @@ namespace RNS {
 		double _announce_rate_target = 0;
 		uint32_t _announce_rate_grace = 0;
 		double _announce_rate_penalty = 0;
+		// Ingress Control state (ported from RNS Interfaces/Interface.py
+		// ic_* fields ~line 100-135). On by default; should_ingress_limit()
+		// is a no-op when _ingress_control is false.
+		bool _ingress_control = true;
+		bool _ic_burst_active = false;
+		double _ic_burst_activated = 0;
+		// Next time (OS::time seconds) a held announce may be released.
+		double _ic_held_release = 0;
+		// Interface creation time (OS::time seconds); age() = now - created.
+		double _ic_created = 0;
+		// Bounded set of held announces keyed by destination hash. PSRAM-backed
+		// (ContainerMap) like the path tables, since it is growth-prone up to
+		// MAX_HELD_ANNOUNCES entries. Capped on insert in hold_announce().
+		Utilities::Memory::ContainerMap<Bytes, HeldAnnounce> _held_announces;
+		// Inbound-announce timestamp ring for the frequency calculation.
+		TimestampRing<Type::Interface::IA_FREQ_SAMPLES> _ia_freq_ring;
 		bool _is_connected_to_shared_instance = false;
 		bool _is_local_shared_instance = false;
 		//Bytes _hash;
@@ -194,6 +270,25 @@ namespace RNS {
 		inline const Bytes get_hash() const { assert(_impl); return _impl->get_hash(); }
 		void process_announce_queue();
 
+		// Ingress Control (ported from RNS Interfaces/Interface.py).
+		// Seconds since this interface impl was created (now - _ic_created).
+		double age() const;
+		// Record an inbound announce timestamp into the frequency ring.
+		void received_announce();
+		// Inbound announce frequency (Hz) over the ring, matching upstream's
+		// incoming_announce_frequency() including the decay popleft side-effect.
+		double incoming_announce_frequency();
+		// Burst-detection state machine. Returns true while the interface is
+		// ingress-limiting (announces should be held, not processed). No-op
+		// (returns false) when ingress_control is disabled.
+		bool should_ingress_limit();
+		// Hold an announce for slow release. Bounded to MAX_HELD_ANNOUNCES.
+		void hold_announce(const Packet& announce_packet);
+		// Slowly release held announces (lowest-hop first), re-injecting via
+		// Transport::inbound on this interface. Cooperative poll replacement
+		// for upstream's per-release threading.Thread.
+		void process_held_announces();
+
 		// Derive and install IFAC parameters from a network name/passphrase,
 		// turning this into a private interface (matches RNS setup in
 		// Reticulum.py). Either netname or netkey may be null but not both.
@@ -246,6 +341,9 @@ namespace RNS {
 		inline void announce_rate_grace(uint32_t grace) { assert(_impl); _impl->_announce_rate_grace = grace; }
 		inline double announce_rate_penalty() const { assert(_impl); return _impl->_announce_rate_penalty; }
 		inline void announce_rate_penalty(double penalty) { assert(_impl); _impl->_announce_rate_penalty = penalty; }
+		inline bool ingress_control() const { assert(_impl); return _impl->_ingress_control; }
+		inline void ingress_control(bool ingress_control) { assert(_impl); _impl->_ingress_control = ingress_control; }
+		inline size_t held_announces_count() const { assert(_impl); return _impl->_held_announces.size(); }
 		inline size_t rxb() const { assert(_impl); return _impl->_rxb; }
 		inline size_t txb() const { assert(_impl); return _impl->_txb; }
 		inline std::list<AnnounceEntry>& announce_queue() const { assert(_impl); return _impl->_announce_queue; }

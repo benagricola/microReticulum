@@ -1871,6 +1871,35 @@ DestinationEntry empty_destination_entry;
 		// of queued announce rebroadcasts once handed to the next node.
 		if (packet.packet_type() == Type::Packet::ANNOUNCE) {
 			TRACE("Transport::inbound: Packet is ANNOUNCE");
+
+			// Ingress Control (ported from RNS Transport.py:1679/1680-1693).
+			// Upstream short-circuits on a signature-only validate first; uR's
+			// validate_announce() (no signature-only mode) runs further down as
+			// part of the non-local processing, so the cheap pre-check here is
+			// "this is an announce we received on a real interface".
+			// Interface is a shared-impl handle; a copy shares _impl, so the
+			// ingress-control state we mutate below lands on the real interface.
+			Interface receiving_interface = packet.receiving_interface();
+			if (receiving_interface) {
+				// Count this inbound announce toward the interface's frequency
+				// (Transport.py:1679 interface.received_announce()).
+				receiving_interface.received_announce();
+
+				// Apply ingress limiting only for unknown destinations. Already
+				// known destinations have re-announces controlled by normal
+				// announce rate limiting (Transport.py:1680-1693).
+				bool announced_destination_known = has_path(packet.destination_hash());
+				if (!announced_destination_known) {
+					bool awaiting_path_request =
+						_path_requests.find(packet.destination_hash()) != _path_requests.end()
+						|| _discovery_path_requests.find(packet.destination_hash()) != _discovery_path_requests.end();
+					if (!awaiting_path_request && receiving_interface.should_ingress_limit()) {
+						receiving_interface.hold_announce(packet);
+						return;
+					}
+				}
+			}
+
 			Bytes received_from;
 			//p local_destination = next((d for d in Transport.destinations if d.hash == packet.destination_hash), None)
 			auto iter = _destinations.find(packet.destination_hash());

@@ -337,6 +337,23 @@ namespace RNS { namespace Type {
 			MODE_GATEWAY        = 0x40,
 		};
 
+		// Ingress Control constants (ported from RNS Interfaces/Interface.py).
+		// How many samples to use for inbound announce frequency calculations.
+		static const uint16_t IA_FREQ_SAMPLES       = 48;
+		// Maximum amount of ingress-limited announces to hold at any time.
+		static const uint16_t MAX_HELD_ANNOUNCES    = 256;
+		// How long a spawned interface is considered newly created (2 hours).
+		static const uint32_t IC_NEW_TIME           = 2*60*60;
+		static const uint8_t  IC_BURST_FREQ_NEW     = 3;
+		static const uint8_t  IC_BURST_FREQ         = 10;
+		static const uint8_t  IC_BURST_HOLD         = 15;
+		static const uint8_t  IC_BURST_PENALTY      = 15;
+		static const uint8_t  IC_HELD_RELEASE_INTERVAL = 5;
+		static const uint8_t  IC_DEQUE_MIN_SAMPLE   = 2;
+		static const uint8_t  IC_BURST_MIN_SAMPLES  = 6;
+		// Frequency-decay window: 1 / AR_MINFREQ_HZ (AR_MINFREQ_HZ = 0.1).
+		static const uint16_t AR_FREQ_DECAY         = 10;
+
 	}
 
 	namespace Packet {

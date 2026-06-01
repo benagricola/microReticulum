@@ -15,6 +15,7 @@
 #include "Interface.h"
 
 #include "Identity.h"
+#include "Packet.h"
 #include "Transport.h"
 #include "Utilities/OS.h"
 #include "Cryptography/HKDF.h"
@@ -160,6 +161,151 @@ void Interface::process_announce_queue() {
 		// retrying a poison entry forever.
 		ERRORF("Interface::process_announce_queue: %s - clearing announce queue", e.what());
 		queue.clear();
+	}
+}
+
+// Ingress Control. Ported from RNS Interfaces/Interface.py. When inbound
+// announces arrive on an interface faster than a per-interface threshold,
+// announces for unknown destinations are held in a bounded set and released
+// slowly (lowest-hop first) instead of being processed/propagated immediately.
+
+double Interface::age() const {
+	assert(_impl);
+	// Upstream stamps created = time.time() in __init__. The InterfaceImpl
+	// constructor lives in the header and can't reach OS::time(), so we stamp
+	// _ic_created lazily on first query (cast away const: this is birth-time
+	// memoisation, semantically const). Until stamped, age() returns 0, which
+	// keeps the interface in the "new" (stricter) burst threshold band.
+	if (_impl->_ic_created == 0) {
+		const_cast<InterfaceImpl*>(_impl.get())->_ic_created = OS::time();
+		return 0;
+	}
+	return OS::time() - _impl->_ic_created;
+}
+
+void Interface::received_announce() {
+	assert(_impl);
+	// Upstream: self.ia_freq_deque.append(time.time()); then recurses into
+	// parent_interface. uR has no spawned/parent interface fan-out wired here,
+	// so we record on the receiving interface only.
+	_impl->_ia_freq_ring.append(OS::time());
+}
+
+double Interface::incoming_announce_frequency() {
+	assert(_impl);
+	// Ported from RNS Interface.py:279-288. Frequency (Hz) of inbound announces
+	// across the ring, with the same decay side-effect (pop the oldest sample
+	// once it ages past AR_FREQ_DECAY).
+	size_t n = _impl->_ia_freq_ring.size();
+	if (!(n > Type::Interface::IC_DEQUE_MIN_SAMPLE)) {
+		return 0;
+	}
+	double oldest = _impl->_ia_freq_ring.front();
+	double span = OS::time() - oldest;
+	if (span > (double)Type::Interface::AR_FREQ_DECAY) {
+		_impl->_ia_freq_ring.pop_front();
+	}
+	if (span <= 0) {
+		return 0;
+	}
+	return (double)n / span;
+}
+
+bool Interface::should_ingress_limit() {
+	assert(_impl);
+	// Ported from RNS Interface.py:145-165. Burst-detection state machine.
+	// No-op when ingress control is disabled.
+	if (!_impl->_ingress_control) {
+		return false;
+	}
+
+	double freq_threshold = (age() < (double)Type::Interface::IC_NEW_TIME)
+		? (double)Type::Interface::IC_BURST_FREQ_NEW
+		: (double)Type::Interface::IC_BURST_FREQ;
+	double ia_freq = incoming_announce_frequency();
+
+	if (_impl->_ic_burst_active) {
+		if (ia_freq < freq_threshold
+				&& OS::time() > _impl->_ic_burst_activated + (double)Type::Interface::IC_BURST_HOLD) {
+			if (_impl->_ia_freq_ring.size() >= Type::Interface::IC_BURST_MIN_SAMPLES) {
+				_impl->_ic_burst_active = false;
+			}
+		}
+		return true;
+	}
+	else {
+		if (ia_freq > freq_threshold) {
+			_impl->_ic_burst_active = true;
+			_impl->_ic_burst_activated = OS::time();
+			_impl->_ic_held_release = OS::time() + (double)Type::Interface::IC_BURST_PENALTY;
+			return true;
+		}
+		else {
+			return false;
+		}
+	}
+}
+
+void Interface::hold_announce(const Packet& announce_packet) {
+	assert(_impl);
+	// Ported from RNS Interface.py:228-232. Replace an existing held announce
+	// for the same destination; otherwise insert only while under the cap
+	// (bounded — upstream's MAX_HELD_ANNOUNCES guard).
+	const Bytes& destination_hash = announce_packet.destination_hash();
+	auto iter = _impl->_held_announces.find(destination_hash);
+	if (iter != _impl->_held_announces.end()) {
+		iter->second = HeldAnnounce(destination_hash, announce_packet.hops(), announce_packet.raw());
+	}
+	else if (_impl->_held_announces.size() < Type::Interface::MAX_HELD_ANNOUNCES) {
+		_impl->_held_announces.insert({destination_hash,
+			HeldAnnounce(destination_hash, announce_packet.hops(), announce_packet.raw())});
+	}
+}
+
+void Interface::process_held_announces() {
+	assert(_impl);
+	// Ported from RNS Interface.py:234-257. Release at most one held announce
+	// per IC_HELD_RELEASE_INTERVAL, lowest-hop first, but only once the burst
+	// has subsided (frequency back under threshold) and the release timer has
+	// elapsed. Embedded divergence: upstream spawns a daemon thread per release
+	// to call Transport.inbound(); uR is cooperative-poll, so we re-inject
+	// inline. This method is polled per-interface from Reticulum::loop().
+	try {
+		if (_impl->_held_announces.empty() || OS::time() <= _impl->_ic_held_release) {
+			return;
+		}
+
+		double freq_threshold = (age() < (double)Type::Interface::IC_NEW_TIME)
+			? (double)Type::Interface::IC_BURST_FREQ_NEW
+			: (double)Type::Interface::IC_BURST_FREQ;
+		double ia_freq = incoming_announce_frequency();
+		if (ia_freq >= freq_threshold) {
+			return;
+		}
+
+		// Select the lowest-hop held announce.
+		auto selected = _impl->_held_announces.end();
+		uint8_t min_hops = Type::Transport::PATHFINDER_M;
+		for (auto it = _impl->_held_announces.begin(); it != _impl->_held_announces.end(); ++it) {
+			if (it->second._hops < min_hops) {
+				min_hops = it->second._hops;
+				selected = it;
+			}
+		}
+
+		if (selected != _impl->_held_announces.end()) {
+			TRACEF("Interface::process_held_announces: releasing held announce for %s from %s",
+				selected->second._destination_hash.toHex().c_str(), toString().c_str());
+			_impl->_ic_held_release = OS::time() + (double)Type::Interface::IC_HELD_RELEASE_INTERVAL;
+			Bytes raw = selected->second._raw;
+			_impl->_held_announces.erase(selected);
+			// Re-inject on this interface (upstream passes the announce's
+			// receiving_interface, which is this interface).
+			Transport::inbound(raw, *this);
+		}
+	}
+	catch (const std::exception& e) {
+		ERRORF("Interface::process_held_announces: %s on %s", e.what(), toString().c_str());
 	}
 }
 

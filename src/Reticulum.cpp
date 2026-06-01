@@ -266,6 +266,16 @@ void Reticulum::loop() {
 				if (!interface.announce_queue().empty()) {
 					interface.process_announce_queue();
 				}
+				// Cooperative ingress-control drain (ported from RNS
+				// Transport.py:929 interface.process_held_announces()).
+				// Embedded divergence: upstream runs this from a periodic
+				// interface-jobs pass and spawns a thread per release; uR has
+				// no threads, so we poll it inline once per main-loop iteration
+				// and it self-gates on its own release timer. Cheap no-op when
+				// nothing is held.
+				if (interface.held_announces_count() > 0) {
+					interface.process_held_announces();
+				}
 				OS::reset_watchdog();
 			}
 
