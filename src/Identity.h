@@ -38,18 +38,26 @@ namespace RNS {
 	private:
 		class IdentityEntry {
 		public:
-			IdentityEntry(double timestamp, const Bytes& packet_hash, const Bytes& public_key, const Bytes& app_data) :
+			IdentityEntry(double timestamp, const Bytes& packet_hash, const Bytes& public_key, const Bytes& app_data, double last_used = 0) :
 				_timestamp(timestamp),
 				_packet_hash(packet_hash),
 				_public_key(public_key),
-				_app_data(app_data)
+				_app_data(app_data),
+				_last_used(last_used)
 			{
 			}
 		public:
+			// _timestamp is the last-announce/learned time (overwritten on every
+			// announce by remember()). _last_used is the refresh-on-use (LRU)
+			// marker, mirroring upstream known_destinations[dest][4]:
+			//   >0  last-use timestamp (set by recall() on a real use)
+			//    0  learned-but-never-used
+			//   -1  retained/pinned, never evicted
 			double _timestamp = 0;
 			Bytes _packet_hash;
 			Bytes _public_key;
 			Bytes _app_data;
+			double _last_used = 0;
 		};
 		//using IdentityTable = std::map<Bytes, IdentityEntry>;
 		using IdentityTable = std::map<Bytes, IdentityEntry, std::less<Bytes>, Utilities::Memory::ContainerAllocator<std::pair<const Bytes, IdentityEntry>>>;
@@ -133,7 +141,18 @@ namespace RNS {
 
 		static const Identity from_file(const char* path);
 		static void remember(const Bytes& packet_hash, const Bytes& destination_hash, const Bytes& public_key, const Bytes& app_data = {Bytes::NONE});
-		static Identity recall(const Bytes& destination_hash);
+		// no_use=true mirrors upstream recall(..., _no_use=True): the recall is
+		// internal housekeeping (announce processing/validation, link-proof key
+		// lookup, blackhole checks) and must NOT refresh the entry's LRU
+		// last-used marker, otherwise the announce flood self-refreshes every
+		// entry and LRU eviction is defeated.
+		static Identity recall(const Bytes& destination_hash, bool no_use = false);
+		// Pin a destination against LRU eviction (sets the _last_used sentinel to
+		// -1). Mirrors upstream _retain_destination_data; the firmware LXMF layer
+		// calls this when an outbound message is confirmed DELIVERED so a contact
+		// we actually talk to survives the known-destinations churn. Returns false
+		// if the destination isn't in the cache (nothing to pin yet).
+		static bool retain_destination(const Bytes& destination_hash);
 		static Bytes recall_app_data(const Bytes& destination_hash);
 		static bool save_known_destinations();
 		static void load_known_destinations();

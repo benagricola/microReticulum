@@ -399,6 +399,14 @@ namespace RNS {
 		inline static uint32_t announce_rate_blocks() { return _announce_rate_blocks; }
 
 	private:
+		// Refresh-on-use for a path entry, mirroring upstream
+		// path_table[dest][IDX_PT_TIMESTAMP] = time.time() (Transport.py:1131/1151/1622).
+		// The flash/heap-backed path store expires records by their own insertion
+		// timestamp + ttl, so re-putting the (already-decoded) entry resets that
+		// insertion time and extends the route's life. Updates the entry's app-level
+		// _timestamp too, for consistency with the stored value.
+		static void refresh_path_use(const Bytes& destination_hash, Persistence::DestinationEntry& entry);
+
 		// CBA MUST use references to interfaces here in order for virtul overrides for send/receive to work
 		// map is sorted, can use find
 		static InterfaceTable _interfaces;			// All active interfaces

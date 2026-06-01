@@ -496,7 +496,9 @@ DestinationEntry empty_destination_entry;
 								announce_context = Type::Packet::PATH_RESPONSE;
 							}
 							//p announce_data = packet.data
-							Identity announce_identity(Identity::recall(announce_entry._packet.destination_hash()));
+							// no_use: announce rebroadcast processing (upstream Transport.py:584,
+							// _no_use=True) — not a real use, must not refresh the LRU marker.
+							Identity announce_identity(Identity::recall(announce_entry._packet.destination_hash(), true));
 							//Destination announce_destination(announce_identity, Type::Destination::OUT, Type::Destination::SINGLE, "unknown", "unknown");
 							//announce_destination.hash(announce_entry._packet.destination_hash());
 							Destination announce_destination(announce_identity, Type::Destination::OUT, Type::Destination::SINGLE, announce_entry._packet.destination_hash());
@@ -931,7 +933,10 @@ DestinationEntry empty_destination_entry;
 				new_raw << packet.raw().mid(2);
 				transmit(outbound_interface, new_raw);
 				//_path_table[packet.destination_hash][0] = time.time()
-				destination_entry._timestamp = OS::time();
+				// Refresh-on-use: persist the bump back to the path store (the
+				// local copy above would otherwise be discarded). Extends the
+				// route's lifetime, mirroring upstream Transport.py:1131.
+				refresh_path_use(packet.destination_hash(), destination_entry);
 				sent = true;
 			}
 		}
@@ -963,7 +968,9 @@ DestinationEntry empty_destination_entry;
 				new_raw << packet.raw().mid(2);
 				transmit(outbound_interface, new_raw);
 				//Transport.destination_table[packet.destination_hash][0] = time.time()
-				destination_entry._timestamp = OS::time();
+				// Refresh-on-use, persisted to the path store. Mirrors upstream
+				// Transport.py:1151 (one-hop-via-shared-instance case).
+				refresh_path_use(packet.destination_hash(), destination_entry);
 				sent = true;
 			}
 		}
@@ -1782,7 +1789,9 @@ DestinationEntry empty_destination_entry;
 						}
 						TRACE("Transport::outbound: Sending packet to next hop...");
 						transmit(outbound_interface, new_raw);
-						destination_entry._timestamp = OS::time();
+						// Refresh-on-use, persisted to the path store. Mirrors upstream
+						// Transport.py:1622 (forwarding a transported packet to next hop).
+						refresh_path_use(packet.destination_hash(), destination_entry);
 					}
 					else {
 						// TODO: There should probably be some kind of REJECT
@@ -2195,7 +2204,9 @@ DestinationEntry empty_destination_entry;
 						// If we have any local clients connected, we re-
 						// transmit the announce to them immediately
 						if (_local_client_interfaces.size() > 0) {
-							Identity announce_identity(Identity::recall(packet.destination_hash()));
+							// no_use: re-transmit announce to local clients (upstream
+							// Transport.py:1922, _no_use=True) — not a real use.
+							Identity announce_identity(Identity::recall(packet.destination_hash(), true));
 							//Destination announce_destination(announce_identity, Type::Destination::OUT, Type::Destination::SINGLE, "unknown", "unknown");
 							//announce_destination.hash(packet.destination_hash());
 							Destination announce_destination(announce_identity, Type::Destination::OUT, Type::Destination::SINGLE, packet.destination_hash());
@@ -2257,6 +2268,9 @@ DestinationEntry empty_destination_entry;
 							attached_interface = pr_entry._requesting_interface;
 
 							DEBUGF("Got matching announce, answering waiting discovery path request for %s on %s", packet.destination_hash().toHex().c_str(), attached_interface.toString().c_str());
+							// Real use (default, refreshes LRU): answering an explicit
+							// discovery path request mirrors upstream Transport.py:1976
+							// (_no_use=False) — someone asked for this destination.
 							Identity announce_identity(Identity::recall(packet.destination_hash()));
 							//Destination announce_destination(announce_identity, Type::Destination::OUT, Type::Destination::SINGLE, "unknown", "unknown");
 							//announce_destination.hash(packet.destination_hash());
@@ -2420,7 +2434,9 @@ DestinationEntry empty_destination_entry;
 									// Check that the announced destination matches
 									// the handlers aspect filter
 									bool execute_callback = false;
-									Identity announce_identity(Identity::recall(packet.destination_hash()));
+									// no_use: announce-handler callback dispatch (upstream
+									// Transport.py:2028, _no_use=True) — not a real use.
+									Identity announce_identity(Identity::recall(packet.destination_hash(), true));
 									if (handler->aspect_filter().empty()) {
 										// If the handlers aspect filter is set to
 										// None, we execute the callback in all cases
@@ -2548,7 +2564,9 @@ DestinationEntry empty_destination_entry;
 									signalling_bytes = Link::signalling_bytes(Link::mtu_from_lp_packet(packet), Link::mode_from_lp_packet(packet));
 								}
 								Bytes peer_pub_bytes = packet.data().mid(Type::Identity::SIGLENGTH/8, Type::Link::ECPUBSIZE/2);
-								Identity peer_identity = Identity::recall(link_entry._destination_hash);
+								// no_use: link-proof peer key lookup (upstream Transport.py:2171,
+								// _no_use=True) — transport-forwarding housekeeping, not a real use.
+								Identity peer_identity = Identity::recall(link_entry._destination_hash, true);
 								Bytes peer_sig_pub_bytes = peer_identity.get_public_key().mid(Type::Link::ECPUBSIZE/2, Type::Link::ECPUBSIZE/2);
 
 								Bytes signed_data = packet.destination_hash() + peer_pub_bytes + peer_sig_pub_bytes + signalling_bytes;
@@ -3053,6 +3071,28 @@ Deregisters an announce handler.
 		// query the network.
 		Packet request(destination, packet_hash, Type::Packet::DATA, Type::Packet::CACHE_REQUEST);
 		request.send();
+	}
+}
+
+/*static*/ void Transport::refresh_path_use(const Bytes& destination_hash, DestinationEntry& entry) {
+	// Mirror upstream's per-use timestamp bump. The path store expires records
+	// by (insertion_time + ttl); re-putting the decoded entry resets that
+	// insertion time, so an actively-used route doesn't expire after
+	// DESTINATION_TIMEOUT just because no fresh announce arrived. Use the same
+	// per-interface ttl the entry was originally stored with.
+	entry._timestamp = OS::time();
+	uint32_t ttl;
+	if (entry.receiving_interface().mode() == Type::Interface::MODE_ACCESS_POINT) {
+		ttl = AP_PATH_TIME;
+	}
+	else if (entry.receiving_interface().mode() == Type::Interface::MODE_ROAMING) {
+		ttl = ROAMING_PATH_TIME;
+	}
+	else {
+		ttl = DESTINATION_TIMEOUT;
+	}
+	if (!_new_path_table.put(destination_hash.collection(), entry, ttl)) {
+		TRACEF("refresh_path_use: failed to refresh path entry for %s", destination_hash.toHex().c_str());
 	}
 }
 
@@ -3564,6 +3604,9 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 				// data can starve the cooperative jobs() loop for many
 				// seconds, causing path discovery timeouts for local clients.
 				if (is_from_local_client) {
+					// Real use (default, refreshes LRU): answering a local client's
+					// path request, same intent as the discovery-path-request answer
+					// above (upstream Transport.py:1976, _no_use=False).
 					Identity imm_identity(Identity::recall(announce_packet.destination_hash()));
 					if (imm_identity) {
 						Destination imm_destination(imm_identity, Type::Destination::OUT, Type::Destination::SINGLE, announce_packet.destination_hash());
