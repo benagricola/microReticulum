@@ -69,6 +69,11 @@ Link::Link(const Destination& destination /*= {Type::NONE}*/, Callbacks::establi
 		_object->_initiator = true;
 		_object->_expected_hops = Transport::hops_to(_object->_destination.hash());
 		_object->_establishment_timeout = Reticulum::get_instance().get_first_hop_timeout(destination.hash());
+		// Upstream RNS adds a per-hop establishment allowance on top of the
+		// first-hop timeout (Link.py:283-284). Without it a multi-hop link
+		// times out before the LRPROOF can complete the full round trip, so
+		// the link never reaches ACTIVE and the send stays stuck "queued".
+		_object->_establishment_timeout += ESTABLISHMENT_TIMEOUT_PER_HOP * std::max((uint8_t)1, _object->_expected_hops);
 		_object->_prv     = Cryptography::X25519PrivateKey::generate();
 		_object->_sig_prv = Cryptography::Ed25519PrivateKey::generate();
 	}
