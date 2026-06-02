@@ -441,12 +441,30 @@ bool Resource::_build_outgoing(uint16_t link_mdu) {
 	}
 
 	// Resource hash and the proof the receiver will return on completion.
-	d._hash           = Identity::truncated_hash(encrypted + random_hash);
-	d._expected_proof = Identity::full_hash(encrypted + d._hash);
+	// Upstream RNS hashes the *plaintext* payload (Resource.py:441-443),
+	// not the ciphertext, with the full 32-byte SHA-256 — and carries that
+	// full hash on the wire everywhere (Identity.HASHLENGTH//8). Match it
+	// byte-for-byte so real RNS peers (Sideband/MeshChat/NomadNet) can
+	// verify the resources we send.
+	d._hash           = Identity::full_hash(plaintext + random_hash);
+	d._expected_proof = Identity::full_hash(plaintext + d._hash);
 	if (d._original_hash.empty()) d._original_hash = d._hash;
 
 	// Slice into parts. Each part's map_hash = sha256(part_data || random_hash)[:4].
-	const uint16_t sdu = link_mdu;
+	//
+	// The resource SDU is NOT the link MDU. Upstream RNS (Resource.py:337-340)
+	// slices resources at `mtu - HEADER_MAXSIZE - IFAC_MIN_SIZE` when the link
+	// MTU is known — resource parts are raw slices of the already-encrypted
+	// stream sent with Packet context=RESOURCE (no per-packet re-encryption,
+	// see Packet.cpp), so they can fill the packet up to the header, larger
+	// than the AES-block-aligned `mdu` used for ordinary encrypted packets.
+	// Using `get_mdu()` here made uR advertise more parts than an RNS receiver
+	// recomputes from the same MTU, so RNS dropped the resource
+	// ("Could not decode resource advertisement"). Match RNS exactly.
+	const uint16_t link_mtu = const_cast<Link&>(d._link).mtu();
+	const uint16_t sdu = link_mtu
+		? (uint16_t)(link_mtu - Type::Reticulum::HEADER_MAXSIZE - Type::Reticulum::IFAC_MIN_SIZE)
+		: link_mdu;
 	d._sdu = sdu;
 	const uint32_t n_parts32 = (d._transfer_size + sdu - 1) / sdu;
 	if (n_parts32 > 0xFFFF) {
@@ -727,7 +745,15 @@ Resource Resource::accept(const ResourceAdvertisement& adv, const Link& link,
 	d._is_split        = adv.split();
 	d._has_metadata    = adv.has_metadata();
 	d._encrypted_flag  = adv.encrypted();
-	d._sdu             = const_cast<Link&>(link).get_mdu();
+	// Resource SDU mirrors the sender's: mtu - HEADER_MAXSIZE - IFAC_MIN_SIZE
+	// when the link MTU is known (RNS Resource.py:337-340). Used here only for
+	// transfer-timing (EIFR) estimates — the part count comes from adv.parts().
+	{
+		const uint16_t link_mtu = const_cast<Link&>(link).mtu();
+		d._sdu = link_mtu
+			? (uint16_t)(link_mtu - Type::Reticulum::HEADER_MAXSIZE - Type::Reticulum::IFAC_MIN_SIZE)
+			: const_cast<Link&>(link).get_mdu();
+	}
 
 	// Allocate the receive buffer. Heap below RAM_BUFFER_THRESHOLD,
 	// flash-streamed above. nullptr means flash quota would be exceeded.
@@ -966,12 +992,15 @@ void Resource::on_part(const Packet& part_packet) {
 void Resource::on_hashmap_update(const Bytes& body) {
 	assert(_object);
 	auto& d = *_object;
-	const uint8_t HASHLEN = Type::Identity::TRUNCATED_HASHLENGTH / 8;
+	// Resource hash is the full 32-byte SHA-256 on the wire (RNS
+	// Identity.HASHLENGTH//8), not the 16-byte truncated link/destination
+	// hash.
+	const uint8_t HASHLEN = Type::Identity::HASHLENGTH / 8;
 	if (body.size() < HASHLEN + 3) {
 		WARNING("RESOURCE_HMU body too short");
 		return;
 	}
-	// Body: 16 B hash + msgpack([segment, hashmap_bytes])
+	// Body: 32 B hash + msgpack([segment, hashmap_bytes])
 	Bytes peer_hash(body.data(), HASHLEN);
 	if (peer_hash != d._hash) {
 		DEBUG("RESOURCE_HMU hash mismatch; ignoring");
@@ -1060,29 +1089,12 @@ void Resource::_assemble_and_deliver() {
 	// receive doesn't reboot the device. (#60)
 	Utilities::OS::reset_watchdog();
 
-	// Verify the resource hash. We hash the assembled ciphertext + the
-	// random_hash salt and truncate to 16 bytes, matching the sender's
-	// `Identity::truncated_hash(encrypted + random_hash)`.
+	// Decrypt the assembled ciphertext via the Link key, then strip the
+	// random_hash prefix the sender prepended before encryption. This
+	// matches RNS Resource.py assemble(): decrypt the stream, strip the
+	// random hash, *then* verify the content hash over the plaintext.
 	const Bytes assembled = d._buffer->read_all();
 	Utilities::OS::reset_watchdog();
-	const Bytes computed_hash =
-		Identity::truncated_hash(assembled + d._random_hash);
-	Utilities::OS::reset_watchdog();
-	if (computed_hash != d._hash) {
-		WARNINGF("Resource: assembled hash mismatch for %s — corrupt",
-		         d._hash.toHex().c_str());
-		d._status = Type::Resource::CORRUPT;
-		if (d._callbacks._concluded) {
-			try { d._callbacks._concluded(*this); }
-			catch (const std::exception& e) {
-				ERRORF("Resource::_assemble: concluded callback threw: %s", e.what());
-			}
-		}
-		return;
-	}
-
-	// Decrypt via the Link's key, then strip the random_hash prefix the
-	// sender prepended before encryption. Result is the original payload.
 	Bytes decrypted;
 	try {
 		decrypted = d._link.decrypt(assembled);
@@ -1106,6 +1118,25 @@ void Resource::_assemble_and_deliver() {
 	}
 	d._plaintext = Bytes(decrypted.data() + Type::Resource::RANDOM_HASH_SIZE,
 	                     decrypted.size() - Type::Resource::RANDOM_HASH_SIZE);
+
+	// Verify the resource hash over the *plaintext* payload + random_hash
+	// salt, full 32-byte SHA-256 — matching upstream RNS (Resource.py:694)
+	// and the sender's `Identity::full_hash(plaintext + random_hash)`.
+	const Bytes computed_hash =
+		Identity::full_hash(d._plaintext + d._random_hash);
+	Utilities::OS::reset_watchdog();
+	if (computed_hash != d._hash) {
+		WARNINGF("Resource: assembled hash mismatch for %s — corrupt",
+		         d._hash.toHex().c_str());
+		d._status = Type::Resource::CORRUPT;
+		if (d._callbacks._concluded) {
+			try { d._callbacks._concluded(*this); }
+			catch (const std::exception& e) {
+				ERRORF("Resource::_assemble: concluded callback threw: %s", e.what());
+			}
+		}
+		return;
+	}
 
 	d._status = Type::Resource::COMPLETE;
 	d._last_activity_ms = Utilities::OS::ltime();
@@ -1132,11 +1163,17 @@ void Resource::_assemble_and_deliver() {
 
 void Resource::_send_proof() {
 	auto& d = *_object;
-	// PRF body = SHA-256(assembled || hash). The sender pre-computed the
-	// same value at build time as _expected_proof.
-	const Bytes proof = Identity::full_hash(d._buffer->read_all() + d._hash);
+	// PRF body = resource_hash(32) || SHA-256(plaintext || hash), matching
+	// upstream RNS (Resource.py:755-756). The proof is computed over the
+	// decrypted plaintext, and the resource hash prefix lets the sender
+	// route the proof to the right outgoing resource. The sender
+	// pre-computed the proof tail at build time as _expected_proof.
+	const Bytes proof = Identity::full_hash(d._plaintext + d._hash);
+	Bytes body;
+	body.append(d._hash);
+	body.append(proof);
 	try {
-		Packet prf_packet(d._link, proof,
+		Packet prf_packet(d._link, body,
 		                  Type::Packet::PROOF, Type::Packet::RESOURCE_PRF);
 		prf_packet.send();
 	}
@@ -1173,7 +1210,9 @@ void Resource::on_request(const Bytes& body) {
 	d._last_activity_ms = Utilities::OS::ltime();
 	d._retries_left = Type::Resource::MAX_RETRIES;
 
-	const uint8_t HASHLEN  = Type::Identity::TRUNCATED_HASHLENGTH / 8;
+	// Resource hash is the full 32-byte SHA-256 on the wire (RNS
+	// Identity.HASHLENGTH//8), not the 16-byte truncated link hash.
+	const uint8_t HASHLEN  = Type::Identity::HASHLENGTH / 8;
 	const uint8_t MAPLEN   = Type::Resource::MAPHASH_LEN;
 	if (body.size() < 1 + HASHLEN) {
 		WARNING("on_request: body too short");
@@ -1267,7 +1306,7 @@ void Resource::_send_hmu(uint8_t segment_index) {
 
 	Bytes hashmap_seg(d._map_full.data() + start, end - start);
 
-	// Body: 16 B resource hash || msgpack([segment_index, hashmap_seg])
+	// Body: 32 B resource hash || msgpack([segment_index, hashmap_seg])
 	MsgPack::Packer packer;
 	packer.to_array((uint32_t)segment_index, hashmap_seg);
 	Bytes body;

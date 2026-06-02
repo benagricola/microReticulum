@@ -1438,13 +1438,13 @@ void Link::receive(const Packet& packet) {
 					break;
 				}
 				// --- RESOURCE_ICL dispatch (plan step 9) ---
-				// Sender abandoned the resource. Body is the 16-byte hash.
+				// Sender abandoned the resource. Body is the 32-byte hash.
 				case Type::Packet::RESOURCE_ICL:
 				{
 					const Bytes plaintext = decrypt(packet.data());
 					if (!plaintext) break;
 					Bytes resource_hash =
-						plaintext.left(Type::Identity::TRUNCATED_HASHLENGTH / 8);
+						plaintext.left(Type::Identity::HASHLENGTH / 8);
 					for (auto& resource : _object->_incoming_resources) {
 						if (resource.hash() == resource_hash) {
 							const_cast<Resource&>(resource).on_initiator_cancel(resource_hash);
@@ -1454,13 +1454,13 @@ void Link::receive(const Packet& packet) {
 					break;
 				}
 				// --- RESOURCE_RCL dispatch (plan step 9) ---
-				// Receiver refused/abandoned. Body is the 16-byte hash.
+				// Receiver refused/abandoned. Body is the 32-byte hash.
 				case Type::Packet::RESOURCE_RCL:
 				{
 					const Bytes plaintext = decrypt(packet.data());
 					if (!plaintext) break;
 					Bytes resource_hash =
-						plaintext.left(Type::Identity::TRUNCATED_HASHLENGTH / 8);
+						plaintext.left(Type::Identity::HASHLENGTH / 8);
 					for (auto& resource : _object->_outgoing_resources) {
 						if (resource.hash() == resource_hash) {
 							const_cast<Resource&>(resource).on_receiver_cancel(resource_hash);
@@ -1474,7 +1474,7 @@ void Link::receive(const Packet& packet) {
 				// the matching outgoing resource so it can send the
 				// requested parts. Body layout matches
 				// Resource.py:931-979: [exhausted][last_map_hash if
-				// exhausted][hash 16B][requested_map_hashes 4*N].
+				// exhausted][hash 32B][requested_map_hashes 4*N].
 				case Type::Packet::RESOURCE_REQ:
 				{
 					const Bytes plaintext = decrypt(packet.data());
@@ -1482,7 +1482,8 @@ void Link::receive(const Packet& packet) {
 						WARNING("RESOURCE_REQ decrypt failed");
 						break;
 					}
-					const uint8_t HASHLEN = Type::Identity::TRUNCATED_HASHLENGTH / 8;
+					// Full 32-byte SHA-256 resource hash (RNS HASHLENGTH//8).
+					const uint8_t HASHLEN = Type::Identity::HASHLENGTH / 8;
 					const uint8_t MAPLEN  = Type::Resource::MAPHASH_LEN;
 					if (plaintext.size() < 1 + HASHLEN) break;
 
@@ -1504,7 +1505,7 @@ void Link::receive(const Packet& packet) {
 					break;
 				}
 				// --- RESOURCE_HMU dispatch (plan step 7) ---
-				// Body is 16-byte resource hash + msgpack[segment, hashmap].
+				// Body is 32-byte resource hash + msgpack[segment, hashmap].
 				// Decrypt, look up the matching incoming resource by hash,
 				// and feed the body to its on_hashmap_update.
 				case Type::Packet::RESOURCE_HMU:
@@ -1514,7 +1515,8 @@ void Link::receive(const Packet& packet) {
 						WARNING("RESOURCE_HMU decrypt failed");
 						break;
 					}
-					const uint8_t HASHLEN = Type::Identity::TRUNCATED_HASHLENGTH / 8;
+					// Full 32-byte SHA-256 resource hash (RNS HASHLENGTH//8).
+					const uint8_t HASHLEN = Type::Identity::HASHLENGTH / 8;
 					if (plaintext.size() < HASHLEN) break;
 					Bytes resource_hash(plaintext.data(), HASHLEN);
 					for (auto& resource : _object->_incoming_resources) {
@@ -1546,15 +1548,22 @@ void Link::receive(const Packet& packet) {
 			}
 			else if (packet.packet_type() == Type::Packet::PROOF) {
 				// --- RESOURCE_PRF dispatch (plan step 7) ---
-				// The PROOF body is 32 bytes (full SHA-256). We can't
-				// route by the first 16 bytes because the body IS the
-				// proof, not the hash. Instead, hand the proof to every
-				// outgoing resource and let on_proof match against its
-				// own _expected_proof.
+				// PRF body is resource_hash(32) || proof(32), matching
+				// upstream RNS (Resource.py:755-756). Route by the hash
+				// prefix to the matching outgoing resource, then hand it
+				// the proof tail to compare against its _expected_proof.
 				if (packet.context() == Type::Packet::RESOURCE_PRF) {
-					const Bytes& proof = packet.data();
-					for (const auto& resource : _object->_outgoing_resources) {
-						const_cast<Resource&>(resource).on_proof(proof);
+					const Bytes& body = packet.data();
+					const uint8_t HASHLEN = Type::Identity::HASHLENGTH / 8;
+					if (body.size() >= HASHLEN) {
+						Bytes resource_hash(body.data(), HASHLEN);
+						Bytes proof(body.data() + HASHLEN, body.size() - HASHLEN);
+						for (const auto& resource : _object->_outgoing_resources) {
+							if (resource.hash() == resource_hash) {
+								const_cast<Resource&>(resource).on_proof(proof);
+								break;
+							}
+						}
 					}
 				}
 			}
