@@ -24,7 +24,11 @@ using namespace RNS;
 using namespace RNS::Type::Interface;
 using namespace RNS::Utilities;
 
-/*static*/ uint8_t Interface::DISCOVER_PATHS_FOR = MODE_ACCESS_POINT | MODE_GATEWAY;
+// Modes for which an inbound path request triggers recursive path discovery
+// of an unknown destination. Matches upstream RNS Interface.py:54
+// ({ACCESS_POINT, GATEWAY, ROAMING}). ROAMING was previously omitted, which
+// stopped a roaming-mode LoRa node from discovering not-yet-known paths.
+/*static*/ uint8_t Interface::DISCOVER_PATHS_FOR = MODE_ACCESS_POINT | MODE_GATEWAY | MODE_ROAMING;
 
 /*static*/ uint32_t Interface::_drained_announces = 0;
 

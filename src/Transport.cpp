@@ -704,6 +704,31 @@ DestinationEntry empty_destination_entry;
 					ERRORF("jobs: failed to cull link table: %s", e.what());
 				}
 
+				// Cull path-table entries whose receiving interface is no longer
+				// registered, mirroring upstream RNS (Transport.py:718-721) and the
+				// reverse/link culls above. Without this a path via a removed
+				// interface lingers: has_path() stays true, so the LXMF send layer
+				// never requests a fresh path and outbound() silently broadcasts via
+				// the dead next hop. (The TTL store would otherwise only drop it
+				// after the per-mode expiry — up to hours.)
+				try {
+					std::vector<Bytes> stale_paths;
+					for (auto entry : _new_path_table) {
+						if (!is_interface_registered(entry.value.receiving_interface())) {
+							stale_paths.push_back(entry.key);
+						}
+					}
+					for (const auto& destination_hash : stale_paths) {
+						if (expire_path(destination_hash)) {
+							DEBUGF("Path to %s culled: its interface is no longer registered",
+							       destination_hash.toHex().c_str());
+						}
+					}
+				}
+				catch (const std::exception& e) {
+					ERRORF("jobs: failed to cull path table: %s", e.what());
+				}
+
 
 				// Cull the pending discovery path requests table
 				try {
@@ -1483,6 +1508,7 @@ DestinationEntry empty_destination_entry;
 	Packet packet(RNS::Destination(RNS::Type::NONE), *effective_raw);
 	if (!packet.unpack()) {
 		WARNING("Transport::inbound: Packet unpack failed!");
+		_jobs_locked = false;   // inbound() is done — never leave jobs wedged (matches upstream's pre-return reset)
 		return;
 	}
 #ifndef NDEBUG
@@ -1668,6 +1694,7 @@ DestinationEntry empty_destination_entry;
 			if (packet.context() == Type::Packet::CACHE_REQUEST) {
 				if (cache_request_packet(packet)) {
 					TRACE("Transport::inbound: Cached packet");
+					_jobs_locked = false;
 					return;
 				}
 			}
@@ -1758,6 +1785,7 @@ DestinationEntry empty_destination_entry;
 										}
 										catch (const std::exception& e) {
 											WARNINGF("Dropping link request packet. The contained exception was: %s", e.what());
+											_jobs_locked = false;
 											return;
 										}
 									}
@@ -1904,6 +1932,7 @@ DestinationEntry empty_destination_entry;
 						|| _discovery_path_requests.find(packet.destination_hash()) != _discovery_path_requests.end();
 					if (!awaiting_path_request && receiving_interface.should_ingress_limit()) {
 						receiving_interface.hold_announce(packet);
+						_jobs_locked = false;   // critical: this path fires routinely under load; leaking the lock wedges all Transport jobs() until reboot
 						return;
 					}
 				}
@@ -3242,18 +3271,14 @@ Deregisters an announce handler.
 }
 
 /*static*/ bool Transport::expire_path(const Bytes& destination_hash) {
-	// CBA microStore
-	//auto& destination_entry = get_path(destination_hash);
-	DestinationEntry destination_entry;
-	_new_path_table.get(destination_hash, destination_entry);
-	if (destination_entry) {
-		destination_entry._timestamp = 0;
-		_tables_last_culled = 0;
-		return true;
-	}
-	else {
-		return false;
-	}
+	// Actually DROP the entry from the (flash/heap-backed) path store. The
+	// previous body mutated a by-value COPY of the entry (never written back),
+	// and the TTL store expires by insert-time + ttl — not the entry's
+	// _timestamp — so zeroing _timestamp could never expire a record. It was a
+	// silent no-op: drop_all_via() and the link-rediscovery "drop the dead
+	// path" branch dropped nothing. Match upstream's intent — remove it so a
+	// fresh path can be re-resolved.
+	return _new_path_table.remove(destination_hash.collection());
 }
 
 /*static*/ uint16_t Transport::drop_all_via(const Bytes& transport_hash) {
