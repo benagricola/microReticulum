@@ -397,6 +397,14 @@ namespace RNS {
 		inline static uint32_t ifac_flagged_drops() { return _ifac_flagged_drops; }
 		// Announce rebroadcasts suppressed by per-interface flood protection.
 		inline static uint32_t announce_rate_blocks() { return _announce_rate_blocks; }
+		// Link-request accounting (diagnostic): every LINKREQUEST this node
+		// accepts inbound (rx), how many it forwards onward to a next hop
+		// (fwd), and how many were for one of its own destinations and handled
+		// locally (local). On an intermediate node, rx-fwd is link requests
+		// received but not relayed; on a destination node, rx==local.
+		inline static uint32_t linkreqs_rx()    { return _linkreqs_rx; }
+		inline static uint32_t linkreqs_fwd()   { return _linkreqs_fwd; }
+		inline static uint32_t linkreqs_local() { return _linkreqs_local; }
 
 	private:
 		// Refresh-on-use for a path entry, mirroring upstream
@@ -486,6 +494,9 @@ namespace RNS {
 		static uint32_t _ifac_flagged_drops;
 		static uint32_t _announce_rate_blocks;
 		static uint32_t _destinations_added;
+		static uint32_t _linkreqs_rx;
+		static uint32_t _linkreqs_fwd;
+		static uint32_t _linkreqs_local;
 		static size_t _last_memory;
 		static size_t _last_psram;
 		static size_t _last_flash;

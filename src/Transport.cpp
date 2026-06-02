@@ -156,6 +156,9 @@ using namespace RNS::Persistence;
 /*static*/ uint32_t Transport::_ifac_flagged_drops = 0;
 /*static*/ uint32_t Transport::_announce_rate_blocks = 0;
 /*static*/ uint32_t Transport::_destinations_added = 0;
+/*static*/ uint32_t Transport::_linkreqs_rx = 0;
+/*static*/ uint32_t Transport::_linkreqs_fwd = 0;
+/*static*/ uint32_t Transport::_linkreqs_local = 0;
 /*static*/ size_t Transport::_last_memory = 0;
 /*static*/ size_t Transport::_last_psram = 0;
 /*static*/ size_t Transport::_last_flash = 0;
@@ -1514,6 +1517,10 @@ DestinationEntry empty_destination_entry;
 #ifndef NDEBUG
 	TRACEF("Transport::inbound: packet: %s", packet.debugString().c_str());
 #endif
+	// Diagnostic: count every inbound LINKREQUEST this node accepts, so an
+	// intermediate hop's rx-vs-fwd reveals whether it received but failed to
+	// relay a request, versus never receiving it at all.
+	if (packet.packet_type() == Type::Packet::LINKREQUEST) ++_linkreqs_rx;
 
 	TRACEF("Transport::inbound: destination=%s hops=%d", packet.destination_hash().toHex().c_str(), packet.hops());
 
@@ -1754,6 +1761,7 @@ DestinationEntry empty_destination_entry;
 
 						if (packet.packet_type() == Type::Packet::LINKREQUEST) {
 							TRACE("Transport::inbound: Packet is next-hop LINKREQUEST");
+							++_linkreqs_fwd;   // relaying this request toward its next hop
 							double now = OS::time();
 							double proof_timeout  = extra_link_proof_timeout(packet.receiving_interface());
 							proof_timeout += now + Type::Link::ESTABLISHMENT_TIMEOUT_PER_HOP * std::max((uint8_t)1, remaining_hops);
@@ -2513,6 +2521,7 @@ DestinationEntry empty_destination_entry;
 					auto& destination = (*iter).second;
 					if (destination.type() == packet.destination_type()) {
 						TRACE("Transport::inbound: Found local destination for LINKREQUEST");
+						++_linkreqs_local;   // this node is the link's destination
 						packet.destination(destination);
 						// CBA iterator over std::set is always const so need to make temporarily mutable
 						//destination.receive(packet);
