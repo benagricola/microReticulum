@@ -777,9 +777,7 @@ const Bytes Identity::encrypt(const Bytes& plaintext) const {
 
 	Cryptography::Token token(derived_key);
 	TRACEF("Identity::encrypt: Token encrypting data of length %lu", plaintext.size());
-	TRACEF("Identity::encrypt: plaintext:  %s", plaintext.toHex().c_str());
 	Bytes ciphertext = token.encrypt(plaintext);
-	TRACEF("Identity::encrypt: ciphertext: %s", ciphertext.toHex().c_str());
 
 	return ephemeral_pub_bytes + ciphertext;
 }

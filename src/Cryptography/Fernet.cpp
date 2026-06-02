@@ -70,14 +70,12 @@ const Bytes Fernet::encrypt(const Bytes& data) {
 	//double current_time = OS::time();
 	TRACEF("Fernet::encrypt: iv:         %s", iv.toHex().c_str());
 
-	TRACEF("Fernet::encrypt: plaintext:  %s", data.toHex().c_str());
 	Bytes ciphertext = AES_128_CBC::encrypt(
 		PKCS7::pad(data),
 		_encryption_key,
 		iv
 	);
 	DEBUGF("Fernet::encrypt: padded ciphertext length: %lu", ciphertext.size());
-	TRACEF("Fernet::encrypt: ciphertext: %s", ciphertext.toHex().c_str());
 
 	Bytes signed_parts = iv + ciphertext;
 
@@ -107,7 +105,6 @@ const Bytes Fernet::decrypt(const Bytes& token) {
 
 	//ciphertext = token[16:-32]
 	Bytes ciphertext = token.mid(16, token.size()-48);
-	TRACEF("Fernet::decrypt: ciphertext: %s", ciphertext.toHex().c_str());
 
 	try {
 		Bytes plaintext = PKCS7::unpad(
@@ -118,7 +115,6 @@ const Bytes Fernet::decrypt(const Bytes& token) {
 			)
 		);
 		DEBUGF("Fernet::encrypt: unpadded plaintext length: %lu", plaintext.size());
-		TRACEF("Fernet::decrypt: plaintext:  %s", plaintext.toHex().c_str());
 
 		DEBUGF("Fernet::decrypt: plaintext length: %lu", plaintext.size());
 		return plaintext;

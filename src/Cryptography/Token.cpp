@@ -209,7 +209,6 @@ const Bytes Token::encrypt(const Bytes& data) {
 	DEBUGF("Token::encrypt: plaintext length: %lu", data.size());
 	Bytes iv = random(16);
 	TRACEF("Token::encrypt: iv:         %s", iv.toHex().c_str());
-	TRACEF("Token::encrypt: plaintext:  %s", data.toHex().c_str());
 
 	Bytes padded = PKCS7::pad(data);
 
@@ -242,7 +241,6 @@ const Bytes Token::encrypt(const Bytes& data) {
 #endif
 
 	DEBUGF("Token::encrypt: padded ciphertext length: %lu", ciphertext.size());
-	TRACEF("Token::encrypt: ciphertext: %s", ciphertext.toHex().c_str());
 
 	Bytes signed_parts = iv + ciphertext;
 	Bytes sig(HMAC::generate(_signing_key, signed_parts)->digest());
@@ -281,7 +279,6 @@ const Bytes Token::decrypt(const Bytes& token) {
 
 	//ciphertext = token[16:-32]
 	Bytes ciphertext = token.mid(16, token.size()-48);
-	TRACEF("Token::decrypt: ciphertext: %s", ciphertext.toHex().c_str());
 
 	// mbedtls_aes_crypt_cbc mutates the IV; copy it to a writable buf.
 	uint8_t iv_buf[16];
@@ -318,6 +315,5 @@ const Bytes Token::decrypt(const Bytes& token) {
 	}
 
 	DEBUGF("Token::decrypt: plaintext length: %lu", plaintext.size());
-	TRACEF("Token::decrypt: plaintext:  %s", plaintext.toHex().c_str());
 	return plaintext;
 }
