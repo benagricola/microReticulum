@@ -2585,7 +2585,16 @@ DestinationEntry empty_destination_entry;
 				if ((Reticulum::transport_enabled() || for_local_client_link || from_local_client) && _link_table.find(packet.destination_hash()) != _link_table.end()) {
 					TRACE("Handling link request proof...");
 					LinkEntry& link_entry = (*_link_table.find(packet.destination_hash())).second;
-					if (packet.receiving_interface() == link_entry._outbound_interface) {
+					// Match upstream (Transport.py:2162): only transport the proof
+					// onward if it returned over the hop count we expected for the
+					// reverse path. hops() and _remaining_hops are both counted the
+					// same way uR counts every hop, so a valid proof on the symmetric
+					// reverse path matches; an unexpected-route proof is dropped
+					// rather than forwarded blindly.
+					if (packet.hops() != link_entry._remaining_hops) {
+						DEBUG("Received link request proof with hop mismatch, not transporting it");
+					}
+					else if (packet.receiving_interface() == link_entry._outbound_interface) {
 						try {
 							if (packet.data().size() == (Type::Identity::SIGLENGTH/8 + Type::Link::ECPUBSIZE/2) || packet.data().size() == (Type::Identity::SIGLENGTH/8 + Type::Link::ECPUBSIZE/2 + Type::Link::LINK_MTU_SIZE)) {
 								Bytes signalling_bytes;
