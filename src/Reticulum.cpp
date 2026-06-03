@@ -30,6 +30,17 @@ using namespace RNS;
 using namespace RNS::Type::Reticulum;
 using namespace RNS::Utilities;
 
+// Loop sub-section timing probes (opt-in via -DURTN_LOOP_DIAG). With the
+// flag absent these collapse to nothing, so the OS::ltime() calls and the
+// _loop_*_ms writes leave production builds entirely.
+#if defined(URTN_LOOP_DIAG)
+  #define URTN_RL_BEGIN(v)     uint64_t v = OS::ltime()
+  #define URTN_RL_END(v, slot) do { uint32_t _d = (uint32_t)(OS::ltime() - (v)); if (_d > slot) slot = _d; } while (0)
+#else
+  #define URTN_RL_BEGIN(v)     ((void)0)
+  #define URTN_RL_END(v, slot) ((void)0)
+#endif
+
 /*static*/ //std::string Reticulum::_storagepath;
 /*static*/ char Reticulum::_storagepath[FILEPATH_MAXSIZE];
 /*static*/ //std::string Reticulum::_cachepath;
@@ -43,6 +54,13 @@ using namespace RNS::Utilities;
 /*static*/ bool Reticulum::__use_implicit_proof = true;
 /*static*/ bool Reticulum::__allow_probes = false;
 /*static*/ bool Reticulum::panic_on_interface_error = false;
+
+#if defined(URTN_LOOP_DIAG)
+/*static*/ uint32_t Reticulum::_loop_jobs_ms = 0;
+/*static*/ uint32_t Reticulum::_loop_interfaces_ms = 0;
+/*static*/ uint32_t Reticulum::_loop_fs_ms = 0;
+/*static*/ uint32_t Reticulum::_loop_txloop_ms = 0;
+#endif
 
 /*static*/ uint16_t Reticulum::_persist_interval = PERSIST_INTERVAL;
 /*static*/ uint16_t Reticulum::_clean_interval = CLEAN_INTERVAL;
@@ -250,13 +268,16 @@ void Reticulum::loop() {
 
 			// Perform Reticulum housekeeping
 			if (OS::time() > (_object->_jobs_last_run + JOB_INTERVAL)) {
+				URTN_RL_BEGIN(_jt);
 				jobs();
+				URTN_RL_END(_jt, _loop_jobs_ms);
 				OS::reset_watchdog();
 			}
 
 			// Perform Interface processing — each interface.loop() may
 			// dispatch one or more inbound packets through Transport
 			// and into Link/Resource callbacks; non-trivial work.
+			URTN_RL_BEGIN(_it);
 			for (auto& [hash, interface] : Transport::get_interfaces()) {
 				interface.loop();
 				// Cooperative announce-egress drain (replaces upstream's
@@ -278,16 +299,21 @@ void Reticulum::loop() {
 				}
 				OS::reset_watchdog();
 			}
+			URTN_RL_END(_it, _loop_interfaces_ms);
 
 			// Perform Filesystem processing
 			microStore::FileSystem& filesystem = OS::get_filesystem();
 			if (filesystem) {
+				URTN_RL_BEGIN(_ft);
 				filesystem.loop();
+				URTN_RL_END(_ft, _loop_fs_ms);
 				OS::reset_watchdog();
 			}
 
 			// Perform Transport processing
+			URTN_RL_BEGIN(_tt);
 			RNS::Transport::loop();
+			URTN_RL_END(_tt, _loop_txloop_ms);
 			OS::reset_watchdog();
 		}
 

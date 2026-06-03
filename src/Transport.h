@@ -369,6 +369,19 @@ namespace RNS {
 		inline static uint16_t path_requests_maxsize() { return _path_requests_maxsize; }
 		inline static void path_requests_maxsize(uint16_t path_requests_maxsize) { _path_requests_maxsize = path_requests_maxsize; }
 		inline static size_t path_requests_size() { return _path_requests.size(); }
+
+		// Live row counts of the in-memory routing tables (diagnostic). These
+		// are the O(n) inputs to the per-loop housekeeping scans, so a long
+		// loop iteration is read alongside which of these has grown large.
+		inline static size_t path_table_size() { return _path_store.size(); }
+		inline static size_t announce_table_size() { return _announce_table.size(); }
+		inline static size_t reverse_table_size() { return _reverse_table.size(); }
+		inline static size_t link_table_size() { return _link_table.size(); }
+		inline static size_t held_announces_size() { return _held_announces.size(); }
+		inline static size_t announce_rate_table_size() { return _announce_rate_table.size(); }
+		inline static size_t discovery_path_requests_size() { return _discovery_path_requests.size(); }
+		inline static size_t tunnels_size() { return _tunnels.size(); }
+
 		inline static uint16_t hashlist_maxsize() { return _hashlist_maxsize; }
 		inline static void hashlist_maxsize(uint16_t hashlist_maxsize) { _hashlist_maxsize = hashlist_maxsize; }
 		inline static uint16_t max_pr_tags() { return _max_pr_tags; }

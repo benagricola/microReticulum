@@ -62,6 +62,16 @@ namespace RNS {
 		static uint16_t _persist_interval;
 		static uint16_t _clean_interval;
 
+#if defined(URTN_LOOP_DIAG)
+		// Loop sub-section timing (diagnostic, ms): the max duration of each
+		// housekeeping step in loop(), to find which one scales into a long
+		// blocking iteration when the path/announce tables grow large.
+		static uint32_t _loop_jobs_ms;
+		static uint32_t _loop_interfaces_ms;
+		static uint32_t _loop_fs_ms;
+		static uint32_t _loop_txloop_ms;
+#endif
+
 	public:
 		// Return the currently running Reticulum instance
 		inline static const Reticulum& get_instance() { return _instance; }
@@ -72,6 +82,14 @@ namespace RNS {
 		// friend access to the private static char arrays.
 		inline static const char* storagepath() { return _storagepath; }
 		inline static const char* cachepath()   { return _cachepath; }
+
+#if defined(URTN_LOOP_DIAG)
+		inline static uint32_t loop_jobs_ms()       { return _loop_jobs_ms; }
+		inline static uint32_t loop_interfaces_ms() { return _loop_interfaces_ms; }
+		inline static uint32_t loop_fs_ms()         { return _loop_fs_ms; }
+		inline static uint32_t loop_txloop_ms()     { return _loop_txloop_ms; }
+		inline static void reset_loop_timing() { _loop_jobs_ms = _loop_interfaces_ms = _loop_fs_ms = _loop_txloop_ms = 0; }
+#endif
 
 	public:
 		Reticulum();
