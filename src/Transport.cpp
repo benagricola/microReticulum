@@ -963,6 +963,16 @@ DestinationEntry empty_destination_entry;
 	//auto& destination_entry = get_path(packet.destination_hash());
 	DestinationEntry destination_entry;
 	_new_path_table.get(packet.destination_hash(), destination_entry);
+	// A known path whose receiving interface no longer resolves is dead (the
+	// interface was deconfigured): transmitting on a NONE interface no-ops and
+	// silently drops the packet. Drop the path so this send falls through to a
+	// path request / broadcast instead, mirroring upstream dropping such entries
+	// at load (RNS Transport.py:318/332). Rare now that deregister_interface
+	// culls a removed interface's paths up front, but a cheap last-line guard.
+	if (destination_entry && !is_interface_registered(destination_entry.receiving_interface())) {
+		expire_path(packet.destination_hash());
+		destination_entry = DestinationEntry();
+	}
 	if (packet.packet_type() != Type::Packet::ANNOUNCE && packet.destination().type() != Type::Destination::PLAIN && packet.destination().type() != Type::Destination::GROUP && destination_entry) {
 		TRACE("Transport::outbound: Path to destination is known");
         //outbound_interface = Transport.destination_table[packet.destination_hash][5]
@@ -2059,13 +2069,20 @@ DestinationEntry empty_destination_entry;
 						// destination, but the hop count is equal or
 						// less, we'll update our tables.
 						if (packet.hops() <= destination_entry._hops) {
-							// Make sure we haven't heard the random
-							// blob before, so announces can't be
-							// replayed to forge paths.
-							// TODO: Check whether this approach works
-							// under all circumstances
-							//p if not random_blob in random_blobs:
-							if (random_blobs.find(random_blob) == random_blobs.end()) {
+							// Accept an equal/lower-hop announce only if it's a blob we
+							// haven't heard (replay guard) AND its emission is more recent
+							// than the path we hold, so an older announce can't displace a
+							// newer path (RNS Transport.py:1750-1761). path_announce_emitted
+							// = most-recent emission across the stored random blobs.
+							uint64_t path_announce_emitted = 0;
+							for (const Bytes& path_random_blob : random_blobs) {
+								path_announce_emitted = std::max(path_announce_emitted, OS::from_bytes_big_endian(path_random_blob.data() + 5, 5));
+								if (path_announce_emitted >= announce_emitted) {
+									break;
+								}
+							}
+							if (random_blobs.find(random_blob) == random_blobs.end() && announce_emitted > path_announce_emitted) {
+								mark_path_unknown_state(packet.destination_hash());
 								should_add = true;
 							}
 							else {
