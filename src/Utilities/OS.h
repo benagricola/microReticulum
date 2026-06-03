@@ -17,6 +17,7 @@
 #include "../Bytes.h"
 
 #include <microStore/FileSystem.h>
+#include <microStore/Utility.h>
 
 #include <cmath>
 #include <memory>
@@ -49,7 +50,14 @@ namespace RNS { namespace Utilities {
 
 	public:
 		inline static uint64_t getTimeOffset() { return _time_offset; }
-		inline static void setTimeOffset(uint64_t offset) { _time_offset = offset; }
+		// Keep microStore's time offset in lock-step with the OS offset. Both
+		// timestamp on millis()+offset (no RTC), and the path store expires
+		// records by microStore::time(); a divergence would make stored paths
+		// expire instantly or never. Making the OS offset the single source of
+		// truth means a future caller that adopts a real-time clock here
+		// (GPS/RTC/NTP) keeps the store consistent automatically. microStore's
+		// offset is seconds; the OS offset is milliseconds.
+		inline static void setTimeOffset(uint64_t offset) { _time_offset = offset; microStore::set_time_offset((uint32_t)(offset / 1000)); }
 
 #ifdef ARDUINO
         // return current time in milliseconds since first boot
