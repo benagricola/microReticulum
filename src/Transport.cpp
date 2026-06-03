@@ -55,15 +55,15 @@ using namespace RNS::Persistence;
 #endif
 
 // Embedded divergence from upstream: RNS keeps announce_rate_table unbounded.
-// On a memory-constrained device under an announce firehose that is itself a
+// On a memory-constrained device under heavy announce traffic that is itself a
 // leak, so we cap it and LRU-cull by last-seen time.
 #ifndef RNS_ANNOUNCE_RATE_TABLE_MAX
 #define RNS_ANNOUNCE_RATE_TABLE_MAX 100
 #endif
 
 // Embedded divergence from upstream: RNS only culls path-request timestamps
-// after DESTINATION_TIMEOUT (a day), so under a high-cardinality announce
-// firehose _path_requests grows toward tens of thousands of nodes. Those nodes
+// after DESTINATION_TIMEOUT (a day), so under high-cardinality, sustained
+// announce traffic _path_requests grows toward tens of thousands of nodes. Those nodes
 // now live in PSRAM (ContainerMap), so this cap is a generous safety bound on
 // PSRAM footprint + map-traversal cost rather than an internal-SRAM necessity;
 // the oldest request is LRU-evicted when full.
@@ -159,6 +159,13 @@ using namespace RNS::Persistence;
 /*static*/ uint32_t Transport::_linkreqs_rx = 0;
 /*static*/ uint32_t Transport::_linkreqs_fwd = 0;
 /*static*/ uint32_t Transport::_linkreqs_local = 0;
+// Link-transit forwarding diagnostics. Count link/resource packets we
+// relay between interfaces, to tell "SX dropped the forward" from "SX forwarded
+// but the next hop didn't receive it".
+/*static*/ uint32_t Transport::_link_transit_in = 0;
+/*static*/ uint32_t Transport::_link_transit_fwd = 0;
+/*static*/ uint32_t Transport::_link_transit_fwd_lora = 0;
+/*static*/ uint32_t Transport::_link_transit_drop = 0;
 /*static*/ size_t Transport::_last_memory = 0;
 /*static*/ size_t Transport::_last_psram = 0;
 /*static*/ size_t Transport::_last_flash = 0;
@@ -271,7 +278,7 @@ DestinationEntry empty_destination_entry;
 	// Previously this lived inside `if (transport_enabled())` which
 	// left _path_store uninitialised on endpoint-only nodes — every
 	// announce hit a put-fail and the API path-estimate returned
-	// kind=unknown forever. (#98)
+	// kind=unknown forever.
 #if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
 	// CBA microStore
 	if (Utilities::OS::get_filesystem()) {
@@ -382,7 +389,7 @@ DestinationEntry empty_destination_entry;
 				const uint64_t now_ms = OS::ltime();
 				std::set<Link> pending_links(_pending_links);
 				for (auto& link : pending_links) {
-					// (#106) Establishment-timeout watchdog for
+					// Establishment-timeout watchdog for
 					// PENDING/HANDSHAKE links. Without it, a dropped
 					// LRPROOF or LRRTT leaks the link object and
 					// silently refuses all subsequent traffic.
@@ -420,7 +427,7 @@ DestinationEntry empty_destination_entry;
 				}
 				std::set<Link> active_links(_active_links);
 				for (auto& link : active_links) {
-					// (#106) Note that responder-side links land in
+					// Note that responder-side links land in
 					// _active_links while still in HANDSHAKE state (see
 					// Transport::register_link), so the watchdog tick
 					// has to run here too — not just on _pending_links.
@@ -912,7 +919,7 @@ DestinationEntry empty_destination_entry;
 
 	TRACEF("Transport::outbound: destination=%s hops=%d", packet.destination_hash().toHex().c_str(), packet.hops());
 
-	// (#60) Single-threaded RNS: rns_lock in the firmware already
+	// Single-threaded RNS: rns_lock in the firmware already
 	// serialises all Transport access between loopTask and web_task.
 	// The legacy spin-wait on `_jobs_running` was a Python-era cross-
 	// thread guard that deadlocks here, because Resource::tick() runs
@@ -1490,7 +1497,7 @@ DestinationEntry empty_destination_entry;
 	}
 	else {
 		// Open (non-IFAC) interface: a set IFAC flag means a misflagged, corrupted
-		// or foreign-network packet; drop it. rmap is open, so this stays ~0.
+		// or foreign-network packet; drop it. The network is open, so this stays ~0.
 		if ((raw.data()[0] & 0x80) == 0x80) {
 			++_ifac_flagged_drops;
 			DEBUG("Transport::inbound: dropping IFAC-flagged packet on non-IFAC interface");
@@ -1498,7 +1505,7 @@ DestinationEntry empty_destination_entry;
 		}
 	}
 
-	// (#60) Same reentrancy reasoning as Transport::outbound: rns_lock
+	// Same reentrancy reasoning as Transport::outbound: rns_lock
 	// already serialises Transport access; spinning on `_jobs_running`
 	// deadlocks when packet dispatch reenters from inside jobs().
 	if (!_identity) {
@@ -1851,6 +1858,7 @@ DestinationEntry empty_destination_entry;
 				auto link_iter = _link_table.find(packet.destination_hash());
 				if (link_iter != _link_table.end()) {
 					TRACE("Transport::inbound: Found link entry, handling link transport");
+					++_link_transit_in;   // a link/resource packet we recognise as transit
 					LinkEntry& link_entry = (*link_iter).second;
 					// If receiving and outbound interface is
 					// the same for this link, direction doesn't
@@ -1896,12 +1904,21 @@ DestinationEntry empty_destination_entry;
 						//new_raw += packet.raw[2:]
 						new_raw << packet.raw().mid(2);
 						transmit(outbound_interface, new_raw);
+						++_link_transit_fwd;   // relayed onward to the next hop
+						if (outbound_interface.name().find("LoRa") != std::string::npos)
+							++_link_transit_fwd_lora;   // ...specifically onto the LoRa leg
 						link_entry._timestamp = OS::time();
 						// Deferred hashlist insertion for link transport packets
 						_packet_hashlist.insert(packet.packet_hash());
 					}
 					else {
-						//p pass
+						// Found the link entry but no interface direction
+						// matched the packet's hop count, so it is silently
+						// dropped here today. Count + log it.
+						++_link_transit_drop;
+						DEBUGF("Link transit drop: link %s pkt_hops=%u (entry remaining=%u hops=%u)",
+						       packet.destination_hash().toHex().c_str(), (unsigned)packet.hops(),
+						       (unsigned)link_entry._remaining_hops, (unsigned)link_entry._hops);
 					}
 				}
 			}
@@ -3423,7 +3440,7 @@ will announce it.
 	packet.send();
 	// Bound _path_requests (embedded divergence: upstream relies solely on the
 	// DESTINATION_TIMEOUT cull, which is a day long and so unbounded in practice
-	// under a high-cardinality firehose). When at capacity, evict the oldest
+	// under high-cardinality, sustained traffic). When at capacity, evict the oldest
 	// request before recording a new destination. The throttle these timestamps
 	// provide is only an optimisation, so dropping the oldest is harmless.
 	if (_path_requests.size() >= _path_requests_maxsize

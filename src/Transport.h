@@ -405,6 +405,13 @@ namespace RNS {
 		inline static uint32_t linkreqs_rx()    { return _linkreqs_rx; }
 		inline static uint32_t linkreqs_fwd()   { return _linkreqs_fwd; }
 		inline static uint32_t linkreqs_local() { return _linkreqs_local; }
+		// Link/resource transit-forwarding diagnostics. in = packets we
+		// recognised as transit; fwd = relayed onward; fwd_lora = of those, onto
+		// the LoRa leg; drop = matched a link entry but no direction/hop matched.
+		inline static uint32_t link_transit_in()       { return _link_transit_in; }
+		inline static uint32_t link_transit_fwd()      { return _link_transit_fwd; }
+		inline static uint32_t link_transit_fwd_lora() { return _link_transit_fwd_lora; }
+		inline static uint32_t link_transit_drop()     { return _link_transit_drop; }
 
 	private:
 		// Refresh-on-use for a path entry, mirroring upstream
@@ -497,6 +504,10 @@ namespace RNS {
 		static uint32_t _linkreqs_rx;
 		static uint32_t _linkreqs_fwd;
 		static uint32_t _linkreqs_local;
+		static uint32_t _link_transit_in;
+		static uint32_t _link_transit_fwd;
+		static uint32_t _link_transit_fwd_lora;
+		static uint32_t _link_transit_drop;
 		static size_t _last_memory;
 		static size_t _last_psram;
 		static size_t _last_flash;
