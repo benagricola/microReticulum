@@ -70,7 +70,7 @@ namespace RNS {
 		// the cache hasn't changed since the last flush. Lets the
 		// firmware run save_known_destinations() on a tight (~60 s)
 		// interval cheaply, so an unplanned reboot (watchdog, panic)
-		// doesn't drop announces learned in the prior hour. (#59)
+		// doesn't drop announces learned in the prior hour.
 		static bool _known_destinations_dirty;
 		// CBA
 		static uint16_t _known_destinations_maxsize;

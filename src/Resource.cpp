@@ -325,13 +325,13 @@ Resource::Resource(const Bytes& data, const Link& link, const Bytes& request_id,
 	assert(_object);
 	MEM("Resource object created");
 	// Request/response-framed resource (used by Link::request); the actual
-	// pack-and-send pipeline is built out in plan step 5. We just stash
+	// pack-and-send work happens later in the sender pipeline. We just stash
 	// the inputs for now.
 	_object->_initiator   = true;
 	_object->_is_request  = !is_response;
 	_object->_is_response = is_response;
 	_object->_request_id  = request_id;
-	_object->_encrypted   = data;       // placeholder; sender pipeline encrypts via Link in step 5
+	_object->_encrypted   = data;       // placeholder; the sender pipeline encrypts via Link
 	_object->_timeout     = timeout;
 	_object->_status      = Type::Resource::NONE;
 	_object->_last_activity_ms = Utilities::OS::ltime();
@@ -373,7 +373,7 @@ Resource::Resource(const Bytes& data, const Link& link, bool advertise /*= true*
 
 
 // --------------------------------------------------------------------------
-// Sender pipeline (plan step 5)
+// Sender pipeline
 //
 // _build_outgoing prepares everything offline: encrypts the plaintext via
 // the parent Link, generates the random_hash salt, computes the resource
@@ -420,7 +420,7 @@ bool Resource::_build_outgoing(uint16_t link_mdu) {
 
 	// Encrypt via the Link's derived key (Fernet over AES-128-CBC).
 	// AES on a 12 KB blob takes tens of ms; the per-part loop below
-	// adds more. Same WDT story as the receive side. (#60)
+	// adds more. Same WDT story as the receive side.
 	Utilities::OS::reset_watchdog();
 	const Bytes encrypted = d._link.encrypt(salted);
 	Utilities::OS::reset_watchdog();
@@ -567,7 +567,7 @@ bool Resource::_build_outgoing(uint16_t link_mdu) {
 		       map_hash.data(), Type::Resource::MAPHASH_LEN);
 
 		// SHA-256 per part + the vector growth. 30 iterations adds up
-		// to a few hundred ms total — keep the WDT happy. (#60)
+		// to a few hundred ms total — keep the WDT happy.
 		if ((i & 0x07) == 0) Utilities::OS::reset_watchdog();
 	}
 
@@ -708,7 +708,7 @@ void Resource::_send_advertisement() {
 }
 
 // --------------------------------------------------------------------------
-// Receiver pipeline (plan step 6)
+// Receiver pipeline
 //
 // Resource::accept is the static factory the Link's RESOURCE_ADV dispatch
 // arm calls. It constructs a Resource in receive mode, allocates a
@@ -909,7 +909,7 @@ void Resource::update_eifr() {
 }
 
 // --------------------------------------------------------------------------
-// Receiver part assembly + PRF emission (plan step 7)
+// Receiver part assembly + PRF emission
 // --------------------------------------------------------------------------
 
 void Resource::on_part(const Packet& part_packet) {
@@ -954,7 +954,7 @@ void Resource::on_part(const Packet& part_packet) {
 	// Cumulative bytes seen — feeds update_eifr() on window completion
 	// so the receiver's window_timeout adapts to airtime throttling.
 	d._rtt_rxd_bytes += part_data.size();
-	// (#60) Reset receiver retry budget on each successful part. The
+	// Reset receiver retry budget on each successful part. The
 	// retry counter only matters when the transfer stalls entirely; as
 	// long as parts keep arriving we should keep going, even on a
 	// lossy link where every batch needs another window_timeout to
@@ -1086,7 +1086,7 @@ void Resource::_assemble_and_deliver() {
 	// concluded callback (which writes attachment bytes to LittleFS) —
 	// can easily exceed the 5 s task watchdog window for a ~12 KB
 	// resource. We reset the WDT at safe progress points so a long
-	// receive doesn't reboot the device. (#60)
+	// receive doesn't reboot the device.
 	Utilities::OS::reset_watchdog();
 
 	// Decrypt the assembled ciphertext via the Link key, then strip the
@@ -1185,7 +1185,7 @@ void Resource::_send_proof() {
 }
 
 // --------------------------------------------------------------------------
-// Sender REQ handling (plan step 8)
+// Sender REQ handling
 //
 // Receiver has asked for a set of parts identified by map_hash. We scan
 // our pre-built _map_full (one 4-byte slot per part) to find each
@@ -1240,7 +1240,7 @@ void Resource::on_request(const Bytes& body) {
 	// Send each requested part. Each send() queues a packet to the
 	// modem (encrypt + frame); a full REQ batch can chain several
 	// sends and push the loop tick past the WDT window if the radio
-	// queue is also draining. (#60)
+	// queue is also draining.
 	uint16_t resent = 0;
 	while (cursor + MAPLEN <= body.size()) {
 		const uint8_t* req_map_hash = body.data() + cursor;
@@ -1331,7 +1331,7 @@ void Resource::validate_proof(const Bytes& proof_data) {
 }
 
 // --------------------------------------------------------------------------
-// Cancel paths + timeout watchdog (plan step 9)
+// Cancel paths + timeout watchdog
 // --------------------------------------------------------------------------
 
 void Resource::cancel() {
@@ -1570,8 +1570,8 @@ const Bytes& Resource::data() const {
 	assert(_object);
 	// Sender side: the prepared (eventually encrypted) payload.
 	// Receiver side: callers should use the buffer through ResourceBuffer
-	// once assembly completes; that hookup lands in step 7 along with the
-	// resource_concluded callback wiring.
+	// once assembly completes; that hookup lands with the receiver part
+	// assembly along with the resource_concluded callback wiring.
 	return _object->_encrypted;
 }
 

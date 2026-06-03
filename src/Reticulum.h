@@ -203,7 +203,7 @@ namespace RNS {
 			// Fast-path Identity::_known_destinations flush. Runs at
 			// ~60 s instead of waiting for the full hourly persist_data().
 			// Cheap when nothing has changed (Identity::save_known_destinations
-			// short-circuits on a clean dirty flag). (#59)
+			// short-circuits on a clean dirty flag).
 			double _last_known_destinations_save = 0.0;
 
 			// CBA

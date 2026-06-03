@@ -244,7 +244,7 @@ void Reticulum::loop() {
 		// per-packet crypto, link/resource state machine), so resetting
 		// between them keeps a long iteration from tripping the WDT.
 		// This is NOT extending the timeout — if any single step hangs,
-		// the WDT still fires inside it. (#60)
+		// the WDT still fires inside it.
 		OS::reset_watchdog();
 		if (!_object->_is_connected_to_shared_instance) {
 
@@ -343,7 +343,7 @@ void Reticulum::jobs() {
 	// volatile (one entry per announce we hear), so we save it on a
 	// tight 60-second window so an unplanned reboot doesn't drop the
 	// entries we just learned. save_known_destinations() short-
-	// circuits when nothing changed. (#59)
+	// circuits when nothing changed.
 	static constexpr uint16_t KD_SAVE_INTERVAL = 60;
 	if (now > _object->_last_known_destinations_save + KD_SAVE_INTERVAL) {
 		Identity::save_known_destinations();

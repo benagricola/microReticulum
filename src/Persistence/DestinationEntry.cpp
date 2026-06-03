@@ -27,7 +27,7 @@ using namespace RNS::Persistence;
 	if (!entry) {
 		// [PATHDBG] Codec returning empty bytes — store.put will then
 		// store a zero-length value which the FileStore rejects.
-		// Surface which sub-field made the entry invalid. (#98)
+		// Surface which sub-field made the entry invalid.
 		const bool iface_valid = (bool)const_cast<DestinationEntry&>(entry).receiving_interface();
 		const bool pkt_valid   = (bool)const_cast<DestinationEntry&>(entry).announce_packet();
 		RNS::headf(RNS::LOG_NOTICE,

@@ -254,7 +254,7 @@ namespace RNS {
 		// HANDSHAKE (sent LRPROOF, no LRRTT back) transition to CLOSED
 		// with teardown_reason=TIMEOUT after establishment_timeout
 		// elapses. Mirrors RNS/Link.py's __watchdog_job for these
-		// states. Called once per Transport::jobs() pass. (#106)
+		// states. Called once per Transport::jobs() pass.
 		void watchdog_tick(uint64_t now_ms);
 
 		//void __str__();

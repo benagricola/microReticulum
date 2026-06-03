@@ -65,7 +65,7 @@ public:
 	double _expires = 0;
 	// PSRAM-backed: path entries live in the flash-backed _new_path_table, so a
 	// DestinationEntry is constructed transiently every time the table is read,
-	// written or iterated under the announce feed (e.g. rmap.world). Routing the
+	// written or iterated under the announce feed (e.g. a downstream RNS listener). Routing the
 	// random_blobs set nodes to PSRAM via the same ContainerAllocator the rest
 	// of the entry uses keeps that per-(de)serialise churn off internal SRAM.
 	std::set<RNS::Bytes, std::less<RNS::Bytes>, Utilities::Memory::ContainerAllocator<RNS::Bytes>> _random_blobs;

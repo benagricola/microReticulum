@@ -388,7 +388,7 @@ Recall last heard app_data for a destination hash.
 /*static*/ bool Identity::save_known_destinations() {
 	// Fast path: nothing changed since the last successful flush, so
 	// the on-disk blob is already current. Lets callers run this on a
-	// tight interval cheaply. (#59)
+	// tight interval cheaply.
 	if (!_known_destinations_dirty) {
 		return true;
 	}
