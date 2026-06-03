@@ -71,6 +71,13 @@ using namespace RNS::Persistence;
 #define RNS_PATH_REQUESTS_MAX 2000
 #endif
 
+// Path-states map (RNS Transport.py:122). Separate small in-memory map, capped
+// because uR does NOT scan the flash path store per loop to bound it (upstream
+// relies on that scan); the oldest entry is evicted when full.
+#ifndef RNS_PATH_STATES_MAX
+#define RNS_PATH_STATES_MAX 512
+#endif
+
 #ifndef RNS_HASHLIST_MAX
 #define RNS_HASHLIST_MAX 100
 #endif
@@ -94,6 +101,7 @@ using namespace RNS::Persistence;
 /*static*/ std::map<Bytes, Transport::TunnelEntry> Transport::_tunnels;
 /*static*/ Transport::RateTable Transport::_announce_rate_table;
 /*static*/ Utilities::Memory::ContainerMap<Bytes, double> Transport::_path_requests;
+/*static*/ Utilities::Memory::ContainerMap<Bytes, uint8_t> Transport::_path_states;
 
 /*static*/ Transport::PathRequestTable Transport::_discovery_path_requests;
 /*static*/ Utilities::Memory::ContainerSet<Bytes> Transport::_discovery_pr_tags;
@@ -142,6 +150,7 @@ using namespace RNS::Persistence;
 /*static*/ uint16_t Transport::_announce_table_maxsize	= RNS_ANNOUNCE_TABLE_MAX;
 /*static*/ uint16_t Transport::_announce_rate_table_maxsize	= RNS_ANNOUNCE_RATE_TABLE_MAX;
 /*static*/ uint16_t Transport::_path_requests_maxsize	= RNS_PATH_REQUESTS_MAX;
+/*static*/ uint16_t Transport::_path_states_maxsize	= RNS_PATH_STATES_MAX;
 
 /*static*/ Reticulum Transport::_owner({Type::NONE});
 /*static*/ Identity Transport::_identity({Type::NONE});
@@ -678,6 +687,14 @@ DestinationEntry empty_destination_entry;
 								else if (!path_request_throttle && hops_to(link_entry._destination_hash) == 1) {
 									DEBUGF("Trying to rediscover path for %s since an attempted link was never established, and destination was previously local to an interface on this instance", link_entry._destination_hash.toHex().c_str());
 									path_request_conditions = true;
+									// RNS Transport.py:710-739: a failed link over a non-boundary
+									// interface marks the path unresponsive, so an equal/higher-hop
+									// replacement announce is accepted on recovery (path_states consumer).
+									if (Reticulum::transport_enabled()
+											&& is_interface_registered(link_entry._receiving_interface)
+											&& link_entry._receiving_interface.mode() != Type::Interface::MODE_BOUNDARY) {
+										mark_path_unresponsive(link_entry._destination_hash);
+									}
 								}
 
 								// If the link destination was previously only 1 hop
@@ -687,6 +704,14 @@ DestinationEntry empty_destination_entry;
 								else if ( !path_request_throttle and lr_taken_hops == 1) {
 									DEBUGF("Trying to rediscover path for %s since an attempted link was never established, and link initiator is local to an interface on this instance", link_entry._destination_hash.toHex().c_str());
 									path_request_conditions = true;
+									// RNS Transport.py:710-739: a failed link over a non-boundary
+									// interface marks the path unresponsive, so an equal/higher-hop
+									// replacement announce is accepted on recovery (path_states consumer).
+									if (Reticulum::transport_enabled()
+											&& is_interface_registered(link_entry._receiving_interface)
+											&& link_entry._receiving_interface.mode() != Type::Interface::MODE_BOUNDARY) {
+										mark_path_unresponsive(link_entry._destination_hash);
+									}
 								}
 
 								if (path_request_conditions) {
@@ -800,6 +825,22 @@ DestinationEntry empty_destination_entry;
 //#ifndef NDEBUG
 				dump_stats();
 //#endif
+
+				// Remove path-state entries whose path no longer exists (RNS
+				// Transport.py:652-656,911-914). Iterates the small in-memory
+				// _path_states map probing has_path() (a cheap microStore point
+				// lookup) — does NOT scan the flash path store.
+				try {
+					std::vector<Bytes> stale_path_states;
+					stale_path_states.reserve(_path_states.size());
+					for (const auto& [destination_hash, state] : _path_states) {
+						if (!has_path(destination_hash)) stale_path_states.push_back(destination_hash);
+					}
+					for (const Bytes& destination_hash : stale_path_states) _path_states.erase(destination_hash);
+				}
+				catch (const std::exception& e) {
+					ERRORF("jobs: failed to cull path states: %s", e.what());
+				}
 
 				_tables_last_culled = OS::time();
 			}
@@ -2072,6 +2113,18 @@ DestinationEntry empty_destination_entry;
 										should_add = false;
 									}
 								}
+								else if (announce_emitted == path_announce_emitted) {
+									// RNS Transport.py:1806-1811: we've heard this exact announce
+									// before, but the stored path was marked unresponsive by a failed
+									// link attempt, so accept this equal/higher-hop announce as a replacement.
+									if (path_is_unresponsive(packet.destination_hash())) {
+										DEBUGF("Replacing destination table entry for %s with new announce, since the previously tried path was unresponsive", packet.destination_hash().toHex().c_str());
+										should_add = true;
+									}
+									else {
+										should_add = false;
+									}
+								}
 							}
 						}
 					}
@@ -2419,6 +2472,8 @@ DestinationEntry empty_destination_entry;
 							if (_new_path_table.put(packet.destination_hash().collection(), destination_table_entry, ttl)) {
 								TRACEF("Added destination %s to path table!", packet.destination_hash().toHex().c_str());
 								++_destinations_added;
+								// Reset path-state for the (re)installed path (RNS Transport.py:2001).
+								mark_path_unknown_state(packet.destination_hash());
 							}
 							else {
 								ERRORF("Failed to add destination %s to path table!", packet.destination_hash().toHex().c_str());
@@ -3188,6 +3243,7 @@ Deregisters an announce handler.
 	return true;
 */
 	// CBA microStore
+	_path_states.erase(destination_hash);
 	return _new_path_table.remove(destination_hash.collection());
 }
 
@@ -3323,6 +3379,7 @@ Deregisters an announce handler.
 	// silent no-op: drop_all_via() and the link-rediscovery "drop the dead
 	// path" branch dropped nothing. Match upstream's intent — remove it so a
 	// fresh path can be re-resolved.
+	_path_states.erase(destination_hash);
 	return _new_path_table.remove(destination_hash.collection());
 }
 
@@ -3381,6 +3438,39 @@ Deregisters an announce handler.
         return False
 
 */
+
+/*static*/ bool Transport::mark_path_unresponsive(const Bytes& destination_hash) {
+	// RNS Transport.py:2708-2714. Guard on has_path() — a cheap microStore
+	// point lookup, not a path-store scan.
+	if (!has_path(destination_hash)) return false;
+	// Bound the PSRAM map (embedded divergence: upstream leans on the per-
+	// interval path_states cull, cheap there because path_table is in-memory;
+	// uR does not scan the flash path store per loop, so cap explicitly). Only
+	// this method grows the map with new keys.
+	if (_path_states.size() >= _path_states_maxsize
+			&& _path_states.find(destination_hash) == _path_states.end()) {
+		_path_states.erase(_path_states.begin());
+	}
+	_path_states[destination_hash] = Type::Transport::STATE_UNRESPONSIVE;
+	return true;
+}
+
+/*static*/ bool Transport::mark_path_responsive(const Bytes& destination_hash) {
+	if (!has_path(destination_hash)) return false;			// Transport.py:2716-2722
+	_path_states[destination_hash] = Type::Transport::STATE_RESPONSIVE;
+	return true;
+}
+
+/*static*/ bool Transport::mark_path_unknown_state(const Bytes& destination_hash) {
+	if (!has_path(destination_hash)) return false;			// Transport.py:2724-2730
+	_path_states[destination_hash] = Type::Transport::STATE_UNKNOWN;
+	return true;
+}
+
+/*static*/ bool Transport::path_is_unresponsive(const Bytes& destination_hash) {
+	auto iter = _path_states.find(destination_hash);		// Transport.py:2732-2739
+	return iter != _path_states.end() && (*iter).second == Type::Transport::STATE_UNRESPONSIVE;
+}
 
 /*
 Requests a path to the destination from the network. If
