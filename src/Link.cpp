@@ -784,7 +784,7 @@ void Link::watchdog_tick(uint64_t /*now_ms*/) {
 	// Both bail out if their establishment_timeout elapsed — without
 	// this, a lossy interface (LoRa) that drops the LRRTT silently
 	// leaves the link half-established forever, leaks the Link object,
-	// and refuses any RESOURCE_ADV that follows. (#106)
+	// and refuses any RESOURCE_ADV that follows.
 	if (_object->_status == Type::Link::PENDING ||
 	    _object->_status == Type::Link::HANDSHAKE) {
 		if (now >= timeout_at) {
@@ -1207,7 +1207,7 @@ void Link::receive(const Packet& packet) {
 					teardown_packet(packet);
 					break;
 				}
-				// --- RESOURCE_ADV dispatch (plan step 6) ---
+				// --- RESOURCE_ADV dispatch ---
 				// Decrypt the body, validate flag combinations against our
 				// firmware's no-bz2 / no-split / no-metadata stance, check
 				// the size against FIRMWARE_MAX_INCOMING and the flash
@@ -1424,7 +1424,7 @@ void Link::receive(const Packet& packet) {
 					}
 					break;
 				}
-				// --- RESOURCE part dispatch (plan step 7) ---
+				// --- RESOURCE part dispatch ---
 				// Each incoming resource has its own random_hash, so the
 				// same map_hash space is per-resource. We call on_part on
 				// every in-flight incoming resource; each will recompute
@@ -1437,7 +1437,7 @@ void Link::receive(const Packet& packet) {
 					}
 					break;
 				}
-				// --- RESOURCE_ICL dispatch (plan step 9) ---
+				// --- RESOURCE_ICL dispatch ---
 				// Sender abandoned the resource. Body is the 32-byte hash.
 				case Type::Packet::RESOURCE_ICL:
 				{
@@ -1453,7 +1453,7 @@ void Link::receive(const Packet& packet) {
 					}
 					break;
 				}
-				// --- RESOURCE_RCL dispatch (plan step 9) ---
+				// --- RESOURCE_RCL dispatch ---
 				// Receiver refused/abandoned. Body is the 32-byte hash.
 				case Type::Packet::RESOURCE_RCL:
 				{
@@ -1469,7 +1469,7 @@ void Link::receive(const Packet& packet) {
 					}
 					break;
 				}
-				// --- RESOURCE_REQ dispatch (plan step 8) ---
+				// --- RESOURCE_REQ dispatch ---
 				// Decrypt the body, parse out the resource hash, route to
 				// the matching outgoing resource so it can send the
 				// requested parts. Body layout matches
@@ -1504,7 +1504,7 @@ void Link::receive(const Packet& packet) {
 					}
 					break;
 				}
-				// --- RESOURCE_HMU dispatch (plan step 7) ---
+				// --- RESOURCE_HMU dispatch ---
 				// Body is 32-byte resource hash + msgpack[segment, hashmap].
 				// Decrypt, look up the matching incoming resource by hash,
 				// and feed the body to its on_hashmap_update.
@@ -1547,7 +1547,7 @@ void Link::receive(const Packet& packet) {
 				}
 			}
 			else if (packet.packet_type() == Type::Packet::PROOF) {
-				// --- RESOURCE_PRF dispatch (plan step 7) ---
+				// --- RESOURCE_PRF dispatch ---
 				// PRF body is resource_hash(32) || proof(32), matching
 				// upstream RNS (Resource.py:755-756). Route by the hash
 				// prefix to the matching outgoing resource, then hand it
@@ -1799,7 +1799,9 @@ void Link::cancel_incoming_resource(const Resource& resource) {
 
 bool Link::ready_for_new_resource() {
 	assert(_object);
-	return (_object->_outgoing_resources.size() > 0);
+	// Ready only when no outgoing resource is in flight. Matches upstream
+	// RNS Link.py:1328-1330 (the original here had the comparison inverted).
+	return (_object->_outgoing_resources.size() == 0);
 }
 
 void Link::tick_resources(uint64_t now_ms) {
