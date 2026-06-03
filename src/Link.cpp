@@ -687,6 +687,11 @@ void Link::had_outbound(bool is_keepalive /*= false*/) {
 	if (!is_keepalive) {
 		_object->_last_data = _object->_last_outbound;
 	}
+	else {
+		// Record the keepalive send time so the cooperative watchdog can
+		// throttle to one keepalive per interval (RNS Link.py:691).
+		_object->_last_keepalive = _object->_last_outbound;
+	}
 }
 
 /*
@@ -799,10 +804,33 @@ void Link::watchdog_tick(uint64_t /*now_ms*/) {
 			link_closed();
 		}
 	}
-	// ACTIVE keepalive / STALE detection is not ported — the firmware
-	// has no long-lived link reuse pattern (each LXMF send opens a
-	// fresh link, sends one resource, closes). When that changes,
-	// port the upstream ACTIVE/STALE branches from RNS/Link.py:791-814.
+	// ACTIVE: keepalive + staleness detection, so a reused link (LXMF #90)
+	// survives idle gaps instead of being one-sidedly torn down. Ported from
+	// RNS Link.py:847-868. The threaded upstream sleeps `keepalive` seconds
+	// after sending one; this cooperative per-tick version throttles on
+	// _last_keepalive (set by had_outbound) instead.
+	else if (_object->_status == Type::Link::ACTIVE) {
+		const double last_inbound =
+			std::max(std::max(_object->_last_inbound, _object->_last_proof), _object->_activated_at);
+		if (now >= last_inbound + _object->_keepalive) {
+			// Only the initiator emits keepalives; the responder echoes them
+			// (0xFF -> 0xFE) on receipt. Throttle to one per keepalive window.
+			if (_object->_initiator && now >= _object->_last_keepalive + _object->_keepalive) {
+				send_keepalive();
+			}
+			// No inbound for stale_time despite keepalives -> peer is gone.
+			if (now >= last_inbound + _object->_stale_time) {
+				_object->_status = Type::Link::STALE;
+			}
+		}
+	}
+	// STALE: torn down on the next tick so link_closed() fires (which evicts
+	// the LXMF reuse-cache entry) — RNS Link.py:864-868.
+	else if (_object->_status == Type::Link::STALE) {
+		_object->_status = Type::Link::CLOSED;
+		_object->_teardown_reason = Type::Link::TIMEOUT;
+		link_closed();
+	}
 }
 
 /*p TODO
