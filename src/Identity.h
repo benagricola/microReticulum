@@ -209,6 +209,7 @@ namespace RNS {
 		inline const Cryptography::Ed25519PublicKey::Ptr sig_pub() const { assert(_object); return _object->_sig_pub; }
 		inline static uint16_t known_destinations_maxsize() { return _known_destinations_maxsize; }
 		inline static void known_destinations_maxsize(uint16_t known_destinations_maxsize) { _known_destinations_maxsize = known_destinations_maxsize; }
+		inline static size_t known_destinations_count() { return _known_destinations.size(); }
 
 		inline std::string toString() const { if (!_object) return ""; return "{Identity:" + _object->_hash.toHex() + "}"; }
 

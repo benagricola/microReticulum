@@ -363,15 +363,21 @@ void Reticulum::jobs() {
 		persist_data();
 	}
 
-	// Identity::_known_destinations fast-path flush. The full
-	// persist_data() above runs hourly to limit flash wear on the
-	// chunkier Transport tables. Known-destinations is small and
-	// volatile (one entry per announce we hear), so we save it on a
-	// tight 60-second window so an unplanned reboot doesn't drop the
-	// entries we just learned. save_known_destinations() short-
-	// circuits when nothing changed.
+	// Identity::_known_destinations fast-path flush. The full persist_data()
+	// above runs hourly; this tight 60-second flush exists so an unplanned
+	// reboot doesn't drop recently-learned entries. It rewrites the entire
+	// known-destinations blob, so it is only cheap when the set is small (an
+	// endpoint node with a handful of contacts). On a transport/backbone node
+	// the set fills to its cap and the full rewrite freezes the single-threaded
+	// loop for tens of seconds (starving LoRa RX/TX) every interval, so above a
+	// threshold we skip the fast-path and let the hourly persist_data() cover it
+	// (Identity::persist_data() also saves known-destinations). In that regime
+	// the set is re-learned from announces within ~a minute of boot anyway.
+	// save_known_destinations() additionally short-circuits when nothing changed.
 	static constexpr uint16_t KD_SAVE_INTERVAL = 60;
-	if (now > _object->_last_known_destinations_save + KD_SAVE_INTERVAL) {
+	static constexpr size_t   KD_FAST_SAVE_MAX = 64;  // entries; above this, rely on hourly persist
+	if (now > _object->_last_known_destinations_save + KD_SAVE_INTERVAL
+			&& Identity::known_destinations_count() <= KD_FAST_SAVE_MAX) {
 		Identity::save_known_destinations();
 		_object->_last_known_destinations_save = now;
 	}
