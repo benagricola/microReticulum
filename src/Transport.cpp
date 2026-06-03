@@ -714,30 +714,14 @@ DestinationEntry empty_destination_entry;
 					ERRORF("jobs: failed to cull link table: %s", e.what());
 				}
 
-				// Cull path-table entries whose receiving interface is no longer
-				// registered, mirroring upstream RNS (Transport.py:718-721) and the
-				// reverse/link culls above. Without this a path via a removed
-				// interface lingers: has_path() stays true, so the LXMF send layer
-				// never requests a fresh path and outbound() silently broadcasts via
-				// the dead next hop. (The TTL store would otherwise only drop it
-				// after the per-mode expiry — up to hours.)
-				try {
-					std::vector<Bytes> stale_paths;
-					for (auto entry : _new_path_table) {
-						if (!is_interface_registered(entry.value.receiving_interface())) {
-							stale_paths.push_back(entry.key);
-						}
-					}
-					for (const auto& destination_hash : stale_paths) {
-						if (expire_path(destination_hash)) {
-							DEBUGF("Path to %s culled: its interface is no longer registered",
-							       destination_hash.toHex().c_str());
-						}
-					}
-				}
-				catch (const std::exception& e) {
-					ERRORF("jobs: failed to cull path table: %s", e.what());
-				}
+				// Path-table entries whose receiving interface was removed are now
+				// culled event-driven in deregister_interface(), not by a periodic
+				// scan here. The flash/heap-backed path store deserializes every
+				// record on a full iteration, so scanning it every cull interval is
+				// O(n) and, at the table cap, froze the single-threaded loop for tens
+				// of seconds (starving LoRa RX/TX). Timeout expiry stays delegated to
+				// the store TTL; the reverse/link culls below stay periodic (small
+				// in-memory tables, cheap to scan).
 
 
 				// Cull the pending discovery path requests table
@@ -2882,6 +2866,32 @@ DestinationEntry empty_destination_entry;
 	if (iter != _interfaces.end()) {
 		TRACEF("Transport::deregister_interface: Found and removing interface %s", (*iter).second.toString().c_str());
 		_interfaces.erase(iter);
+	}
+
+	// Now the interface is gone, drop any path-table entries that were
+	// received on it. Done here (event-driven on the rare interface removal)
+	// rather than in the periodic table cull: the path store is flash/heap-
+	// backed, so a full deserialize scan every cull interval is O(n) and, at
+	// the path-table cap, freezes the single-threaded loop for tens of
+	// seconds. Mirrors RNS Transport.py:718-721 intent; timeout-based expiry
+	// stays delegated to the store TTL. Yields via OS::run_loop() mid-scan.
+	try {
+		std::vector<Bytes> stale_paths;
+		for (auto entry : _new_path_table) {
+			if (!is_interface_registered(entry.value.receiving_interface())) {
+				stale_paths.push_back(entry.key);
+			}
+			OS::run_loop();
+		}
+		for (const auto& destination_hash : stale_paths) {
+			if (expire_path(destination_hash)) {
+				DEBUGF("Path to %s culled: its interface was deregistered",
+				       destination_hash.toHex().c_str());
+			}
+		}
+	}
+	catch (const std::exception& e) {
+		ERRORF("deregister_interface: failed to cull path table: %s", e.what());
 	}
 }
 
