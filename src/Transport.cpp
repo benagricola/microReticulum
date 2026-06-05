@@ -822,9 +822,15 @@ DestinationEntry empty_destination_entry;
 					ERRORF("jobs: failed to cull tunnel table: %s", e.what());
 				}
 
-//#ifndef NDEBUG
+				// dump_stats() runs filesystem free-space scans (lfs_fs_size) and a
+				// TLSF pool walk. On the single main loop, called here every cull
+				// interval (60s), that bursts to seconds and starves LoRa. The same
+				// data is available off-loop via /api/diag/mem, so keep the periodic
+				// dump behind the verbose-diag flag (matching the dumpInfo() gate
+				// below). The one-shot dump at start() still runs.
+#if defined(RNS_VERBOSE_DIAG)
 				dump_stats();
-//#endif
+#endif
 
 				// Remove path-state entries whose path no longer exists (RNS
 				// Transport.py:652-656,911-914). Iterates the small in-memory
