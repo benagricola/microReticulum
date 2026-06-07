@@ -381,6 +381,8 @@ namespace RNS {
 		// are the O(n) inputs to the per-loop housekeeping scans, so a long
 		// loop iteration is read alongside which of these has grown large.
 		inline static size_t path_table_size() { return _path_store.size(); }
+		// Flash-store write/compaction counters for the path store (diagnostics).
+		inline static PathStore::Stats path_store_stats() { return _path_store.stats(); }
 		inline static size_t announce_table_size() { return _announce_table.size(); }
 		inline static size_t reverse_table_size() { return _reverse_table.size(); }
 		inline static size_t link_table_size() { return _link_table.size(); }

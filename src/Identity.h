@@ -155,6 +155,10 @@ namespace RNS {
 		static bool retain_destination(const Bytes& destination_hash);
 		static Bytes recall_app_data(const Bytes& destination_hash);
 		static bool save_known_destinations();
+		// Force the next save_known_destinations() to actually write (bypass the
+		// not-dirty fast-path). Diagnostics only — lets a probe measure the
+		// full-blob persist cost on demand instead of waiting for the hourly job.
+		static void mark_known_destinations_dirty() { _known_destinations_dirty = true; }
 		static void load_known_destinations();
 		// CBA
 		static void cull_known_destinations();
