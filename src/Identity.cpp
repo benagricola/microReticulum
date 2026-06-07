@@ -46,40 +46,33 @@ using namespace RNS::Utilities;
 #define RNS_KNOWN_DESTINATIONS_MAX 100
 #endif
 
-/*static*/ Identity::IdentityTable Identity::_known_destinations;
-/*static*/ bool Identity::_saving_known_destinations = false;
-/*static*/ bool Identity::_known_destinations_dirty = false;
+// Flash persist-tier geometry for the known-destinations store (mirrors the
+// path store). Eight 24 KB segments = 192 KB ceiling, ample for the runtime cap
+// (set to URTN_PATH_TABLE_MAX_RECS by the firmware) of ~300-byte records.
+#ifndef RNS_KNOWN_DEST_SEGMENT_SIZE
+#define RNS_KNOWN_DEST_SEGMENT_SIZE 24576
+#endif
+#ifndef RNS_KNOWN_DEST_SEGMENT_COUNT
+#define RNS_KNOWN_DEST_SEGMENT_COUNT 8
+#endif
+
+// The known-destinations cache: a PSRAM front (always) + an optional flash
+// persist tier (RNS_PERSIST_KNOWN_DESTS, enabled at init() when a filesystem is
+// present). _known_destinations is the typed Bytes->IdentityEntry view over it.
+/*static*/ Identity::KnownDestStore Identity::_known_dest_store(RNS_KNOWN_DEST_SEGMENT_SIZE, RNS_KNOWN_DEST_SEGMENT_COUNT);
+/*static*/ Identity::KnownDestTable Identity::_known_destinations(Identity::_known_dest_store);
 // CBA
 // CBA ACCUMULATES
 /*static*/ uint16_t Identity::_known_destinations_maxsize = RNS_KNOWN_DESTINATIONS_MAX;
 
-// Binary serialisation helpers used by save_known_destinations /
-// load_known_destinations. Defined here at file scope so both functions
-// can see them (the file's compilation order otherwise puts save before
-// load).
+// Legacy known_destinations blob format constants — read once by the one-time
+// migration in load_known_destinations() that imports the old single-file cache
+// into the per-record store. The format is no longer written.
 namespace {
 constexpr uint32_t KD_MAGIC   = 0xC0DEC0DE;
-// v2 adds the LRU last_used marker (int64 ms; -1000 sentinel = retained) per
-// entry. v1 files (no marker) are still loaded, with last_used defaulting to 0.
+// v2 added the LRU last_used marker (int64 ms; -1000 sentinel = retained) per
+// entry. v1 files (no marker) load with last_used defaulting to 0.
 constexpr uint32_t KD_VERSION = 2;
-void put_u16(Bytes& b, uint16_t v) {
-	uint8_t tmp[2] = {(uint8_t)(v >> 8), (uint8_t)v};
-	b.append(tmp, 2);
-}
-void put_u32(Bytes& b, uint32_t v) {
-	uint8_t tmp[4] = {(uint8_t)(v >> 24), (uint8_t)(v >> 16),
-	                  (uint8_t)(v >> 8),  (uint8_t)v};
-	b.append(tmp, 4);
-}
-void put_u64(Bytes& b, uint64_t v) {
-	uint8_t tmp[8];
-	for (int i = 0; i < 8; ++i) tmp[i] = (uint8_t)(v >> (56 - 8 * i));
-	b.append(tmp, 8);
-}
-void put_bytes(Bytes& b, const Bytes& src) {
-	put_u16(b, (uint16_t)src.size());
-	if (src.size()) b.append(src.data(), src.size());
-}
 } // anonymous namespace
 
 Identity::Identity(bool create_keys /*= true*/) : _object(new Object()) {
@@ -266,14 +259,23 @@ Can be used to load previously created and saved identities into Reticulum.
 			// entry and leaves [4] (last_used / retained) intact. A fresh entry
 			// starts at 0 (learned-but-never-used).
 			double last_used = 0;
-			auto existing = _known_destinations.find(destination_hash);
-			if (existing != _known_destinations.end()) {
-				last_used = existing->second._last_used;
+			bool genuine = true;   // new key / changed identity ⇒ persist; else front-only
+			IdentityEntry existing;
+			if (_known_destinations.get(destination_hash, existing)) {
+				last_used = existing._last_used;
+				// A re-announce from a known peer usually only bumps the timestamp;
+				// the durable identity (public key + app_data) is unchanged. That is
+				// a volatile touch — keep it in the PSRAM front (put_front) and out
+				// of the flash tier, exactly like the path store's refresh-on-use.
+				// Persisting every announce would otherwise hammer flash under the
+				// backbone feed. The persist tier records only genuine changes.
+				genuine = (existing._public_key != public_key) || (existing._app_data != app_data);
 			}
-			_known_destinations.insert_or_assign(
-				destination_hash,
-				IdentityEntry{OS::time(), packet_hash, public_key, app_data, last_used});
-			_known_destinations_dirty = true;
+			IdentityEntry updated{OS::time(), packet_hash, public_key, app_data, last_used};
+			if (genuine)
+				_known_destinations.put(destination_hash, updated);        // front + flash
+			else
+				_known_destinations.put_front(destination_hash, updated);  // front only
 			// CBA IMMEDIATE CULL
 			cull_known_destinations();
 		}
@@ -295,11 +297,13 @@ identity/key survives table churn. Sets the LRU marker to the -1 sentinel, which
 recall() leaves untouched and the cull treats as never-a-candidate.
 */
 /*static*/ bool Identity::retain_destination(const Bytes& destination_hash) {
-	auto iter = _known_destinations.find(destination_hash);
-	if (iter != _known_destinations.end()) {
-		if (!(iter->second._last_used < 0)) {
-			iter->second._last_used = -1;
-			_known_destinations_dirty = true;
+	IdentityEntry entry;
+	if (_known_destinations.get(destination_hash, entry)) {
+		if (!(entry._last_used < 0)) {
+			entry._last_used = -1;
+			// Pinning is a durable state change (a contact we've delivered to),
+			// so write through to the persist tier — not put_front.
+			_known_destinations.put(destination_hash, entry);
 		}
 		return true;
 	}
@@ -314,15 +318,17 @@ Recall identity for a destination hash.
 */
 /*static*/ Identity Identity::recall(const Bytes& destination_hash, bool no_use /*= false*/) {
 	TRACE("Identity::recall...");
-	auto iter = _known_destinations.find(destination_hash);
-	if (iter != _known_destinations.end()) {
+	IdentityEntry identity_data;
+	if (_known_destinations.get(destination_hash, identity_data)) {
 		TRACEF("Identity::recall: Found identity entry for destination %s", destination_hash.toHex().c_str());
-		IdentityEntry& identity_data = (*iter).second;
 		// Refresh-on-use (LRU), mirroring upstream _used_destination_data():
 		// mark this destination used now unless the recall is internal
 		// housekeeping (no_use) or the entry is retained/pinned (_last_used<0).
+		// A volatile touch, so front-only (put_front) — it must NOT churn the
+		// flash persist tier on every use (the announce feed alone would).
 		if (!no_use && !(identity_data._last_used < 0)) {
 			identity_data._last_used = OS::time();
+			_known_destinations.put_front(destination_hash, identity_data);
 		}
 		Identity identity(false);
 		identity.load_public_key(identity_data._public_key);
@@ -350,13 +356,12 @@ Recall identity for a destination hash.
 		// cache path. Makes "has a path => can recall the key" structurally true.
 		Packet stored_announce = Transport::path_announce(destination_hash);
 		if (stored_announce && validate_announce(stored_announce)) {
-			auto cached = _known_destinations.find(destination_hash);
-			if (cached != _known_destinations.end()) {
+			IdentityEntry cached;
+			if (_known_destinations.get(destination_hash, cached)) {
 				TRACEF("Identity::recall: recovered identity for %s from path-record announce", destination_hash.toHex().c_str());
-				const IdentityEntry& identity_data = (*cached).second;
 				Identity identity(false);
-				identity.load_public_key(identity_data._public_key);
-				identity.app_data(identity_data._app_data);
+				identity.load_public_key(cached._public_key);
+				identity.app_data(cached._app_data);
 				return identity;
 			}
 		}
@@ -373,10 +378,9 @@ Recall last heard app_data for a destination hash.
 */
 /*static*/ Bytes Identity::recall_app_data(const Bytes& destination_hash) {
 	TRACE("Identity::recall_app_data...");
-	auto iter = _known_destinations.find(destination_hash);
-	if (iter != _known_destinations.end()) {
+	IdentityEntry identity_data;
+	if (_known_destinations.get(destination_hash, identity_data)) {
 		TRACEF("Identity::recall_app_data: Found identity entry for destination %s", destination_hash.toHex().c_str());
-		const IdentityEntry& identity_data = (*iter).second;
 		return identity_data._app_data;
 	}
 	else {
@@ -386,144 +390,56 @@ Recall last heard app_data for a destination hash.
 }
 
 /*static*/ bool Identity::save_known_destinations() {
-	// Fast path: nothing changed since the last successful flush, so
-	// the on-disk blob is already current. Lets callers run this on a
-	// tight interval cheaply.
-	if (!_known_destinations_dirty) {
-		return true;
-	}
-	bool success = false;
-	try {
-		if (_saving_known_destinations) {
-			double wait_interval = 0.2;
-			double wait_timeout = 5;
-			double wait_start = OS::time();
-			while (_saving_known_destinations) {
-				OS::sleep(wait_interval);
-				if (OS::time() > (wait_start + wait_timeout)) {
-					ERROR("Could not save known destinations to storage, waiting for previous save operation timed out.");
-					return false;
-				}
-			}
-		}
-
-		_saving_known_destinations = true;
-		const double save_start = OS::time();
-
-		// Serialize the entire table into a binary blob (see format
-		// comment near load_known_destinations).
-		Bytes buf;
-		put_u32(buf, KD_MAGIC);
-		put_u32(buf, KD_VERSION);
-		put_u16(buf, (uint16_t)_known_destinations.size());
-		for (const auto& [destination_hash, entry] : _known_destinations) {
-			put_bytes(buf, destination_hash);
-			put_u64(buf, (uint64_t)(entry._timestamp * 1000.0));
-			put_bytes(buf, entry._packet_hash);
-			put_bytes(buf, entry._public_key);
-			put_bytes(buf, entry._app_data);
-			// Signed ms: -1 (retained) -> -1000, 0 -> 0, else last-use ms.
-			put_u64(buf, (uint64_t)(int64_t)(entry._last_used * 1000.0));
-		}
-
-		char path[Type::Reticulum::FILEPATH_MAXSIZE];
-		snprintf(path, Type::Reticulum::FILEPATH_MAXSIZE, "%s/known_destinations",
-		         Reticulum::storagepath());
-		const size_t wrote = OS::write_file(path, buf);
-		if (wrote == buf.size()) {
-			DEBUGF("Identity: saved %u known destinations (%u bytes) in %.3fs",
-			       (unsigned)_known_destinations.size(),
-			       (unsigned)buf.size(),
-			       OS::round(OS::time() - save_start, 3));
-			success = true;
-			_known_destinations_dirty = false;
-		}
-		else {
-			ERRORF("Identity: known_destinations write truncated (%u of %u bytes)",
-			       (unsigned)wrote, (unsigned)buf.size());
-		}
-	}
-	catch (const std::exception& e) {
-		ERRORF("Error while saving known destinations to disk, the contained exception was: %s", e.what());
-	}
-
-	_saving_known_destinations = false;
-
-	return success;
+	// Per-record persistence: remember()/retain_destination() write each change
+	// straight through to the flash persist tier, so there is no batched blob to
+	// flush. This replaces the old full-table rewrite that froze the loop ~22 s
+	// once the cache filled. Kept (returning success) for the periodic-persist
+	// and diagnostics callers that still invoke it.
+	return true;
 }
 
-// Binary wire format for the known_destinations persistence file. Single
-// file, replaced atomically (well, write-then-rename would be — for now,
-// write-truncate which is fine because the file is only loaded at boot
-// and the old data is acceptable on read failure):
-//
-//   uint32_t  magic       = 0xC0DEC0DE
-//   uint32_t  version     = 1
-//   uint16_t  count
-//   for each of `count` entries:
-//     uint16_t dest_hash_len      then dest_hash bytes
-//     uint64_t timestamp_ms       (entry._timestamp converted to ms-since-epoch
-//                                  for storage stability across rebuilds)
-//     uint16_t pkt_hash_len       then pkt_hash bytes
-//     uint16_t pub_key_len        then pub_key bytes
-//     uint16_t app_data_len       then app_data bytes
-//     int64_t  last_used_ms       (v2+ only; signed ms LRU marker:
-//                                  -1000 = retained, 0 = never used, else last-use)
-//
-// Average entry: 16 (dest_hash) + 8 (ts) + 16 (pkt_hash) + 32 (pub_key) +
-// ~100 (app_data) + 8 (length prefixes) ≈ 180 bytes. 100 entries × 180 B
-// ≈ 18 KiB, well within LittleFS budget.
+/*static*/ void Identity::known_destinations_compact_step() {
+	_known_dest_store.compact_step();
+}
 
-/*static*/ void Identity::load_known_destinations() {
+// One-time import of the legacy single-file known_destinations blob into the
+// per-record store. Runs at boot after the store is up; on success the old file
+// is deleted so it never imports twice. Returns the number of entries imported.
+//
+// Legacy wire format:
+//   uint32_t magic = 0xC0DEC0DE, uint32_t version (1 or 2), uint16_t count, then
+//   per entry: dest_hash (u16 len+bytes), timestamp_ms (u64), pkt_hash, pub_key,
+//   app_data (each u16 len+bytes), and (v2+) last_used_ms (signed u64).
+static uint16_t migrate_legacy_known_destinations(RNS::Persistence::KnownDestTable& table) {
+	using namespace RNS;
+	char path[Type::Reticulum::FILEPATH_MAXSIZE];
+	snprintf(path, Type::Reticulum::FILEPATH_MAXSIZE, "%s/known_destinations", Reticulum::storagepath());
+	if (!OS::file_exists(path)) return 0;
+	Bytes buf;
+	if (OS::read_file(path, buf) == 0) { OS::remove_file(path); return 0; }
+
+	const uint8_t* p   = buf.data();
+	const uint8_t* end = p + buf.size();
+	auto need = [&](size_t n) { return (size_t)(end - p) >= n; };
+	auto read_u16 = [&]() -> uint16_t { uint16_t v = ((uint16_t)p[0] << 8) | p[1]; p += 2; return v; };
+	auto read_u32 = [&]() -> uint32_t {
+		uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; p += 4; return v;
+	};
+	auto read_u64 = [&]() -> uint64_t { uint64_t v = 0; for (int i = 0; i < 8; ++i) v = (v << 8) | p[i]; p += 8; return v; };
+	auto read_bytes = [&]() -> Bytes {
+		if (!need(2)) return Bytes();
+		uint16_t len = read_u16();
+		if (!need(len)) return Bytes();
+		Bytes b(p, len); p += len; return b;
+	};
+
+	uint16_t imported = 0;
 	try {
-		char path[Type::Reticulum::FILEPATH_MAXSIZE];
-		snprintf(path, Type::Reticulum::FILEPATH_MAXSIZE, "%s/known_destinations",
-		         Reticulum::storagepath());
-		if (!OS::file_exists(path)) {
-			DEBUG("Identity: no known_destinations file, starting with empty cache");
-			return;
-		}
-		Bytes buf;
-		if (OS::read_file(path, buf) == 0) {
-			WARNING("Identity: known_destinations file present but unreadable");
-			return;
-		}
-		const uint8_t* p   = buf.data();
-		const uint8_t* end = p + buf.size();
-		auto need = [&](size_t n) { return (size_t)(end - p) >= n; };
-		auto read_u16 = [&]() -> uint16_t {
-			uint16_t v = ((uint16_t)p[0] << 8) | p[1]; p += 2; return v;
-		};
-		auto read_u32 = [&]() -> uint32_t {
-			uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-			             ((uint32_t)p[2] << 8)  | p[3]; p += 4; return v;
-		};
-		auto read_u64 = [&]() -> uint64_t {
-			uint64_t v = 0;
-			for (int i = 0; i < 8; ++i) v = (v << 8) | p[i];
-			p += 8; return v;
-		};
-		auto read_bytes = [&]() -> Bytes {
-			if (!need(2)) return Bytes();
-			uint16_t len = read_u16();
-			if (!need(len)) return Bytes();
-			Bytes b(p, len); p += len; return b;
-		};
-
-		if (!need(10)) { WARNING("Identity: known_destinations file truncated"); return; }
-		uint32_t magic = read_u32();
-		if (magic != KD_MAGIC) {
-			WARNINGF("Identity: known_destinations bad magic 0x%08x — discarding", (unsigned)magic);
-			return;
-		}
+		if (!need(10)) { OS::remove_file(path); return 0; }
+		if (read_u32() != KD_MAGIC) { OS::remove_file(path); return 0; }
 		uint32_t version = read_u32();
-		if (version != 1 && version != KD_VERSION) {
-			WARNINGF("Identity: known_destinations file version %u not supported (expected %u) — discarding", (unsigned)version, (unsigned)KD_VERSION);
-			return;
-		}
+		if (version != 1 && version != KD_VERSION) { OS::remove_file(path); return 0; }
 		uint16_t count = read_u16();
-		_known_destinations.clear();
-		uint16_t loaded = 0;
 		for (uint16_t i = 0; i < count; ++i) {
 			Bytes dest_hash = read_bytes();
 			if (!need(8)) break;
@@ -532,26 +448,44 @@ Recall last heard app_data for a destination hash.
 			Bytes pub_key   = read_bytes();
 			Bytes app_data  = read_bytes();
 			double last_used = 0;
-			if (version >= 2) {
-				if (!need(8)) break;
-				last_used = (double)(int64_t)read_u64() / 1000.0;
-			}
+			if (version >= 2) { if (!need(8)) break; last_used = (double)(int64_t)read_u64() / 1000.0; }
 			if (dest_hash.size() != Type::Reticulum::TRUNCATED_HASHLENGTH / 8) continue;
 			if (pub_key.size()   != Type::Identity::KEYSIZE / 8) continue;
-			double ts = (double)ts_ms / 1000.0;
-			try {
-				_known_destinations.insert({dest_hash, {ts, pkt_hash, pub_key, app_data, last_used}});
-				loaded++;
-			}
-			catch (const std::bad_alloc&) {
-				ERROR("Identity: bad_alloc while loading known_destinations — stopping early");
-				break;
-			}
+			table.put(dest_hash, Persistence::IdentityEntry{(double)ts_ms / 1000.0, pkt_hash, pub_key, app_data, last_used});
+			imported++;
 		}
-		NOTICEF("Identity: loaded %u known destinations from disk", (unsigned)loaded);
 	}
 	catch (const std::exception& e) {
-		ERRORF("Identity::load_known_destinations exception: %s", e.what());
+		ERRORF("Identity: legacy known_destinations migration exception: %s", e.what());
+	}
+	OS::remove_file(path);   // imported (or unparseable) — don't import again
+	return imported;
+}
+
+/*static*/ void Identity::load_known_destinations() {
+	// Bring up the store. init() warms the PSRAM front from the flash persist
+	// tier (so a reboot keeps the cache) and enables incremental compaction.
+#if defined(RNS_USE_FS) && defined(RNS_PERSIST_KNOWN_DESTS)
+	const bool persist = (bool)Utilities::OS::get_filesystem();
+#else
+	const bool persist = false;
+#endif
+#if defined(ARDUINO)
+	const char* prefix = "/known_dest";
+#else
+	const char* prefix = "known_dest";
+#endif
+	_known_dest_store.init(Utilities::OS::get_filesystem(), prefix, persist);
+
+	if (persist) {
+		NOTICEF("Identity: known-destinations persist tier ON (%u warm-loaded)", (unsigned)_known_destinations.size());
+		const uint16_t migrated = migrate_legacy_known_destinations(_known_destinations);
+		if (migrated > 0) {
+			NOTICEF("Identity: migrated %u known destinations from the legacy blob", (unsigned)migrated);
+		}
+	}
+	else {
+		NOTICE("Identity: known-destinations PSRAM-only (persist tier off)");
 	}
 }
 
@@ -568,12 +502,15 @@ Recall last heard app_data for a destination hash.
 			// Sorting by _timestamp alone (last-announce) wrongly evicted an
 			// actively-used destination that announces less often than a chatty
 			// backbone node; the use marker fixes that.
+			// Collect first, remove after — remove() mutates the store, which
+			// would invalidate the iterator if done inline. Iterating the typed
+			// view decodes each entry from the PSRAM front (no flash I/O).
 			std::vector<std::pair<double, Bytes>> sorted_keys;
 			sorted_keys.reserve(_known_destinations.size());
-			for (const auto& [key, entry] : _known_destinations) {
-				if (entry._last_used < 0) continue;  // retained/pinned: never a candidate
-				double sort_value = (entry._last_used > 0) ? entry._last_used : entry._timestamp;
-				sorted_keys.emplace_back(sort_value, key);
+			for (auto entry : _known_destinations) {
+				if (entry.value._last_used < 0) continue;  // retained/pinned: never a candidate
+				double sort_value = (entry.value._last_used > 0) ? entry.value._last_used : entry.value._timestamp;
+				sorted_keys.emplace_back(sort_value, entry.key);
 			}
 			// Sort ascending by effective-use time (least-recently-used first)
 			std::sort(sorted_keys.begin(), sorted_keys.end());
@@ -581,7 +518,7 @@ Recall last heard app_data for a destination hash.
 			uint16_t count = 0;
 			for (const auto& [timestamp, destination_hash] : sorted_keys) {
 				TRACEF("Identity::cull_known_destinations: Removing destination %s from known destinations", destination_hash.toHex().c_str());
-				if (_known_destinations.erase(destination_hash) < 1) {
+				if (!_known_destinations.remove(destination_hash)) {
 					WARNINGF("Failed to remove destination %s from known destinations", destination_hash.toHex().c_str());
 				}
 				++count;
@@ -593,26 +530,23 @@ Recall last heard app_data for a destination hash.
 		}
 		catch (const std::bad_alloc& e) {
 			ERROR("cull_known_destinations: bad_alloc - OUT OF MEMORY building sort index, falling back to single erase");
-			// Fallback: no heap allocation — scan for the single least-recently-used
-			// non-retained entry and erase it. Uses the same effective-use key as
-			// the main path (last-use if used, else learned time); retained
-			// (_last_used == -1) entries are skipped so they're never evicted.
-			auto eff_use = [](const IdentityEntry& e) {
-				return (e._last_used > 0) ? e._last_used : e._timestamp;
-			};
-			auto oldest = _known_destinations.end();
+			// Fallback: no sort index — scan for the single least-recently-used
+			// non-retained entry, recording its key, then remove it after the scan
+			// (the iterator must not be live across the mutation). Retained
+			// (_last_used < 0) entries are skipped so they're never evicted.
+			Bytes oldest_key;
 			double oldest_value = 0;
-			for (auto it = _known_destinations.begin(); it != _known_destinations.end(); ++it) {
-				if (it->second._last_used < 0) continue;  // retained/pinned
-				double value = eff_use(it->second);
-				if (oldest == _known_destinations.end() || value < oldest_value) {
-					oldest = it;
+			bool found = false;
+			for (auto entry : _known_destinations) {
+				if (entry.value._last_used < 0) continue;  // retained/pinned
+				double value = (entry.value._last_used > 0) ? entry.value._last_used : entry.value._timestamp;
+				if (!found || value < oldest_value) {
+					oldest_key = entry.key;
 					oldest_value = value;
+					found = true;
 				}
 			}
-			if (oldest != _known_destinations.end()) {
-				_known_destinations.erase(oldest);
-			}
+			if (found) _known_destinations.remove(oldest_key);
 		}
 		catch (const std::exception& e) {
 			ERRORF("cull_known_destinations: exception: %s", e.what());
@@ -676,9 +610,8 @@ Recall last heard app_data for a destination hash.
 				if (packet.destination_hash() == expected_hash) {
 					// Check if we already have a public key for this destination
 					// and make sure the public key is not different.
-					auto iter = _known_destinations.find(packet.destination_hash());
-					if (iter != _known_destinations.end()) {
-						IdentityEntry& identity_entry = (*iter).second;
+					IdentityEntry identity_entry;
+					if (_known_destinations.get(packet.destination_hash(), identity_entry)) {
 						if (public_key != identity_entry._public_key) {
 							// In reality, this should never occur, but in the odd case
 							// that someone manages a hash collision, we reject the announce.

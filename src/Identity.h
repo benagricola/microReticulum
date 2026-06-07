@@ -22,6 +22,7 @@
 #include "Cryptography/X25519.h"
 #include "Cryptography/Token.h"
 #include "Utilities/Memory.h"
+#include "Persistence/IdentityEntry.h"
 
 #include <map>
 #include <string>
@@ -36,42 +37,18 @@ namespace RNS {
 	class Identity {
 
 	private:
-		class IdentityEntry {
-		public:
-			IdentityEntry(double timestamp, const Bytes& packet_hash, const Bytes& public_key, const Bytes& app_data, double last_used = 0) :
-				_timestamp(timestamp),
-				_packet_hash(packet_hash),
-				_public_key(public_key),
-				_app_data(app_data),
-				_last_used(last_used)
-			{
-			}
-		public:
-			// _timestamp is the last-announce/learned time (overwritten on every
-			// announce by remember()). _last_used is the refresh-on-use (LRU)
-			// marker, mirroring upstream known_destinations[dest][4]:
-			//   >0  last-use timestamp (set by recall() on a real use)
-			//    0  learned-but-never-used
-			//   -1  retained/pinned, never evicted
-			double _timestamp = 0;
-			Bytes _packet_hash;
-			Bytes _public_key;
-			Bytes _app_data;
-			double _last_used = 0;
-		};
-		//using IdentityTable = std::map<Bytes, IdentityEntry>;
-		using IdentityTable = std::map<Bytes, IdentityEntry, std::less<Bytes>, Utilities::Memory::ContainerAllocator<std::pair<const Bytes, IdentityEntry>>>;
+		// The known-destinations identity cache. IdentityEntry, the two-tier
+		// store and the typed table live in Persistence/IdentityEntry.h so the
+		// microStore Codec can see the entry layout. _known_dest_store is the
+		// PSRAM front + optional flash persist tier; _known_destinations is the
+		// Bytes->IdentityEntry typed view used everywhere below.
+		using IdentityEntry  = Persistence::IdentityEntry;
+		using KnownDestStore = Persistence::KnownDestStore;
+		using KnownDestTable = Persistence::KnownDestTable;
 
 	private:
-		static IdentityTable _known_destinations;
-		static bool _saving_known_destinations;
-		// Set true whenever _known_destinations is mutated (remember()).
-		// Checked by save_known_destinations() to skip no-op writes when
-		// the cache hasn't changed since the last flush. Lets the
-		// firmware run save_known_destinations() on a tight (~60 s)
-		// interval cheaply, so an unplanned reboot (watchdog, panic)
-		// doesn't drop announces learned in the prior hour.
-		static bool _known_destinations_dirty;
+		static KnownDestStore _known_dest_store;
+		static KnownDestTable _known_destinations;
 		// CBA
 		static uint16_t _known_destinations_maxsize;
 
@@ -154,12 +131,19 @@ namespace RNS {
 		// if the destination isn't in the cache (nothing to pin yet).
 		static bool retain_destination(const Bytes& destination_hash);
 		static Bytes recall_app_data(const Bytes& destination_hash);
+		// Persistence is now per-record (remember()/retain_destination() write
+		// through to the flash tier as they mutate), so there is no full-blob
+		// flush to trigger. Kept as no-ops for the callers (periodic persist job,
+		// diagnostics probe) that still invoke them.
 		static bool save_known_destinations();
-		// Force the next save_known_destinations() to actually write (bypass the
-		// not-dirty fast-path). Diagnostics only — lets a probe measure the
-		// full-blob persist cost on demand instead of waiting for the hourly job.
-		static void mark_known_destinations_dirty() { _known_destinations_dirty = true; }
+		static void mark_known_destinations_dirty() {}
+		// Bring up the known-destinations store (warms the front from the flash
+		// tier) and migrate any legacy known_destinations blob into it once.
 		static void load_known_destinations();
+		// Pump an in-flight persist-tier compaction one slice. Drive from the
+		// host loop so a compaction converges when the announce feed goes quiet
+		// (remember() self-drives it under load). Cheap no-op when idle.
+		static void known_destinations_compact_step();
 		// CBA
 		static void cull_known_destinations();
 
@@ -214,6 +198,9 @@ namespace RNS {
 		inline static uint16_t known_destinations_maxsize() { return _known_destinations_maxsize; }
 		inline static void known_destinations_maxsize(uint16_t known_destinations_maxsize) { _known_destinations_maxsize = known_destinations_maxsize; }
 		inline static size_t known_destinations_count() { return _known_destinations.size(); }
+		// Two-tier store stats (front/persist record counts, write/compaction
+		// counters) for the known-destinations cache — surfaced on /api/diag.
+		inline static KnownDestStore::Stats known_dest_stats() { return _known_dest_store.stats(); }
 
 		inline std::string toString() const { if (!_object) return ""; return "{Identity:" + _object->_hash.toHex() + "}"; }
 

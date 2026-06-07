@@ -218,11 +218,6 @@ namespace RNS {
 			double _last_data_persist = 0.0;
 			double _last_cache_clean = 0.0;
 			double _last_time_persist = 0.0;
-			// Fast-path Identity::_known_destinations flush. Runs at
-			// ~60 s instead of waiting for the full hourly persist_data().
-			// Cheap when nothing has changed (Identity::save_known_destinations
-			// short-circuits on a clean dirty flag).
-			double _last_known_destinations_save = 0.0;
 
 			// CBA
 			double _jobs_last_run = Utilities::OS::time();

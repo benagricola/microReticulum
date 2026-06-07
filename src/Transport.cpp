@@ -184,11 +184,9 @@ using namespace RNS::Persistence;
 // CBA microStore
 /*static*/ uint32_t Transport::_path_store_segment_size = 0;
 /*static*/ uint8_t Transport::_path_store_segment_count = 0;
-#if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
+// Always a two-tier store; the persist tier (flash) is enabled at init() per
+// RNS_PERSIST_PATHS. Segment params size the (optional) persist FileStore.
 /*static*/ PathStore Transport::_path_store(RNS_PATH_TABLE_SEGMENT_SIZE, RNS_PATH_TABLE_SEGMENT_COUNT);
-#else
-/*static*/ PathStore Transport::_path_store;
-#endif
 /*static*/ NewPathTable Transport::_new_path_table(Transport::_path_store);
 
 DestinationEntry empty_destination_entry;
@@ -288,39 +286,45 @@ DestinationEntry empty_destination_entry;
 	// left _path_store uninitialised on endpoint-only nodes — every
 	// announce hit a put-fail and the API path-estimate returned
 	// kind=unknown forever.
-#if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
-	// CBA microStore
-	if (Utilities::OS::get_filesystem()) {
-		INFOF("FileSystem available: %lu", Utilities::OS::get_filesystem().storageAvailable());
-		// Feed the host watchdog from inside microStore's long blocking ops
-		// (compaction record copy, boot index rebuild) so a large compaction
-		// cannot trip the task WDT. Only resets the watchdog - deliberately NOT
-		// run_loop(), which would process announces (puts) and mutate the index
-		// mid-compaction. reset_watchdog() is a no-op off-ESP32.
-		microStore::set_yield_callback([]{ OS::reset_watchdog(); });
-		// CBA Must pass time offset into microStore for accurate timestamps on devices without a real-time clock
+	// The path store is a two-tier store: the PSRAM front is always brought up;
+	// the flash persist tier is enabled per RNS_PERSIST_PATHS, and only when a
+	// filesystem is actually present (else it degrades to PSRAM-only).
+	// Feed the host watchdog from microStore's long blocking ops (compaction
+	// record copy, boot index rebuild) so a big compaction can't trip the task
+	// WDT — deliberately NOT run_loop(), which would mutate the index. And pass
+	// the RTC offset so timestamps/TTLs are correct without a real-time clock.
+	microStore::set_yield_callback([]{ OS::reset_watchdog(); });
 #if defined(ARDUINO)
-		microStore::set_time_offset(Utilities::OS::getTimeOffset() / 1000);
-		// URTN_PATH_STORE_CLEAR_ONCE: build flag that wipes the path store on
-		// boot. microStore has no on-disk format-version check, so when the
-		// segment layout (size/count) changes a stale store written with the
-		// old geometry must be cleared once or its first compaction walks the
-		// old segments. Build with this defined, flash, then rebuild without it.
+	microStore::set_time_offset(Utilities::OS::getTimeOffset() / 1000);
+	const char* path_store_prefix = "/path_store";
+#else
+	const char* path_store_prefix = "path_store";
+#endif
+#if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
+	const bool persist_paths = (bool)Utilities::OS::get_filesystem();
+#else
+	const bool persist_paths = false;
+#endif
+	// URTN_PATH_STORE_CLEAR_ONCE: wipe the persist tier on boot when the segment
+	// geometry changed (microStore has no on-disk format-version check). Build
+	// with it defined once, flash, then rebuild without it.
 #if defined(URTN_PATH_STORE_CLEAR_ONCE)
-		_path_store.init(Utilities::OS::get_filesystem(), "/path_store", true, _path_store_segment_size, _path_store_segment_count);
+	const bool clear_path_store = true;
 #else
-		_path_store.init(Utilities::OS::get_filesystem(), "/path_store", false, _path_store_segment_size, _path_store_segment_count);
+	const bool clear_path_store = false;
 #endif
-#else
-		_path_store.init(Utilities::OS::get_filesystem(), "path_store", false, _path_store_segment_size, _path_store_segment_count);
-#endif
-		// If the filesystem is full then clear the path store since it's of no use full anyway
-		if (Utilities::OS::get_filesystem().storageAvailable() > 0 && Utilities::OS::get_filesystem().storageAvailable() < 1024) {
-			WARNING("FileSystem is full, clearing existing path store");
-			_path_store.clear();
-		}
+	if (persist_paths)
+		INFOF("Path store: persist tier ON (FileSystem avail %lu)", Utilities::OS::get_filesystem().storageAvailable());
+	else
+		INFO("Path store: PSRAM-only (persist tier off)");
+	_path_store.init(Utilities::OS::get_filesystem(), path_store_prefix, persist_paths,
+	                 clear_path_store, _path_store_segment_size, _path_store_segment_count);
+	// If the filesystem is nearly full, clear the persist tier (no use full).
+	if (persist_paths && Utilities::OS::get_filesystem().storageAvailable() > 0
+	    && Utilities::OS::get_filesystem().storageAvailable() < 1024) {
+		WARNING("FileSystem is full, clearing existing path store");
+		_path_store.clear();
 	}
-#endif // RNS_USE_FS && RNS_PERSIST_PATHS
 
 	// Load transport-related data
 	if (Reticulum::transport_enabled()) {
@@ -380,6 +384,11 @@ DestinationEntry empty_destination_entry;
 		jobs();
 		_jobs_last_run = OS::time();
 	}
+	// Pump any in-flight path-store compaction one bounded slice. Under the
+	// announce feed, path put()s already self-drive the compaction; this nudge
+	// converges it when the feed goes quiet so a half-done compaction never
+	// lingers. Cheap no-op when the store is not compacting (or not persisted).
+	_path_store.compact_step();
 }
 
 /*static*/ void Transport::jobs() {
@@ -3243,7 +3252,10 @@ Deregisters an announce handler.
 	else {
 		ttl = DESTINATION_TIMEOUT;
 	}
-	if (!_new_path_table.put(destination_hash.collection(), entry, ttl)) {
+	// Refresh-on-use is a volatile TTL bump of an already-known route, so it
+	// updates the RAM front only (put_front) — it must NOT churn the flash
+	// persist tier. A genuine route change goes through put() (see should_add).
+	if (!_new_path_table.put_front(destination_hash.collection(), entry, ttl)) {
 		TRACEF("refresh_path_use: failed to refresh path entry for %s", destination_hash.toHex().c_str());
 	}
 }

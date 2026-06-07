@@ -250,7 +250,6 @@ void Reticulum::start() {
 	_object->_last_cache_clean = OS::time();
 	_object->_jobs_last_run = OS::time();
 	_object->_last_time_persist = OS::time();
-	_object->_last_known_destinations_save = OS::time();
 }
 
 void Reticulum::loop() {
@@ -315,6 +314,11 @@ void Reticulum::loop() {
 			RNS::Transport::loop();
 			URTN_RL_END(_tt, _loop_txloop_ms);
 			OS::reset_watchdog();
+
+			// Converge any in-flight known-destinations persist-tier compaction
+			// when the announce feed is quiet (remember() self-drives it under
+			// load). Cheap no-op when nothing is compacting.
+			Identity::known_destinations_compact_step();
 		}
 
 		// Perform random number gnerator housekeeping
@@ -363,24 +367,11 @@ void Reticulum::jobs() {
 		persist_data();
 	}
 
-	// Identity::_known_destinations fast-path flush. The full persist_data()
-	// above runs hourly; this tight 60-second flush exists so an unplanned
-	// reboot doesn't drop recently-learned entries. It rewrites the entire
-	// known-destinations blob, so it is only cheap when the set is small (an
-	// endpoint node with a handful of contacts). On a transport/backbone node
-	// the set fills to its cap and the full rewrite freezes the single-threaded
-	// loop for tens of seconds (starving LoRa RX/TX) every interval, so above a
-	// threshold we skip the fast-path and let the hourly persist_data() cover it
-	// (Identity::persist_data() also saves known-destinations). In that regime
-	// the set is re-learned from announces within ~a minute of boot anyway.
-	// save_known_destinations() additionally short-circuits when nothing changed.
-	static constexpr uint16_t KD_SAVE_INTERVAL = 60;
-	static constexpr size_t   KD_FAST_SAVE_MAX = 64;  // entries; above this, rely on hourly persist
-	if (now > _object->_last_known_destinations_save + KD_SAVE_INTERVAL
-			&& Identity::known_destinations_count() <= KD_FAST_SAVE_MAX) {
-		Identity::save_known_destinations();
-		_object->_last_known_destinations_save = now;
-	}
+	// (The old 60-second known-destinations fast-path flush lived here. It
+	// rewrote the entire blob and froze the loop for tens of seconds once the
+	// set filled — the #95 stall. Identity now persists each entry through to
+	// its flash tier as it changes (remember()/retain_destination()), so there
+	// is no batched flush to schedule.)
 
 #ifdef ARDUINO
 #if defined(RNS_USE_FS)

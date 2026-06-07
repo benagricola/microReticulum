@@ -19,11 +19,7 @@
 #include "Bytes.h"
 
 // CBA microStore
-#if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
-#include <microStore/FileStore.h>
-#else
-#include <microStore/HeapStore.h>
-#endif
+#include <microStore/TieredStore.h>   // pulls in HeapStore.h + FileStore.h
 #include <microStore/TypedStore.h>
 #include <microStore/Codec.h>
 
@@ -94,11 +90,11 @@ public:
 //using PathTable = std::map<RNS::Bytes, DestinationEntry>;
 using PathTable = std::map<RNS::Bytes, DestinationEntry, std::less<RNS::Bytes>, Utilities::Memory::ContainerAllocator<std::pair<const RNS::Bytes, DestinationEntry>>>;
 
-#if defined(RNS_USE_FS) && defined(RNS_PERSIST_PATHS)
-using PathStore = microStore::BasicFileStore<Utilities::Memory::ContainerAllocator<uint8_t>>;
-#else
-using PathStore = microStore::BasicHeapStore<Utilities::Memory::ContainerAllocator<uint8_t>>;
-#endif
+// The path store is always a two-tier store: a PSRAM/heap front (always) plus
+// an optional flash persist tier gated at init() by RNS_PERSIST_PATHS. The
+// front absorbs the announce-rate churn; the persist tier only sees genuine
+// route changes (put), while TTL refreshes use put_front and stay in RAM.
+using PathStore = microStore::BasicTieredStore<Utilities::Memory::ContainerAllocator<uint8_t>>;
 using NewPathTable = microStore::TypedStore<Bytes, DestinationEntry, PathStore>;
 
 } }
