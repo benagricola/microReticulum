@@ -87,6 +87,13 @@ namespace RNS {
 		};
 
 		using PathResponse = std::pair<double, Bytes>;
+		// Tree nodes to PSRAM via ContainerAllocator, matching PathTable. On a
+		// transport node this map holds one path-response per recent path-request
+		// tag; with the default allocator its hundreds of nodes (each ~44 B) land
+		// in scarce internal SRAM. Time-bounded by PR_TAG_WINDOW (swept in
+		// announce()), so PSRAM-backing only moves the heap, not the lifetime.
+		using PathResponses = std::map<Bytes, PathResponse, std::less<Bytes>,
+			Utilities::Memory::ContainerAllocator<std::pair<const Bytes, PathResponse>>>;
 
 	public:
 		Destination(Type::NoneConstructor none) {
@@ -215,7 +222,7 @@ namespace RNS {
 		//inline Type::Link::status status() const { assert(_object); return _object->_status; }
 		inline const Callbacks& callbacks() const { assert(_object); return _object->_callbacks; }
 		inline const Identity& identity() const { assert(_object); return _object->_identity; }
-		inline const std::map<Bytes, PathResponse>& path_responses() const { assert(_object); return _object->_path_responses; }
+		inline const PathResponses& path_responses() const { assert(_object); return _object->_path_responses; }
 		inline const std::map<Bytes, RequestHandler>& request_handlers() const { assert(_object); return _object->_request_handlers; }
 
 		// setters
@@ -248,7 +255,7 @@ namespace RNS {
 			Type::Destination::proof_strategies _proof_strategy = Type::Destination::PROVE_NONE;
 			uint16_t _mtu = 0;
 
-			std::map<Bytes, PathResponse> _path_responses;
+			PathResponses _path_responses;
 			std::set<Link> _links;
 
 			Identity _identity;

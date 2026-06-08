@@ -389,15 +389,6 @@ Recall last heard app_data for a destination hash.
 	}
 }
 
-/*static*/ bool Identity::save_known_destinations() {
-	// Per-record persistence: remember()/retain_destination() write each change
-	// straight through to the flash persist tier, so there is no batched blob to
-	// flush. This replaces the old full-table rewrite that froze the loop ~22 s
-	// once the cache filled. Kept (returning success) for the periodic-persist
-	// and diagnostics callers that still invoke it.
-	return true;
-}
-
 /*static*/ void Identity::known_destinations_compact_step() {
 	_known_dest_store.compact_step();
 }
@@ -505,7 +496,12 @@ static uint16_t migrate_legacy_known_destinations(RNS::Persistence::KnownDestTab
 			// Collect first, remove after — remove() mutates the store, which
 			// would invalidate the iterator if done inline. Iterating the typed
 			// view decodes each entry from the PSRAM front (no flash I/O).
-			std::vector<std::pair<double, Bytes>> sorted_keys;
+			// The sort index is PSRAM-backed (ContainerAllocator): at the 500-entry
+			// cap it is ~12 KB, and the component build runs with only ~15-20 KB
+			// free INTERNAL SRAM — a default-allocator vector here narrows that
+			// margin on every cull and can tip a concurrent allocation into OOM.
+			using SortPair = std::pair<double, Bytes>;
+			std::vector<SortPair, Memory::ContainerAllocator<SortPair>> sorted_keys;
 			sorted_keys.reserve(_known_destinations.size());
 			for (auto entry : _known_destinations) {
 				if (entry.value._last_used < 0) continue;  // retained/pinned: never a candidate
@@ -666,16 +662,6 @@ static uint16_t migrate_legacy_known_destinations(RNS::Persistence::KnownDestTab
 		return false;
 	}
 	return false;
-}
-
-/*static*/ void Identity::persist_data() {
-	if (!Transport::reticulum() || !Transport::reticulum().is_connected_to_shared_instance()) {
-		save_known_destinations();
-	}
-}
-
-/*static*/ void Identity::exit_handler() {
-	persist_data();
 }
 
 /*

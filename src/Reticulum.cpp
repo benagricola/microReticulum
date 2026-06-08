@@ -416,7 +416,7 @@ void Reticulum::should_persist_data() {
 void Reticulum::persist_data() {
 	TRACE("Persisting transport and identity data...");
 	Transport::persist_data();
-	Identity::persist_data();
+	// Identity (known destinations) persists per-record now — nothing to flush.
 
 	_object->_last_data_persist = OS::time();
 }

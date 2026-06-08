@@ -131,12 +131,8 @@ namespace RNS {
 		// if the destination isn't in the cache (nothing to pin yet).
 		static bool retain_destination(const Bytes& destination_hash);
 		static Bytes recall_app_data(const Bytes& destination_hash);
-		// Persistence is now per-record (remember()/retain_destination() write
-		// through to the flash tier as they mutate), so there is no full-blob
-		// flush to trigger. Kept as no-ops for the callers (periodic persist job,
-		// diagnostics probe) that still invoke them.
-		static bool save_known_destinations();
-		static void mark_known_destinations_dirty() {}
+		// Known destinations are persisted per-record by remember()/
+		// retain_destination() as they mutate — there is no batched flush.
 		// Bring up the known-destinations store (warms the front from the flash
 		// tier) and migrate any legacy known_destinations blob into it once.
 		static void load_known_destinations();
@@ -179,8 +175,6 @@ namespace RNS {
 		}
 
 		static bool validate_announce(const Packet& packet);
-		static void persist_data();
-		static void exit_handler();
 
 		// getters/setters
 		inline const Bytes& encryptionPrivateKey() const { assert(_object); return _object->_prv_bytes; }
