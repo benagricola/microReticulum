@@ -473,6 +473,10 @@ bool Resource::_build_outgoing(uint16_t link_mdu) {
 	}
 	const uint16_t n_parts = (uint16_t)n_parts32;
 	d._parts_count = n_parts;
+	// One bit per part for distinct-sent tracking (upstream's per-part
+	// part.sent). Drives the AWAITING_PROOF transition in on_request.
+	d._part_sent.assign(n_parts, false);
+	d._distinct_sent = 0;
 
 	d._parts.clear();
 	// Only reserve _parts when we actually hold per-part bytes in memory
@@ -1238,7 +1242,11 @@ void Resource::on_request(const Bytes& body) {
 	if (d._status == Type::Resource::FAILED ||
 	    d._status == Type::Resource::COMPLETE) return;
 
-	if (d._status == Type::Resource::ADVERTISED) {
+	// A REQ means the receiver still wants parts, so resume transferring even
+	// if we'd optimistically moved to AWAITING_PROOF after sending the last
+	// part (upstream Resource.py:975 — any non-TRANSFERRING status resets).
+	if (d._status == Type::Resource::ADVERTISED ||
+	    d._status == Type::Resource::AWAITING_PROOF) {
 		d._status = Type::Resource::TRANSFERRING;
 	}
 	d._last_activity_ms = Utilities::OS::ltime();
@@ -1293,6 +1301,13 @@ void Resource::on_request(const Bytes& body) {
 					part_packet.send();
 					resent++;
 					d._sent_parts++;
+					// Count DISTINCT parts (upstream bumps sent_parts only on a
+					// part's first send) so we know when every part is out.
+					if (i < d._part_sent.size() && !d._part_sent[i]) {
+						d._part_sent[i] = true;
+						d._distinct_sent++;
+					}
+					d._last_part_sent_ms = Utilities::OS::ltime();
 				}
 				catch (const std::exception& e) {
 					ERRORF("on_request: part %u send failed: %s", (unsigned)i, e.what());
@@ -1324,6 +1339,16 @@ void Resource::on_request(const Bytes& body) {
 		if (next_start < d._map_full.size()) {
 			_send_hmu(next_seg);
 		}
+	}
+
+	// Every part has now been sent at least once -> wait only for the proof.
+	// AWAITING_PROOF uses a tight timeout in the watchdog (vs the generous
+	// part-request wait); a later REQ for a missing part flips us back to
+	// TRANSFERRING at the top of on_request. retries_left is reset to the
+	// upstream proof-retry budget (Resource.py:1054-1056).
+	if (d._distinct_sent >= d._parts_count && d._parts_count > 0) {
+		d._status = Type::Resource::AWAITING_PROOF;
+		d._retries_left = 3;
 	}
 }
 
@@ -1480,12 +1505,38 @@ void Resource::tick(uint64_t now_ms) {
 				cancel();
 			}
 		}
-		else if ((d._status == Type::Resource::TRANSFERRING ||
-		          d._status == Type::Resource::AWAITING_PROOF) &&
+		else if (d._status == Type::Resource::TRANSFERRING &&
 		         elapsed > sender_max_wait_ms) {
 			NOTICEF("Resource: transfer timeout, FAILED hash=%s (no receiver activity for %u ms)",
 			        d._hash.toHex().c_str(), (unsigned)elapsed);
 			cancel();
+		}
+		else if (d._status == Type::Resource::AWAITING_PROOF) {
+			// All parts are out; only the small proof remains. Use a tight
+			// timeout (upstream Resource.py:635-654 PROOF_TIMEOUT_FACTOR) rather
+			// than the generous part-request wait above, so a lost proof fails
+			// fast and the LXMF layer re-sends the whole message (the receiver
+			// dedups the re-delivery). A late REQ for a missing part flips us
+			// back to TRANSFERRING in on_request. Upstream also issues a
+			// packet-cache request per retry; that path is a no-op on a 2-node
+			// link, so we omit it and just re-wait the proof window. `rtt` is
+			// the link rtt computed at the top of the watchdog (2.0 s fallback).
+			const uint64_t proof_wait_ms =
+				(uint64_t)((rtt * Type::Resource::PROOF_TIMEOUT_FACTOR +
+				            Type::Resource::SENDER_GRACE_TIME) * 1000.0);
+			if (now_ms > d._last_part_sent_ms + proof_wait_ms) {
+				if (d._retries_left == 0) {
+					NOTICEF("Resource: all parts sent but no proof, FAILED hash=%s",
+					        d._hash.toHex().c_str());
+					cancel();
+				}
+				else {
+					DEBUGF("Resource: proof wait elapsed, %u retries left, hash=%s",
+					       (unsigned)d._retries_left, d._hash.toHex().c_str());
+					d._retries_left--;
+					d._last_part_sent_ms = now_ms;
+				}
+			}
 		}
 	}
 	else {

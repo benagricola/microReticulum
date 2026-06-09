@@ -106,6 +106,15 @@ private:
 	uint16_t _sent_parts        = 0;
 	uint8_t  _retries_left      = Type::Resource::MAX_RETRIES;
 	uint8_t  _adv_retries_left  = Type::Resource::MAX_ADV_RETRIES;
+	// Distinct parts sent (vs _sent_parts, which counts resends too). When
+	// _distinct_sent reaches _parts_count the sender moves to AWAITING_PROOF
+	// and switches to the tight proof-wait timeout. _part_sent[i] guards the
+	// first send of part i (upstream's per-part `part.sent`); sized to
+	// _parts_count in _build_outgoing. _last_part_sent_ms anchors the
+	// AWAITING_PROOF timeout (upstream's last_part_sent), stamped on each send.
+	std::vector<bool> _part_sent;
+	uint16_t _distinct_sent     = 0;
+	uint64_t _last_part_sent_ms = 0;
 
 	// --- Timing (millis since boot, via OS::ltime()) ---
 	uint64_t _last_activity_ms = 0;
