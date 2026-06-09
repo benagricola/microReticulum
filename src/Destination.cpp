@@ -234,6 +234,7 @@ Packet Destination::announce(const Bytes& app_data, bool path_response, const In
 		}
 
 		Bytes announce_data;
+		Bytes ratchet;
 
 /*
 		// CBA TEST
@@ -301,14 +302,15 @@ Packet Destination::announce(const Bytes& app_data, bool path_response, const In
 			//TRACEF("Destination::announce: app data:     %s", new_app_data.toHex().c_str());
 			//TRACEF("Destination::announce: app data text:%s", new_app_data.toString().c_str());
 			// PATCH-OUTBOUND-RATCHET-V1
-			Bytes ratchet;
+			// Matches upstream Destination.py: when ratchets are not enabled for
+			// this destination the announce carries no ratchet field and the
+			// packet context flag stays unset. Destinations with a provider
+			// (LXMF identities) always emit a real ratchet.
 			{
 				uint8_t _ratchet_buf[Type::Identity::RATCHETSIZE/8];
 				if (_lxmf_outbound_ratchet_provider != nullptr &&
 				    _lxmf_outbound_ratchet_provider(_object->_hash.data(), _ratchet_buf)) {
 					ratchet = Bytes(_ratchet_buf, Type::Identity::RATCHETSIZE/8);
-				} else {
-					ratchet = Cryptography::random(Type::Identity::RATCHETSIZE/8);
 				}
 			}
 			signed_data << _object->_hash << _object->_identity.get_public_key() << _object->_name_hash << random_hash << ratchet;
@@ -347,7 +349,8 @@ Packet Destination::announce(const Bytes& app_data, bool path_response, const In
 		//TRACE("Destination::announce: creating announce packet...");
 		//p announce_packet = RNS.Packet(self, announce_data, RNS.Packet.ANNOUNCE, context = announce_context, attached_interface = attached_interface)
 		//Packet announce_packet(*this, announce_data, Type::Packet::ANNOUNCE, announce_context, Type::Transport::BROADCAST, Type::Packet::HEADER_1, nullptr, attached_interface);
-		Packet announce_packet(*this, attached_interface, announce_data, Type::Packet::ANNOUNCE, announce_context, Type::Transport::BROADCAST, Type::Packet::HEADER_1, {Bytes::NONE}, true, Type::Packet::FLAG_SET);
+		Type::Packet::context_flags context_flag = ratchet ? Type::Packet::FLAG_SET : Type::Packet::FLAG_UNSET;
+		Packet announce_packet(*this, attached_interface, announce_data, Type::Packet::ANNOUNCE, announce_context, Type::Transport::BROADCAST, Type::Packet::HEADER_1, {Bytes::NONE}, true, context_flag);
 
 		if (send) {
 			TRACE("Destination::announce: sending announce packet...");
