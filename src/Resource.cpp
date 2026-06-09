@@ -1350,6 +1350,18 @@ void Resource::on_request(const Bytes& body) {
 		d._status = Type::Resource::AWAITING_PROOF;
 		d._retries_left = 3;
 	}
+
+	// Fire the sender-side progress callback (upstream request() does this at
+	// the end of each REQ batch). uR previously only fired progress on the
+	// receiver (on_part), so outbound transfers reported no progress. The
+	// outbound LXMF trampoline reads get_progress() = _sent_parts/_parts_count
+	// to drive the SPA's outbound transfer row, mirroring on_part.
+	if (d._callbacks._progress) {
+		try { d._callbacks._progress(*this); }
+		catch (const std::exception& e) {
+			ERRORF("Resource::on_request: progress callback threw: %s", e.what());
+		}
+	}
 }
 
 
