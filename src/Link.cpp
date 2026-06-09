@@ -395,6 +395,8 @@ void Link::validate_proof(const Packet& packet) {
 						_object->_establishment_rate = _object->_establishment_cost / _object->_rtt;
 					}
 
+					update_keepalive();
+
                     //p rtt_data = umsgpack.packb(self.rtt)
 					MsgPack::Packer packer;
 					packer.serialize(_object->_rtt);
@@ -533,6 +535,15 @@ void Link::update_mdu() {
 	_object->_mdu = floor((_object->_mtu-RNS::Type::Reticulum::IFAC_MIN_SIZE-RNS::Type::Reticulum::HEADER_MINSIZE-RNS::Type::Identity::TOKEN_OVERHEAD)/RNS::Type::Identity::AES128_BLOCKSIZE)*RNS::Type::Identity::AES128_BLOCKSIZE - 1;
 }
 
+void Link::update_keepalive() {
+	assert(_object);
+	//p self.keepalive = max(min(self.rtt*(Link.KEEPALIVE_MAX/Link.KEEPALIVE_MAX_RTT), Link.KEEPALIVE_MAX), Link.KEEPALIVE_MIN)
+	//p self.stale_time = self.keepalive * Link.STALE_FACTOR
+	double scaled = _object->_rtt * ((double)Type::Link::KEEPALIVE_MAX / Type::Link::KEEPALIVE_MAX_RTT);
+	_object->_keepalive = (uint16_t)std::max(std::min(scaled, (double)Type::Link::KEEPALIVE_MAX), (double)Type::Link::KEEPALIVE_MIN);
+	_object->_stale_time = _object->_keepalive * Type::Link::STALE_FACTOR;
+}
+
 void Link::rtt_packet(const Packet& packet) {
 	assert(_object);
 	try {
@@ -552,6 +563,8 @@ void Link::rtt_packet(const Packet& packet) {
 			if (_object->_rtt != 0.0 && _object->_establishment_cost != 0.0 && _object->_rtt > 0 and _object->_establishment_cost > 0) {
 				_object->_establishment_rate = _object->_establishment_cost / _object->_rtt;
 			}
+
+			update_keepalive();
 
 			try {
 				if (_object->_owner.callbacks()._link_established != nullptr) {

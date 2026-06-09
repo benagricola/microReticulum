@@ -195,6 +195,7 @@ namespace RNS {
 		void identify(const Identity& identity);
 		const RequestReceipt request(const Bytes& path, const Bytes& data = {Bytes::NONE}, RequestReceipt::Callbacks::response response_callback = nullptr, RequestReceipt::Callbacks::failed failed_callback = nullptr, RequestReceipt::Callbacks::progress progress_callback = nullptr, double timeout = 0.0);
 		void update_mdu();
+		void update_keepalive();
 		void rtt_packet(const Packet& packet);
 		float get_establishment_rate();
 		uint16_t get_mtu();
