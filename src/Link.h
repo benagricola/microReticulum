@@ -247,6 +247,16 @@ namespace RNS {
 		void register_outgoing_resource(const Resource& resource);
 		void register_incoming_resource(const Resource& resource);
 		bool has_incoming_resource(const Resource& resource);
+		// Window / EIFR carry between consecutive incoming resources
+		// (upstream get_last_resource_window / get_last_resource_eifr,
+		// Link.py:1321-1325). Upstream records the values inside
+		// Link.resource_concluded; the port records them from the Resource
+		// at conclusion time via the setters because terminal resources are
+		// swept out of the in-flight sets by tick_resources instead.
+		uint16_t get_last_resource_window() const;
+		double get_last_resource_eifr() const;
+		void last_resource_window(uint16_t window);
+		void last_resource_eifr(double eifr);
 		void cancel_outgoing_resource(const Resource& resource);
 		void cancel_incoming_resource(const Resource& resource);
 		bool ready_for_new_resource();

@@ -1369,18 +1369,44 @@ void Link::receive(const Packet& packet) {
 					// sender fails cleanly instead of waiting for a timeout.
 					auto passes_embedded_guards = [&]() -> bool {
 						if (adv.compressed())   { send_rcl("compressed (c=1) not supported"); return false; }
-						if (adv.split())        { send_rcl("split (s=1) not supported"); return false; }
 						if (adv.has_metadata()) { send_rcl("metadata (x=1) not supported"); return false; }
 						if (adv.transfer_size() == 0) {
 							send_rcl("zero-size resource"); return false;
 						}
-						if (adv.transfer_size() > RNS::resource_max_incoming()) {
+						//p if adv.l > 1: resource.split = True
+						// Upstream derives split from the segment count, not
+						// the s flag (Resource.py:202); honour either here so
+						// the downstream arithmetic can trust i/l.
+						const bool split = adv.split() || adv.total_segments() > 1;
+						if (split && (adv.total_segments() < 2 ||
+						              adv.segment_index() < 1 ||
+						              adv.segment_index() > adv.total_segments())) {
+							send_rcl("malformed split advertisement"); return false;
+						}
+						// Split (multi-segment) resources are gated on the
+						// FULL advertised data size: upstream's advertisement
+						// carries the whole transfer's uncompressed size in
+						// the `d` field (ResourceAdvertisement, Resource.py:
+						// 1263 `self.d = resource.total_size`), so no
+						// cross-segment usage tracking is needed. Gating on
+						// the per-segment transfer size alone would let
+						// segment 1 pass and run the device out of space on
+						// a later segment. (Resource.cpp's store-append path
+						// still tracks the cumulative size as a backstop
+						// against a sender whose `d` lies.)
+						const uint32_t full_size = split
+							? std::max(adv.data_size(), adv.transfer_size())
+							: adv.transfer_size();
+						if (full_size > RNS::resource_max_incoming()) {
 							send_rcl("transfer size exceeds firmware cap"); return false;
 						}
 						// Flash quota check: only matters for >RAM_BUFFER_THRESHOLD
 						// resources, since heap-backed ones don't consume flash.
-						if (adv.transfer_size() > Type::Resource::RAM_BUFFER_THRESHOLD &&
-						    !flash_quota_can_allocate(adv.transfer_size())) {
+						// For split resources the full size is checked — the
+						// per-segment receive buffer plus the cross-segment
+						// assembly file together approach full_size on disk.
+						if (full_size > Type::Resource::RAM_BUFFER_THRESHOLD &&
+						    !flash_quota_can_allocate(full_size)) {
 							send_rcl("flash quota exhausted"); return false;
 						}
 						return true;
@@ -1923,6 +1949,32 @@ bool Link::has_incoming_resource(const Resource& resource) {
 		}
 	}
 	return false;
+}
+
+//p def get_last_resource_window(self): return self.last_resource_window
+uint16_t Link::get_last_resource_window() const {
+	assert(_object);
+	return _object->_last_resource_window;
+}
+
+//p def get_last_resource_eifr(self): return self.last_resource_eifr
+double Link::get_last_resource_eifr() const {
+	assert(_object);
+	return _object->_last_resource_eifr;
+}
+
+// Upstream records these inside Link.resource_concluded (Link.py:1286-1290)
+// while removing the concluded incoming resource; the port's terminal
+// resources are swept by tick_resources instead, so the Resource itself
+// records them through these setters when it concludes.
+void Link::last_resource_window(uint16_t window) {
+	assert(_object);
+	_object->_last_resource_window = window;
+}
+
+void Link::last_resource_eifr(double eifr) {
+	assert(_object);
+	_object->_last_resource_eifr = eifr;
 }
 
 void Link::cancel_outgoing_resource(const Resource& resource) {

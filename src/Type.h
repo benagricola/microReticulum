@@ -553,17 +553,13 @@ namespace RNS { namespace Type {
 		// it is to be handled within reasonable
 		// time constraint, even on small systems.
 		#
-		// A small system in this regard is
-		// defined as a Raspberry Pi, which should
-		// be able to compress, encrypt and hash-map
-		// the resource in about 10 seconds.
-		#
 		// This constant will be used when determining
 		// how to sequence the sending of large resources.
 		#
 		// Capped at 16777215 (0xFFFFFF) per segment to
 		// fit in 3 bytes in resource advertisements.
-		static const uint32_t MAX_EFFICIENT_SIZE      = 16 * 1024 * 1024 - 1;
+		// Upstream RNS 1.1.4 Resource.py:116 (1 MiB - 1).
+		static const uint32_t MAX_EFFICIENT_SIZE      = 1 * 1024 * 1024 - 1;
 		static const uint8_t RESPONSE_MAX_GRACE_TIME = 10;
 		
 		// The maximum size to auto-compress with

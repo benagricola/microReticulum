@@ -89,6 +89,14 @@ namespace RNS {
         float _expected_rate = 0.0;
 		Type::Link::teardown_reason _teardown_reason = Type::Link::TEARDOWN_NONE;
 
+		// Window / EIFR observed by the last concluded incoming resource on
+		// this link (upstream Link.py:243-244 last_resource_window /
+		// last_resource_eifr). Seeds the next incoming resource — notably
+		// the next segment of a split transfer — so it doesn't restart from
+		// the cold-start window. 0 means "not recorded yet" (upstream None).
+		uint16_t _last_resource_window = 0;
+		double   _last_resource_eifr   = 0.0;
+
 		Cryptography::Token::Ptr _token;
 
 		// Consecutive Link::decrypt() failures on this link. Bumped by

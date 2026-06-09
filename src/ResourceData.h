@@ -35,10 +35,10 @@ public:
 private:
 	// --- Identity ---
 	Link  _link;                                  // Underlying Link this resource transfers over
-	Bytes _hash;                                  // 16 B truncated resource hash
+	Bytes _hash;                                  // 32 B resource hash (this segment)
 	Bytes _random_hash;                           // 4 B salt
 	Bytes _expected_proof;                        // 32 B SHA-256 of (data || hash); sender uses to verify PRF
-	Bytes _original_hash;                         // 16 B; for single-segment == _hash
+	Bytes _original_hash;                         // 32 B first-segment hash; for single-segment == _hash
 	Bytes _request_id;                            // 16 B; empty for non-request resources
 
 	// --- Payload state ---
@@ -71,14 +71,20 @@ private:
 	// Receiver side: per-part received flag and sliding window state.
 	std::vector<bool>  _parts_received;
 
-	uint32_t _transfer_size  = 0;                 // _t in ADV (post-encrypt bytes on wire)
-	uint32_t _data_size      = 0;                 // _d in ADV (uncompressed; equals _t in our port)
+	uint32_t _transfer_size  = 0;                 // _t in ADV (post-encrypt bytes on wire, this segment)
+	uint32_t _data_size      = 0;                 // _d in ADV — upstream resource.total_size: the FULL
+	                                              // uncompressed data size of the whole transfer
 	uint16_t _parts_count    = 0;                 // _n in ADV
 	uint16_t _sdu            = 0;                 // bytes per part (derived from Link MDU)
 
-	// Single-segment port: these are fixed at 1/1/false.
-	uint8_t _segment_index   = 1;
-	uint8_t _total_segments  = 1;
+	// Multi-segment (split) transfer state, upstream Resource.py
+	// segment_index / total_segments / split. Resources whose data
+	// exceeds MAX_EFFICIENT_SIZE are transferred as total_segments
+	// consecutive Resource instances over the same link; _data_size
+	// carries the FULL transfer size while _transfer_size is
+	// per-segment.
+	uint32_t _segment_index  = 1;
+	uint32_t _total_segments = 1;
 	bool    _is_split        = false;
 	bool    _is_request      = false;
 	bool    _is_response     = false;
@@ -134,6 +140,24 @@ private:
 	// Empty string indicates in-memory mode; cleared back to empty on
 	// COMPLETE / FAILED / cancel after the underlying file is unlinked.
 	std::string _ciphertext_path;
+
+	// --- Multi-segment transfer files ---
+	// Sender side: the full plaintext of a split transfer, spilled to a
+	// temp file at construction (upstream's tempfile.TemporaryFile +
+	// input_file, Resource.py:271-312). Each segment's _build_outgoing
+	// reads its MAX_EFFICIENT_SIZE slice from this file; ownership of
+	// the path moves to the next segment when it is prepared, and the
+	// final segment (or any failure) unlinks it. Empty when not split.
+	std::string _input_path;
+	// Receiver side: cross-segment cleartext accumulation file, keyed on
+	// the advertisement's original_hash like upstream's storagepath
+	// (Resource.py:197 resourcepath/<original_hash.hex>). Each segment's
+	// assembled cleartext is appended on completion (upstream assemble()
+	// opens it "ab"); the final segment reads the whole file back into
+	// _plaintext for the concluded callback and unlinks it. Kept on disk
+	// between segments so a multi-MiB transfer never dwells fully in RAM
+	// mid-transfer. Empty when not split.
+	std::string _segment_store_path;
 
 	// --- Rate tracking for airtime-aware window timeout ---
 	// `_eifr_bps` is the Effective Interface Rate in bits/sec — the

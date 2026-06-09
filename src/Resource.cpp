@@ -26,6 +26,7 @@
 #include <MsgPack.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <string>
 
@@ -287,8 +288,8 @@ bool RNS::ResourceAdvertisement::unpack(const Bytes& body) {
 		else if (key == "h") { if (!r.read_bin_or_nil(_h)) return false; got_h = true; }
 		else if (key == "r") { if (!r.read_bin_or_nil(_r)) return false; got_r = true; }
 		else if (key == "o") { if (!r.read_bin_or_nil(_o)) return false; got_o = true; }
-		else if (key == "i") { uint32_t v; if (!r.read_uint(v)) return false; _i = uint8_t(v); got_i = true; }
-		else if (key == "l") { uint32_t v; if (!r.read_uint(v)) return false; _l = uint8_t(v); got_l = true; }
+		else if (key == "i") { uint32_t v; if (!r.read_uint(v)) return false; _i = v; got_i = true; }
+		else if (key == "l") { uint32_t v; if (!r.read_uint(v)) return false; _l = v; got_l = true; }
 		else if (key == "q") { if (!r.read_bin_or_nil(_q)) return false; got_q = true; }
 		else if (key == "f") { uint32_t v; if (!r.read_uint(v)) return false; _f = uint8_t(v); got_f = true; }
 		else if (key == "m") { if (!r.read_bin_or_nil(_m)) return false; got_m = true; }
@@ -346,8 +347,8 @@ Resource::Resource(const Bytes& data, const Link& link, bool advertise /*= true*
 	_object->_callbacks._concluded = callback;
 	_object->_callbacks._progress  = progress_callback;
 	_object->_encrypted         = data;     // _build_outgoing replaces this with the ciphertext
-	_object->_segment_index     = (uint8_t)segment_index;
-	_object->_total_segments    = 1;        // single-segment port; always 1
+	_object->_segment_index     = (uint32_t)segment_index;
+	_object->_total_segments    = 1;
 	_object->_is_split          = false;
 	_object->_original_hash     = (original_hash.size() > 0 ? original_hash : Bytes());
 	_object->_request_id        = request_id;
@@ -360,7 +361,67 @@ Resource::Resource(const Bytes& data, const Link& link, bool advertise /*= true*
 	_object->_status            = Type::Resource::NONE;
 	_object->_last_activity_ms  = Utilities::OS::ltime();
 
-	if (advertise) {
+	//p if not hasattr(data, "read") and self.metadata_size + len(data) > Resource.MAX_EFFICIENT_SIZE:
+	//p     ... data = tempfile.TemporaryFile(); data.write(original_data) ...
+	//p self.total_segments = ((self.total_size-1)//Resource.MAX_EFFICIENT_SIZE)+1
+	// (Resource.py:271-312) Data larger than MAX_EFFICIENT_SIZE is spilled
+	// to an input file under the resource-tmp dir and transferred as
+	// consecutive segments; this constructor builds segment 1, and each
+	// proven non-final segment chains the next via _advertise_next_segment.
+	// Metadata is never sent by this port, so upstream's metadata_size is 0
+	// and every non-final segment's slice is exactly MAX_EFFICIENT_SIZE.
+	bool split_prep_failed = false;
+	const size_t MES = Type::Resource::MAX_EFFICIENT_SIZE;
+	if (data.size() > MES) {
+		_object->_total_segments = (uint32_t)(((data.size() - 1) / MES) + 1);
+		_object->_is_split       = true;
+		//p self.total_size = data_size + self.metadata_size
+		_object->_data_size      = (uint32_t)data.size();
+
+		static uint64_t input_counter = 0;
+		char path[256];
+		snprintf(path, sizeof(path), "%s/snd_in_%llu_%llu.bin",
+		         RNS::resource_tmp_path(),
+		         (unsigned long long)Utilities::OS::ltime(),
+		         (unsigned long long)(++input_counter));
+		bool spill_ok = false;
+		try {
+			microStore::File f = Utilities::OS::open_file(
+				path, microStore::File::ModeReadWrite);
+			if (f) {
+				// Chunked write with WDT resets — the input can be several
+				// MiB and a single multi-MiB write could outlast the task
+				// watchdog window on slow flash.
+				size_t written = 0;
+				const size_t CHUNK = 64 * 1024;
+				while (written < data.size()) {
+					const size_t n = std::min(CHUNK, data.size() - written);
+					if (f.write(data.data() + written, n) != n) break;
+					written += n;
+					Utilities::OS::reset_watchdog();
+				}
+				f.flush();
+				f.close();
+				spill_ok = (written == data.size());
+				if (!spill_ok) Utilities::OS::remove_file(path);
+			}
+		}
+		catch (const std::exception& e) {
+			ERRORF("Resource: input spill failed: %s", e.what());
+		}
+		if (spill_ok) {
+			_object->_input_path = path;
+			// Segment 1 covers [0, MAX_EFFICIENT_SIZE).
+			_object->_encrypted = Bytes(data.data(), MES);
+		}
+		else {
+			ERROR("Resource: could not spill split-transfer input; resource not advertised");
+			split_prep_failed = true;
+			_object->_status = Type::Resource::FAILED;
+		}
+	}
+
+	if (advertise && !split_prep_failed) {
 		const uint16_t link_mdu = const_cast<Link&>(link).get_mdu();
 		if (_build_outgoing(link_mdu)) {
 			_send_advertisement();
@@ -426,15 +487,25 @@ bool Resource::_build_outgoing(uint16_t link_mdu) {
 	Utilities::OS::reset_watchdog();
 	d._encrypted    = encrypted;
 	d._transfer_size = (uint32_t)encrypted.size();
-	d._data_size     = d._transfer_size;   // _d == _t (no compression in this port)
+	//p self.d = resource.total_size  # Total uncompressed data size
+	// (Resource.py:281,316,1263) `d` carries the FULL plaintext size of the
+	// whole transfer — for split resources the constructor /
+	// _advertise_next_segment preset it to the all-segments total; for
+	// single-segment resources it is this segment's plaintext size.
+	if (!d._is_split) d._data_size = (uint32_t)plaintext.size();
 
 	BO_HEAP("post-encrypt");
 
 	{
+		// Sender-side mirror of the receiver's ADV gate: refuse to build a
+		// transfer the peer-side firmware cap could never accept. For split
+		// resources gate on the FULL data size, since that is what the
+		// receiver's guard checks against its cap.
 		const size_t firmware_cap = RNS::resource_max_incoming();
-		if (d._transfer_size > firmware_cap) {
+		const uint32_t gate_size = std::max(d._transfer_size, d._data_size);
+		if (gate_size > firmware_cap) {
 			ERRORF("Resource: transfer size %u exceeds firmware cap %u",
-			       (unsigned)d._transfer_size,
+			       (unsigned)gate_size,
 			       (unsigned)firmware_cap);
 			return false;
 		}
@@ -650,6 +721,38 @@ void Resource::_release_ciphertext_file() {
 	d._ciphertext_path.clear();
 }
 
+void Resource::_release_input_file() {
+	assert(_object);
+	auto& d = *_object;
+	if (d._input_path.empty()) return;
+	try {
+		if (Utilities::OS::file_exists(d._input_path.c_str())) {
+			Utilities::OS::remove_file(d._input_path.c_str());
+		}
+	}
+	catch (const std::exception& e) {
+		WARNINGF("Resource: unlink '%s' threw: %s",
+		         d._input_path.c_str(), e.what());
+	}
+	d._input_path.clear();
+}
+
+void Resource::_release_segment_store() {
+	assert(_object);
+	auto& d = *_object;
+	if (d._segment_store_path.empty()) return;
+	try {
+		if (Utilities::OS::file_exists(d._segment_store_path.c_str())) {
+			Utilities::OS::remove_file(d._segment_store_path.c_str());
+		}
+	}
+	catch (const std::exception& e) {
+		WARNINGF("Resource: unlink '%s' threw: %s",
+		         d._segment_store_path.c_str(), e.what());
+	}
+	d._segment_store_path.clear();
+}
+
 void Resource::_send_advertisement() {
 	assert(_object);
 	auto& d = *_object;
@@ -689,6 +792,10 @@ void Resource::_send_advertisement() {
 	catch (const std::exception& e) {
 		ERRORF("Resource: ADV send failed: %s", e.what());
 		d._status = Type::Resource::FAILED;
+		// A resource that never got its ADV out won't reach any other
+		// terminal path; drop its spill files here.
+		_release_ciphertext_file();
+		_release_input_file();
 		return;
 	}
 
@@ -746,7 +853,11 @@ Resource Resource::accept(const ResourceAdvertisement& adv, const Link& link,
 	d._is_request      = adv.is_request();
 	d._is_response     = adv.is_response();
 	d._compressed      = adv.compressed();
-	d._is_split        = adv.split();
+	//p if adv.l > 1: resource.split = True
+	//p else: resource.split = False
+	// (Resource.py:202-203) Upstream derives split from the segment count,
+	// not from the s flag.
+	d._is_split        = (adv.total_segments() > 1);
 	d._has_metadata    = adv.has_metadata();
 	d._encrypted_flag  = adv.encrypted();
 	// Resource SDU mirrors the sender's: mtu - HEADER_MAXSIZE - IFAC_MIN_SIZE
@@ -757,6 +868,80 @@ Resource Resource::accept(const ResourceAdvertisement& adv, const Link& link,
 		d._sdu = link_mtu
 			? (uint16_t)(link_mtu - Type::Reticulum::HEADER_MAXSIZE - Type::Reticulum::IFAC_MIN_SIZE)
 			: const_cast<Link&>(link).get_mdu();
+	}
+
+	//p previous_window = resource.link.get_last_resource_window()
+	//p previous_eifr   = resource.link.get_last_resource_eifr()
+	//p if previous_window: resource.window = previous_window
+	//p if previous_eifr: resource.previous_eifr = previous_eifr
+	// (Resource.py:214-219) Seed from the last concluded incoming resource
+	// on this link — notably the previous segment of a split transfer — so
+	// the window / rate don't restart from cold. previous_eifr lands
+	// directly in _eifr_bps: update_eifr() only overwrites it once a real
+	// observation exists, which is exactly when upstream stops consulting
+	// its previous_eifr fallback.
+	{
+		const uint16_t previous_window = link.get_last_resource_window();
+		const double   previous_eifr   = link.get_last_resource_eifr();
+		if (previous_window > 0) d._window = previous_window;
+		if (previous_eifr > 0.0) d._eifr_bps = previous_eifr;
+	}
+
+	//p resource.storagepath = RNS.Reticulum.resourcepath+"/"+resource.original_hash.hex()
+	// Cross-segment accumulation file. Upstream ties the segments of a
+	// split transfer together purely through this original_hash-keyed file
+	// on disk — there is no other receiver-side cross-segment state
+	// (Resource.py:197 sets the path, assemble() appends at 697-699, the
+	// final segment reads it back and unlinks at 726-733).
+	if (d._is_split) {
+		char store[256];
+		snprintf(store, sizeof(store), "%s/seg_%s.bin",
+		         RNS::resource_tmp_path(),
+		         d._original_hash.toHex().substr(0, 32).c_str());
+		d._segment_store_path = store;
+		if (d._segment_index <= 1) {
+			// Fresh transfer: drop any stale leftover colliding on the
+			// path (paranoia — original_hash is salted per transfer).
+			try {
+				if (Utilities::OS::file_exists(store)) Utilities::OS::remove_file(store);
+			}
+			catch (const std::exception&) {}
+		}
+		else {
+			// Divergence from upstream, which appends blindly and leaves
+			// orphaned files to a periodic cache cleaner the port doesn't
+			// have: a continuation segment is only acceptable when the
+			// store already holds exactly the previous segments' cleartext
+			// — every non-final segment is exactly MAX_EFFICIENT_SIZE
+			// bytes (metadata is never accepted). Anything else means a
+			// missed segment (reboot, cleanup), so the assembled file
+			// could only ever be garbage; refuse now instead of burning
+			// minutes of airtime first. The FAILED status makes the
+			// dispatch in Link::receive answer the ADV with RESOURCE_RCL.
+			size_t store_size = 0;
+			bool store_present = false;
+			try {
+				if (Utilities::OS::file_exists(store)) {
+					microStore::File f = Utilities::OS::open_file(
+						store, microStore::File::ModeRead);
+					if (f) {
+						store_size = f.size();
+						store_present = true;
+						f.close();
+					}
+				}
+			}
+			catch (const std::exception&) {}
+			const size_t expected =
+				(size_t)(d._segment_index - 1) * (size_t)Type::Resource::MAX_EFFICIENT_SIZE;
+			if (!store_present || store_size != expected) {
+				ERRORF("Resource::accept: continuation segment %u/%u but segment store holds %zu bytes (expected %zu); refusing",
+				       (unsigned)d._segment_index, (unsigned)d._total_segments,
+				       store_present ? store_size : (size_t)0, expected);
+				d._status = Type::Resource::FAILED;
+				return r;
+			}
+		}
 	}
 
 	// Allocate the receive buffer. Heap below RAM_BUFFER_THRESHOLD,
@@ -1083,11 +1268,27 @@ void Resource::on_proof(const Bytes& proof) {
 		d._status = Type::Resource::COMPLETE;
 		d._last_activity_ms = Utilities::OS::ltime();
 		DEBUGF("Resource: PRF matched, COMPLETE hash=%s", d._hash.toHex().c_str());
-		if (d._callbacks._concluded) {
-			try { d._callbacks._concluded(*this); }
-			catch (const std::exception& e) {
-				ERRORF("Resource::on_proof: concluded callback threw: %s", e.what());
+		//p if self.segment_index == self.total_segments:
+		//p     # If all segments were processed, we'll
+		//p     # signal that the resource sending concluded
+		// (Resource.py:777-792) Only the FINAL segment fires the
+		// application's concluded callback; upstream then closes the
+		// input file (the port unlinks its on-disk equivalent).
+		if (d._segment_index == d._total_segments) {
+			if (d._callbacks._concluded) {
+				try { d._callbacks._concluded(*this); }
+				catch (const std::exception& e) {
+					ERRORF("Resource::on_proof: concluded callback threw: %s", e.what());
+				}
 			}
+			_release_input_file();
+		}
+		//p else: # Otherwise we'll recursively create the
+		//p       # next segment of the resource
+		// (Resource.py:793-810) A proven non-final segment chains the next
+		// segment over the same link, with no application callback.
+		else {
+			_advertise_next_segment();
 		}
 	}
 	else {
@@ -1100,10 +1301,107 @@ void Resource::on_proof(const Bytes& proof) {
 				ERRORF("Resource::on_proof: concluded callback threw: %s", e.what());
 			}
 		}
+		// A corrupt proof ends the whole transfer; the remaining
+		// segments will never be read out of the input file.
+		_release_input_file();
 	}
 	// Either way, the spilled ciphertext is no longer useful — the
 	// receiver has either acknowledged everything or rejected us.
 	_release_ciphertext_file();
+}
+
+//p def __prepare_next_segment(self):
+void Resource::_advertise_next_segment() {
+	assert(_object);
+	auto& d = *_object;
+	const uint32_t next_index = d._segment_index + 1;
+	//p RNS.log(f"Preparing segment {self.segment_index+1} of {self.total_segments} for resource {self}", RNS.LOG_DEBUG)
+	DEBUGF("Resource: preparing segment %u of %u for transfer %s",
+	       (unsigned)next_index, (unsigned)d._total_segments,
+	       d._original_hash.toHex().c_str());
+
+	//p self.next_segment = Resource(self.input_file, self.link,
+	//p     callback=self.callback, segment_index=self.segment_index+1,
+	//p     original_hash=self.original_hash,
+	//p     progress_callback=self.__progress_callback,
+	//p     request_id=self.request_id, is_response=self.is_response,
+	//p     advertise=False, ...)
+	// (Resource.py:754-769) Upstream prepares the next segment on a worker
+	// thread while the current one transfers; the port has no threads, so
+	// preparation happens here on proof validation — upstream's own
+	// single-threaded fallback path (Resource.py:796-798).
+	Resource next(Bytes(), d._link, /*advertise=*/false, /*auto_compress=*/false,
+	              d._callbacks._concluded, d._callbacks._progress, d._timeout,
+	              (int)next_index, d._original_hash, d._request_id, d._is_response);
+	auto& nd = *next._object;
+	nd._is_split       = true;
+	nd._total_segments = d._total_segments;
+	nd._data_size      = d._data_size;       // full transfer size, constant across segments
+	//p self.input_file = data  (ownership of the spill file moves along the chain)
+	nd._input_path     = d._input_path;
+	d._input_path.clear();
+
+	// Read the next segment's slice out of the input spill file. Layout
+	// matches the constructor: with metadata_size always 0, upstream's
+	// first_read_size equals MAX_EFFICIENT_SIZE, so segment k covers
+	// [(k-1)*MAX_EFFICIENT_SIZE, k*MAX_EFFICIENT_SIZE) (Resource.py:300-311).
+	bool ok = false;
+	const size_t MES = Type::Resource::MAX_EFFICIENT_SIZE;
+	try {
+		microStore::File f = Utilities::OS::open_file(
+			nd._input_path.c_str(), microStore::File::ModeRead);
+		if (f) {
+			const size_t total  = f.size();
+			const size_t offset = (size_t)(next_index - 1) * MES;
+			if (offset < total &&
+			    f.seek((uint32_t)offset, microStore::SeekModeSet) >= 0) {
+				const size_t length = std::min(MES, total - offset);
+				uint8_t* dst = nd._encrypted.writable(length);
+				if (dst != nullptr) {
+					size_t got = 0;
+					while (got < length) {
+						const size_t n = f.read(dst + got, length - got);
+						if (n == 0 || n == (size_t)-1) break;
+						got += n;
+						Utilities::OS::reset_watchdog();
+					}
+					ok = (got == length);
+				}
+			}
+			f.close();
+		}
+	}
+	catch (const std::exception& e) {
+		ERRORF("Resource: next-segment read failed: %s", e.what());
+	}
+
+	if (ok) {
+		const uint16_t link_mdu = const_cast<Link&>(nd._link).get_mdu();
+		ok = next._build_outgoing(link_mdu);
+	}
+	//p self.next_segment.advertise()
+	if (ok) {
+		next._send_advertisement();
+		ok = (next.status() == Type::Resource::ADVERTISED);
+	}
+	if (!ok) {
+		// Divergence from upstream, where a failed next-segment
+		// preparation dies silently on its worker thread and the transfer
+		// stalls into the receiver's timeout: we are on the caller's call
+		// path and CAN report, so fail the chained segment loudly and let
+		// the application's concluded callback see it.
+		ERRORF("Resource: could not prepare segment %u of %u; transfer failed",
+		       (unsigned)next_index, (unsigned)d._total_segments);
+		next._release_ciphertext_file();
+		next._release_input_file();
+		nd._status = Type::Resource::FAILED;
+		if (nd._callbacks._concluded) {
+			try { nd._callbacks._concluded(next); }
+			catch (const std::exception& e) {
+				ERRORF("Resource::_advertise_next_segment: concluded callback threw: %s", e.what());
+			}
+		}
+	}
 }
 
 const Bytes& Resource::plaintext() const {
@@ -1127,11 +1425,27 @@ void Resource::_assemble_and_deliver() {
 	// receive doesn't reboot the device.
 	Utilities::OS::reset_watchdog();
 
+	//p self.last_resource_window = resource.window
+	//p self.last_resource_eifr = resource.eifr
+	// Upstream records these inside Link.resource_concluded
+	// (Link.py:1285-1290) while the resource is still registered, on
+	// COMPLETE and CORRUPT alike (assemble() concludes on every outcome,
+	// Resource.py:712). Both values are final once assembly starts, so the
+	// port records them up front — they seed the next incoming resource,
+	// notably the next segment of a split transfer.
+	d._link.last_resource_window(d._window);
+	d._link.last_resource_eifr(d._eifr_bps);
+
 	// Decrypt the assembled ciphertext via the Link key, then strip the
 	// random_hash prefix the sender prepended before encryption. This
 	// matches RNS Resource.py assemble(): decrypt the stream, strip the
 	// random hash, *then* verify the content hash over the plaintext.
 	const Bytes assembled = d._buffer->read_all();
+	// The per-segment receive buffer's job ends here. Discard now so the
+	// flash temp file + quota are released before the next segment's ADV
+	// guard runs, instead of at sweep-time destruction. (read_all returned
+	// either a copy or a shared handle to the heap data, both safe.)
+	d._buffer->discard();
 	Utilities::OS::reset_watchdog();
 	Bytes decrypted;
 	try {
@@ -1140,73 +1454,195 @@ void Resource::_assemble_and_deliver() {
 	}
 	catch (const std::exception& e) {
 		ERRORF("Resource: Link.decrypt failed: %s", e.what());
-		d._status = Type::Resource::CORRUPT;
-		if (d._callbacks._concluded) {
-			try { d._callbacks._concluded(*this); }
-			catch (const std::exception& cb_e) {
-				ERRORF("Resource::_assemble: concluded callback threw: %s", cb_e.what());
-			}
-		}
+		_conclude_corrupt_segment();
 		return;
 	}
 	if (decrypted.size() < Type::Resource::RANDOM_HASH_SIZE) {
 		ERROR("Resource: decrypted body too short to contain random_hash prefix");
-		d._status = Type::Resource::CORRUPT;
+		_conclude_corrupt_segment();
 		return;
 	}
-	d._plaintext = Bytes(decrypted.data() + Type::Resource::RANDOM_HASH_SIZE,
-	                     decrypted.size() - Type::Resource::RANDOM_HASH_SIZE);
+	// This SEGMENT's cleartext. Only becomes _plaintext directly for
+	// single-segment transfers — for split transfers it is appended to
+	// the cross-segment store, and _plaintext is the full concatenation
+	// loaded back on the final segment.
+	Bytes seg_plaintext(decrypted.data() + Type::Resource::RANDOM_HASH_SIZE,
+	                    decrypted.size() - Type::Resource::RANDOM_HASH_SIZE);
 
 	// Verify the resource hash over the *plaintext* payload + random_hash
-	// salt, full 32-byte SHA-256 — matching upstream RNS (Resource.py:694)
+	// salt, full 32-byte SHA-256 — matching upstream RNS (Resource.py:683)
 	// and the sender's `Identity::full_hash(plaintext + random_hash)`.
 	const Bytes computed_hash =
-		Identity::full_hash(d._plaintext + d._random_hash);
+		Identity::full_hash(seg_plaintext + d._random_hash);
 	Utilities::OS::reset_watchdog();
 	if (computed_hash != d._hash) {
 		WARNINGF("Resource: assembled hash mismatch for %s — corrupt",
 		         d._hash.toHex().c_str());
-		d._status = Type::Resource::CORRUPT;
+		_conclude_corrupt_segment();
+		return;
+	}
+
+	//p proof = RNS.Identity.full_hash(self.data+self.hash)
+	// The proof covers this SEGMENT's cleartext; compute it before
+	// _plaintext is (for the final segment) replaced by the full
+	// concatenation.
+	const Bytes proof = Identity::full_hash(seg_plaintext + d._hash);
+
+	//p self.file = open(self.storagepath, "ab"); self.file.write(data)
+	// (Resource.py:697-699) Append the verified segment cleartext to the
+	// cross-segment store so a multi-MiB transfer never dwells fully in
+	// RAM between segments.
+	if (d._is_split) {
+		bool append_ok = false;
+		try {
+			microStore::File f = Utilities::OS::open_file(
+				d._segment_store_path.c_str(), microStore::File::ModeAppend);
+			if (f) {
+				// Defense the advertised `d` gate can't give us: a sender
+				// could advertise a small full-size yet keep chaining
+				// 1 MiB segments. Track the cumulative store size and
+				// abort (RESOURCE_RCL + cleanup via cancel()) when it
+				// would exceed the firmware cap.
+				const size_t store_size = f.size();
+				if (store_size + seg_plaintext.size() > RNS::resource_max_incoming()) {
+					f.close();
+					NOTICEF("Resource: cumulative split size %zu exceeds firmware cap; aborting",
+					        store_size + seg_plaintext.size());
+					cancel();
+					return;
+				}
+				size_t written = 0;
+				const size_t CHUNK = 64 * 1024;
+				while (written < seg_plaintext.size()) {
+					const size_t n = std::min(CHUNK, seg_plaintext.size() - written);
+					if (f.write(seg_plaintext.data() + written, n) != n) break;
+					written += n;
+					Utilities::OS::reset_watchdog();
+				}
+				f.flush();
+				f.close();
+				append_ok = (written == seg_plaintext.size());
+			}
+		}
+		catch (const std::exception& e) {
+			ERRORF("Resource: segment store append failed: %s", e.what());
+		}
+		if (!append_ok) {
+			ERRORF("Resource: could not persist segment %u/%u; aborting transfer",
+			       (unsigned)d._segment_index, (unsigned)d._total_segments);
+			cancel();   // sends RESOURCE_RCL, releases the store, fires FAILED
+			return;
+		}
+	}
+
+	d._status = Type::Resource::COMPLETE;
+	d._last_activity_ms = Utilities::OS::ltime();
+	DEBUGF("Resource: assembled %s (%zu plaintext bytes, segment %u/%u)",
+	       d._hash.toHex().c_str(), seg_plaintext.size(),
+	       (unsigned)d._segment_index, (unsigned)d._total_segments);
+
+	// Send the PRF before firing the callback — the sender wants to know
+	// we got the bytes before we go off and process them, otherwise its
+	// MAX_RETRIES timer might fire while we're still on the callback.
+	// (Upstream order too: prove() precedes the final-segment delivery,
+	// Resource.py:702 vs :714.)
+	_send_proof(proof);
+	Utilities::OS::reset_watchdog();
+
+	//p if self.segment_index == self.total_segments:
+	if (d._segment_index == d._total_segments) {
+		if (d._is_split) {
+			//p self.data = open(self.storagepath, "rb") ... os.unlink(self.storagepath)
+			// (Resource.py:726-733) Load the full concatenation back for
+			// the data()/plaintext() accessors the concluded callback
+			// reads, then drop the store.
+			seg_plaintext = Bytes();
+			decrypted = Bytes();
+			bool load_ok = false;
+			try {
+				microStore::File f = Utilities::OS::open_file(
+					d._segment_store_path.c_str(), microStore::File::ModeRead);
+				if (f) {
+					const size_t total = f.size();
+					uint8_t* dst = d._plaintext.writable(total);
+					if (dst != nullptr) {
+						size_t got = 0;
+						while (got < total) {
+							const size_t n = f.read(dst + got, total - got);
+							if (n == 0 || n == (size_t)-1) break;
+							got += n;
+							Utilities::OS::reset_watchdog();
+						}
+						load_ok = (got == total);
+					}
+					f.close();
+				}
+			}
+			catch (const std::exception& e) {
+				ERRORF("Resource: segment store read-back failed: %s", e.what());
+			}
+			_release_segment_store();
+			if (!load_ok) {
+				// The proof is already out (the sender legitimately
+				// completed its job); only the local hand-off failed.
+				ERROR("Resource: could not load assembled split transfer; delivering FAILED");
+				d._plaintext = Bytes();
+				d._status = Type::Resource::FAILED;
+			}
+		}
+		else {
+			d._plaintext = seg_plaintext;
+		}
+
+		if (d._callbacks._concluded) {
+			try { d._callbacks._concluded(*this); }
+			catch (const std::exception& e) {
+				ERRORF("Resource::_assemble: concluded callback threw: %s", e.what());
+			}
+			// The concluded callback in LXMFGateway writes any attachment
+			// blobs to LittleFS, which can block for hundreds of ms on
+			// fragmented flash. Reset again on the way out.
+			Utilities::OS::reset_watchdog();
+		}
+	}
+	else {
+		//p RNS.log("Resource segment "+str(self.segment_index)+" of "+str(self.total_segments)+" received, waiting for next segment to be announced", RNS.LOG_DEBUG)
+		// (Resource.py:737-738) Non-final segment: no application callback;
+		// the segment's bytes live in the store until the final segment.
+		DEBUGF("Resource: segment %u of %u received, waiting for next segment to be announced",
+		       (unsigned)d._segment_index, (unsigned)d._total_segments);
+	}
+}
+
+// Terminal CORRUPT helper for the receive-assembly paths. Upstream fires
+// the application callback from assemble() only when segment_index ==
+// total_segments (Resource.py:714-729); a corrupt non-final segment just
+// logs and leaves the rest to the sender's proof timeout. Divergence from
+// upstream: the cross-segment store is released here in every corrupt
+// case (the transfer can never complete once a segment is corrupt) —
+// upstream leaves the file to a periodic cache cleaner the port doesn't
+// have.
+void Resource::_conclude_corrupt_segment() {
+	auto& d = *_object;
+	d._status = Type::Resource::CORRUPT;
+	_release_segment_store();
+	if (d._segment_index == d._total_segments) {
 		if (d._callbacks._concluded) {
 			try { d._callbacks._concluded(*this); }
 			catch (const std::exception& e) {
 				ERRORF("Resource::_assemble: concluded callback threw: %s", e.what());
 			}
 		}
-		return;
-	}
-
-	d._status = Type::Resource::COMPLETE;
-	d._last_activity_ms = Utilities::OS::ltime();
-	DEBUGF("Resource: assembled %s (%zu plaintext bytes)",
-	       d._hash.toHex().c_str(), d._plaintext.size());
-
-	// Send the PRF before firing the callback — the sender wants to know
-	// we got the bytes before we go off and process them, otherwise its
-	// MAX_RETRIES timer might fire while we're still on the callback.
-	_send_proof();
-	Utilities::OS::reset_watchdog();
-
-	if (d._callbacks._concluded) {
-		try { d._callbacks._concluded(*this); }
-		catch (const std::exception& e) {
-			ERRORF("Resource::_assemble: concluded callback threw: %s", e.what());
-		}
-		// The concluded callback in LXMFGateway writes any attachment
-		// blobs to LittleFS, which can block for hundreds of ms on
-		// fragmented flash. Reset again on the way out.
-		Utilities::OS::reset_watchdog();
 	}
 }
 
-void Resource::_send_proof() {
+void Resource::_send_proof(const Bytes& proof) {
 	auto& d = *_object;
-	// PRF body = resource_hash(32) || SHA-256(plaintext || hash), matching
-	// upstream RNS (Resource.py:755-756). The proof is computed over the
-	// decrypted plaintext, and the resource hash prefix lets the sender
-	// route the proof to the right outgoing resource. The sender
-	// pre-computed the proof tail at build time as _expected_proof.
-	const Bytes proof = Identity::full_hash(d._plaintext + d._hash);
+	// PRF body = resource_hash(32) || SHA-256(segment plaintext || hash),
+	// matching upstream RNS (Resource.py:744-745). The resource hash
+	// prefix lets the sender route the proof to the right outgoing
+	// resource; the sender pre-computed the proof tail at build time as
+	// _expected_proof.
 	Bytes body;
 	body.append(d._hash);
 	body.append(proof);
@@ -1398,9 +1834,6 @@ void Resource::_send_hmu(uint8_t segment_index) {
 }
 
 
-void Resource::validate_proof(const Bytes& proof_data) {
-}
-
 // --------------------------------------------------------------------------
 // Cancel paths + timeout watchdog
 // --------------------------------------------------------------------------
@@ -1424,8 +1857,13 @@ void Resource::cancel() {
 	}
 	d._status = Type::Resource::FAILED;
 	if (d._buffer) d._buffer->discard();
-	// Sender's spilled ciphertext (if any) is no longer needed.
+	// Spill files are no longer needed: the sender's ciphertext + split
+	// input file, and the receiver's cross-segment store (a cancelled
+	// segment ends the whole split transfer). All idempotent no-ops when
+	// the respective path is empty.
 	_release_ciphertext_file();
+	_release_input_file();
+	_release_segment_store();
 	DEBUGF("Resource: cancelled (%s side) hash=%s",
 	       d._initiator ? "sender" : "receiver", d._hash.toHex().c_str());
 
@@ -1450,6 +1888,9 @@ void Resource::on_initiator_cancel(const Bytes& sender_hash) {
 	        d._hash.toHex().c_str());
 	d._status = Type::Resource::FAILED;
 	if (d._buffer) d._buffer->discard();
+	// The sender abandoning any segment ends the whole split transfer;
+	// drop the cross-segment store with it.
+	_release_segment_store();
 	if (d._callbacks._concluded) {
 		try { d._callbacks._concluded(*this); }
 		catch (const std::exception& e) {
@@ -1470,6 +1911,11 @@ void Resource::on_receiver_cancel(const Bytes& receiver_hash) {
 	NOTICEF("Resource: received RCL (receiver refused) hash=%s",
 	        d._hash.toHex().c_str());
 	d._status = Type::Resource::FAILED;
+	// The refused segment ends the whole transfer: drop the spilled
+	// ciphertext (previously leaked on this path) and, for split
+	// transfers, the full-plaintext input file.
+	_release_ciphertext_file();
+	_release_input_file();
 	if (d._callbacks._concluded) {
 		try { d._callbacks._concluded(*this); }
 		catch (const std::exception& e) {
@@ -1612,39 +2058,54 @@ void Resource::tick(uint64_t now_ms) {
 
 /*
 :returns: The current progress of the resource transfer as a *float* between 0.0 and 1.0.
+
+Port of upstream get_progress (Resource.py:1107-1162): split transfers
+report WHOLE-transfer progress by counting each prior segment as
+ceil(MAX_EFFICIENT_SIZE/sdu) parts and scaling a short (final) segment up
+by the same factor. The sender counts DISTINCT parts sent (upstream bumps
+sent_parts only on a part's first send), not resends.
 */
 float Resource::get_progress() const {
 	assert(_object);
 	const auto& d = *_object;
-	if (d._parts_count == 0) return 0.0f;
-	const uint16_t done = d._initiator ? d._sent_parts : d._received_count;
-	if (done >= d._parts_count) return 1.0f;
-	return (float)done / (float)d._parts_count;
-}
-/*
-	// Original (Python-style) implementation kept for reference. Single-
-	// segment only is the firmware's stance, so the segment-index +
-	// total_size math is unused; the simple done/total ratio above is
-	// equivalent for our s=1, non-split case.
-	assert(_object);
-	if (_object->_initiator) {
-		_object->_processed_parts = (_object->_segment_index-1)*math.ceil(Type::Resource::MAX_EFFICIENT_SIZE/Type::Resource::SDU);
-		_object->_processed_parts += _object->sent_parts;
-		_object->_progress_total_parts = float(_object->grand_total_parts);
+	//p if self.status == RNS.Resource.COMPLETE and self.segment_index == self.total_segments: return 1.0
+	if (d._status == Type::Resource::COMPLETE &&
+	    d._segment_index == d._total_segments) return 1.0f;
+	if (d._parts_count == 0 || d._sdu == 0) return 0.0f;
+
+	const double done = d._initiator ? (double)d._distinct_sent
+	                                 : (double)d._received_count;
+	double processed_parts;
+	double progress_total_parts;
+	if (!d._is_split) {
+		//p self.processed_parts = self.sent_parts / self.received_count
+		//p self.progress_total_parts = float(self.total_parts)
+		processed_parts      = done;
+		progress_total_parts = (double)d._parts_count;
 	}
 	else {
-		_object->_processed_parts = (_object->_segment_index-1)*math.ceil(Type::Resource::MAX_EFFICIENT_SIZE/Type::Resource::SDU);
-		_object->_processed_parts += _object->_received_count;
-		if (_object->split) {
-			_object->progress_total_parts = float(math.ceil(_object->total_size/Type::Resource::SDU));
+		//p max_parts_per_segment = math.ceil(Resource.MAX_EFFICIENT_SIZE/self.sdu)
+		//p previously_processed_parts = processed_segments*max_parts_per_segment
+		//p if current_segment_parts < max_parts_per_segment:
+		//p     current_segment_factor = max_parts_per_segment / current_segment_parts
+		//p else: current_segment_factor = 1
+		//p self.processed_parts = previously_processed_parts + <done>*current_segment_factor
+		//p self.progress_total_parts = self.total_segments*max_parts_per_segment
+		const double max_parts_per_segment =
+			std::ceil((double)Type::Resource::MAX_EFFICIENT_SIZE / (double)d._sdu);
+		const double previously_processed_parts =
+			(double)(d._segment_index - 1) * max_parts_per_segment;
+		double current_segment_factor = 1.0;
+		if ((double)d._parts_count < max_parts_per_segment) {
+			current_segment_factor = max_parts_per_segment / (double)d._parts_count;
 		}
-		else {
-			_object->progress_total_parts = float(_object->total_parts);
-		}
+		processed_parts      = previously_processed_parts + done * current_segment_factor;
+		progress_total_parts = (double)d._total_segments * max_parts_per_segment;
 	}
 
-	return (float)_object->processed_parts / (float)_object->progress_total_parts;
-*/
+	//p progress = min(1.0, self.processed_parts / self.progress_total_parts)
+	return (float)std::min(1.0, processed_parts / progress_total_parts);
+}
 
 void Resource::set_concluded_callback(Callbacks::concluded callback) {
 	assert(_object);
@@ -1668,6 +2129,22 @@ std::string Resource::toString() const {
 const Bytes& Resource::hash() const {
 	assert(_object);
 	return _object->_hash;
+}
+
+const Bytes& Resource::original_hash() const {
+	assert(_object);
+	return _object->_original_hash;
+}
+
+uint32_t Resource::segment_index() const {
+	assert(_object);
+	return _object->_segment_index;
+}
+
+//p def get_segments(self): return self.total_segments
+uint32_t Resource::total_segments() const {
+	assert(_object);
+	return _object->_total_segments;
 }
 
 const Bytes& Resource::request_id() const {

@@ -111,6 +111,16 @@ namespace RNS {
 		// CORRUPT branches, and the destructor for safety. Idempotent.
 		void _release_ciphertext_file();
 
+		// Sender-side (split transfers): unlink the full-plaintext input
+		// spill file. Called when the final segment is proven or any
+		// segment fails/cancels. Idempotent.
+		void _release_input_file();
+
+		// Receiver-side (split transfers): unlink the cross-segment
+		// cleartext accumulation file. Called when the final segment is
+		// delivered or the transfer fails/cancels mid-way. Idempotent.
+		void _release_segment_store();
+
 		// Receiver: ingest an incoming RESOURCE part packet. Computes the
 		// part's map_hash, locates the corresponding slot, writes data
 		// into the ResourceBuffer at part_index*sdu. If the window is now
@@ -187,9 +197,30 @@ namespace RNS {
 		// callback retrieval, fires the concluded callback, sends PRF.
 		void _assemble_and_deliver();
 
-		// Receiver-only: emit the RESOURCE_PRF packet so the sender
-		// can transition to COMPLETE.
-		void _send_proof();
+		// Receiver-only: terminal CORRUPT handling shared by the assembly
+		// failure paths. Releases the cross-segment store and fires the
+		// concluded callback only on the final segment (upstream assemble()
+		// gates the callback on segment_index == total_segments).
+		void _conclude_corrupt_segment();
+
+		// Receiver-only: emit the RESOURCE_PRF packet (resource_hash ||
+		// proof) so the sender can transition to COMPLETE. The proof is
+		// computed by the caller over the SEGMENT's plaintext (for split
+		// transfers _plaintext later holds the full concatenation, which
+		// must not feed the per-segment proof).
+		void _send_proof(const Bytes& proof);
+
+		// Sender-only (split transfers): port of upstream
+		// __prepare_next_segment + the validate_proof non-final branch
+		// (Resource.py:754-769, 793-810). Reads the next segment's slice
+		// from the input spill file, constructs the next Resource over the
+		// same link with the same callbacks / original_hash / request_id,
+		// hands it ownership of the input file, and advertises it.
+		// Upstream prepares the next segment on a worker thread while the
+		// current one transfers; the port has no threads, so preparation
+		// happens here on proof validation (upstream's own single-threaded
+		// fallback path).
+		void _advertise_next_segment();
 
 	public:
 //p def hashmap_update_packet(self, plaintext):
@@ -201,7 +232,7 @@ namespace RNS {
 //p def __watchdog_job(self):
 //p def assemble(self):
 //p def prove(self):
-		void validate_proof(const Bytes& proof_data);
+//p def validate_proof(self, proof_data):
 //p def receive_part(self, packet):
 //p def request_next(self):
 //p def request(self, request_data):
@@ -222,6 +253,14 @@ namespace RNS {
 
 		// getters
 		const Bytes& hash() const;
+		// First-segment hash, constant across all segments of a split
+		// transfer (upstream resource.original_hash); equals hash() for
+		// single-segment resources. Lets callers correlate the per-segment
+		// Resource instances of one logical transfer.
+		const Bytes& original_hash() const;
+		uint32_t segment_index() const;
+		//p def get_segments(self): return self.total_segments
+		uint32_t total_segments() const;
 		const Bytes& request_id() const;
 		const Bytes& data() const;
 		const Type::Resource::status status() const;
@@ -275,8 +314,8 @@ namespace RNS {
 		const Bytes&   hash()           const { return _h; }
 		const Bytes&   random_hash()    const { return _r; }
 		const Bytes&   original_hash()  const { return _o; }
-		uint8_t        segment_index()  const { return _i; }
-		uint8_t        total_segments() const { return _l; }
+		uint32_t       segment_index()  const { return _i; }
+		uint32_t       total_segments() const { return _l; }
 		const Bytes&   request_id()     const { return _q; }
 		uint8_t        flags()          const { return _f; }
 		const Bytes&   hashmap()        const { return _m; }
@@ -302,22 +341,22 @@ namespace RNS {
 		void set_hash(const Bytes& h)             { _h = h; }
 		void set_random_hash(const Bytes& r)      { _r = r; }
 		void set_original_hash(const Bytes& o)    { _o = o; }
-		void set_segment_index(uint8_t i)         { _i = i; }
-		void set_total_segments(uint8_t l)        { _l = l; }
+		void set_segment_index(uint32_t i)        { _i = i; }
+		void set_total_segments(uint32_t l)       { _l = l; }
 		void set_request_id(const Bytes& q)       { _q = q; }
 		void set_flags(uint8_t f)                 { _f = f; }
 		void set_hashmap(const Bytes& m)          { _m = m; }
 
 	private:
 		const Link* _link = nullptr;  // see set_link(); not serialized
-		uint32_t _t = 0;   // transfer size (on-wire, after encryption)
-		uint32_t _d = 0;   // data size (uncompressed; equal to _t since c=0)
-		uint16_t _n = 0;   // number of parts
-		Bytes    _h;       // 16 B resource hash
+		uint32_t _t = 0;   // transfer size (on-wire per segment, after encryption)
+		uint32_t _d = 0;   // FULL uncompressed data size of the whole transfer
+		uint16_t _n = 0;   // number of parts (this segment)
+		Bytes    _h;       // 32 B resource hash (this segment)
 		Bytes    _r;       // 4  B random salt
-		Bytes    _o;       // 16 B original (first-segment) hash; equals _h
-		uint8_t  _i = 1;   // segment index (always 1 in this port)
-		uint8_t  _l = 1;   // total segments (always 1 in this port)
+		Bytes    _o;       // 32 B original (first-segment) hash; equals _h when l=1
+		uint32_t _i = 1;   // segment index (1-based)
+		uint32_t _l = 1;   // total segments
 		Bytes    _q;       // empty (nil-on-wire) for non-request resources
 		uint8_t  _f = 0;   // flag byte (see FLAG_* above)
 		Bytes    _m;       // hashmap bytes (n * 4)
