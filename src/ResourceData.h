@@ -90,7 +90,17 @@ private:
 	int32_t  _consecutive_completed_height = -1;
 	uint16_t _received_count    = 0;
 	uint16_t _outstanding_parts = 0;
-	uint16_t _window            = Type::Resource::WINDOW;  // fixed at 4 for this port
+	// Adaptive sliding window, ported from upstream RNS Resource.py. Starts at
+	// WINDOW(4) and grows toward _window_max on each fully-satisfied window;
+	// shrinks on a part timeout. _window_min ratchets up with the window;
+	// _window_max ramps between WINDOW_MAX_VERY_SLOW(4)/SLOW(10)/FAST(75) by the
+	// measured per-request data rate (_req_data_rtt_rate, bytes/sec).
+	uint16_t _window            = Type::Resource::WINDOW;
+	uint16_t _window_min        = Type::Resource::WINDOW_MIN;
+	uint16_t _window_max        = Type::Resource::WINDOW_MAX_SLOW;
+	uint8_t  _fast_rate_rounds      = 0;
+	uint8_t  _very_slow_rate_rounds = 0;
+	double   _req_data_rtt_rate     = 0.0;
 
 	// --- Sender progress ---
 	uint16_t _sent_parts        = 0;

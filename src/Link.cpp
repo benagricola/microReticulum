@@ -132,6 +132,7 @@ Link::Link(const Destination& destination /*= {Type::NONE}*/, Callbacks::establi
 		start_watchdog();
 		_object->_packet.send();
 		had_outbound();
+		Transport::count_link_initiated();
 		DEBUGF("Link request %s sent to %s", _object->_link_id.toHex().c_str(), _object->_destination.toString().c_str());
 		TRACEF("Establishment timeout is %f for link request %s", _object->_establishment_timeout, _object->_link_id.toHex().c_str());
 	}
@@ -313,6 +314,7 @@ void Link::prove() {
 	// CBA TODO: Determine which approach is better, passing liunk to packet or passing _link_destination
 	Packet proof(*this, proof_data, Type::Packet::PROOF, Type::Packet::LRPROOF);
 	proof.send();
+	Transport::count_lrproof_sent();
 	_object->_establishment_cost += proof.raw().size();
 	had_outbound();
 }
@@ -336,6 +338,7 @@ void Link::prove_packet(const Packet& packet) {
 void Link::validate_proof(const Packet& packet) {
 	assert(_object);
 	DEBUGF("Link %s validating proof", link_id().toHex().c_str());
+	Transport::count_lrproof_rx();
 	try {
 		if (_object->_status == Type::Link::PENDING) {
 			Bytes packet_data(packet.data());
@@ -381,6 +384,7 @@ void Link::validate_proof(const Packet& packet) {
 					else _object->_mtu = RNS::Type::Reticulum::MTU;
 					update_mdu();
 					_object->_status = Type::Link::ACTIVE;
+					Transport::count_link_active();
 					_object->_activated_at = OS::time();
 					_object->_last_proof = _object->_activated_at;
 					Transport::activate_link(*this);

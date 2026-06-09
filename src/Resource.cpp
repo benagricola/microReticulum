@@ -981,9 +981,43 @@ void Resource::on_part(const Packet& part_packet) {
 		_assemble_and_deliver();
 	}
 	else if (d._outstanding_parts == 0) {
-		// Window done; recompute EIFR from observed throughput before
-		// firing the next REQ so future window timeouts reflect the
-		// link's real (possibly airtime-throttled) rate.
+		// Window fully satisfied: grow the sliding window and ramp window_max by
+		// the measured rate, faithful to upstream RNS Resource.py:889-913.
+		// Grow the window (+1) up to window_max, ratcheting window_min by the
+		// flexibility so the min trails the window.
+		if (d._window < d._window_max) {
+			d._window += 1;
+			if ((d._window - d._window_min) > (Type::Resource::WINDOW_FLEXIBILITY - 1)) {
+				d._window_min += 1;
+			}
+		}
+		// Measure the per-request data rate (bytes/sec) over the window that just
+		// completed, then ramp window_max between the fast / very-slow tiers.
+		if (d._req_sent_ms > 0) {
+			const double rtt_s = (double)(Utilities::OS::ltime() - d._req_sent_ms) / 1000.0;
+			const uint64_t req_transferred = (d._rtt_rxd_bytes > d._rtt_rxd_bytes_at_part_req)
+				? (d._rtt_rxd_bytes - d._rtt_rxd_bytes_at_part_req) : 0;
+			if (rtt_s > 0.0) {
+				d._req_data_rtt_rate = (double)req_transferred / rtt_s;
+				if (d._req_data_rtt_rate > (double)Type::Resource::RATE_FAST
+						&& d._fast_rate_rounds < Type::Resource::FAST_RATE_THRESHOLD) {
+					d._fast_rate_rounds += 1;
+					if (d._fast_rate_rounds == Type::Resource::FAST_RATE_THRESHOLD) {
+						d._window_max = Type::Resource::WINDOW_MAX_FAST;
+					}
+				}
+				if (d._fast_rate_rounds == 0
+						&& d._req_data_rtt_rate < (double)Type::Resource::RATE_VERY_SLOW
+						&& d._very_slow_rate_rounds < Type::Resource::VERY_SLOW_RATE_THRESHOLD) {
+					d._very_slow_rate_rounds += 1;
+					if (d._very_slow_rate_rounds == Type::Resource::VERY_SLOW_RATE_THRESHOLD) {
+						d._window_max = Type::Resource::WINDOW_MAX_VERY_SLOW;
+					}
+				}
+			}
+		}
+		// Recompute EIFR from observed throughput before firing the next REQ so
+		// future window timeouts reflect the link's real (airtime-throttled) rate.
 		update_eifr();
 		send_part_request();
 	}
@@ -1485,8 +1519,20 @@ void Resource::tick(uint64_t now_ms) {
 		if (elapsed > window_timeout_ms) {
 			if (d._retries_left > 0) {
 				d._retries_left--;
-				DEBUGF("Resource: REQ retry (%u left, window_timeout=%u ms, eifr=%.0f bps)",
-				       (unsigned)d._retries_left,
+				// Shrink the window on a part timeout so a struggling link
+				// converges to a smaller, more reliable window — faithful to
+				// upstream RNS Resource.py:612-617.
+				if (d._window > d._window_min) {
+					d._window -= 1;
+					if (d._window_max > d._window_min) {
+						d._window_max -= 1;
+						if ((d._window_max - d._window) > (Type::Resource::WINDOW_FLEXIBILITY - 1)) {
+							d._window_max -= 1;
+						}
+					}
+				}
+				DEBUGF("Resource: REQ retry (%u left, window=%u/%u, window_timeout=%u ms, eifr=%.0f bps)",
+				       (unsigned)d._retries_left, (unsigned)d._window, (unsigned)d._window_max,
 				       (unsigned)window_timeout_ms, d._eifr_bps);
 				d._outstanding_parts = 0;
 				send_part_request();

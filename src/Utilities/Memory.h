@@ -21,6 +21,7 @@
 #include <memory>
 #include <map>
 #include <set>
+#include <deque>
 
 #define RNS_HEAP_ALLOCATOR 0		 // Use HEAP for allocator
 #define RNS_HEAP_POOL_ALLOCATOR 1	 // Use HEAP pool for allocator
@@ -194,6 +195,8 @@ namespace RNS { namespace Utilities {
 		using ContainerMap = std::map<K, V, std::less<K>, ContainerAllocator<std::pair<const K, V>>>;
 		template <typename T>
 		using ContainerSet = std::set<T, std::less<T>, ContainerAllocator<T>>;
+		template <typename T>
+		using ContainerDeque = std::deque<T, ContainerAllocator<T>>;
 
 	};
 

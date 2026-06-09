@@ -83,7 +83,12 @@ using namespace RNS::Persistence;
 #endif
 
 #ifndef RNS_PR_TAGS_MAX
-#define RNS_PR_TAGS_MAX	 32
+// Upstream RNS keeps max_pr_tags = 32000 most-recent path-request tags to
+// suppress duplicate path requests. 32 (the old value) forgot seen tags almost
+// immediately and re-processed/re-broadcast duplicates upstream would suppress.
+// 4096 is a large PSRAM-backed dedup window (a deliberate MCU bound below
+// upstream's 32000 to cap the PSRAM cost) culled FIFO-by-recency like upstream.
+#define RNS_PR_TAGS_MAX	 4096
 #endif
 
 /*static*/ Transport::InterfaceTable Transport::_interfaces;
@@ -105,6 +110,7 @@ using namespace RNS::Persistence;
 
 /*static*/ Transport::PathRequestTable Transport::_discovery_path_requests;
 /*static*/ Utilities::Memory::ContainerSet<Bytes> Transport::_discovery_pr_tags;
+/*static*/ Utilities::Memory::ContainerDeque<Bytes> Transport::_discovery_pr_tags_order;
 
 /*static*/ std::set<Destination> Transport::_control_destinations;
 /*static*/ std::set<Bytes> Transport::_control_hashes;
@@ -175,6 +181,11 @@ using namespace RNS::Persistence;
 /*static*/ uint32_t Transport::_link_transit_fwd = 0;
 /*static*/ uint32_t Transport::_link_transit_fwd_lora = 0;
 /*static*/ uint32_t Transport::_link_transit_drop = 0;
+/*static*/ uint32_t Transport::_links_initiated = 0;
+/*static*/ uint32_t Transport::_lrproofs_sent = 0;
+/*static*/ uint32_t Transport::_lrproofs_rx = 0;
+/*static*/ uint32_t Transport::_links_active = 0;
+/*static*/ uint32_t Transport::_path_reqs_originated = 0;
 /*static*/ size_t Transport::_last_memory = 0;
 /*static*/ size_t Transport::_last_psram = 0;
 /*static*/ size_t Transport::_last_flash = 0;
@@ -602,11 +613,13 @@ DestinationEntry empty_destination_entry;
 				_packet_hashlist.erase(_packet_hashlist.begin(), iter);
 			}
 
-			// Cull the path request tags list if it has reached its max size
-			if (_discovery_pr_tags.size() > _max_pr_tags) {
-				std::set<Bytes>::iterator iter = _discovery_pr_tags.begin();
-				std::advance(iter, _discovery_pr_tags.size() - _max_pr_tags);
-				_discovery_pr_tags.erase(_discovery_pr_tags.begin(), iter);
+			// Cull the path-request tags FIFO-by-recency (drop the OLDEST first),
+			// matching upstream's discovery_pr_tags[len-max:] slice. The membership
+			// set is value-ordered, so the insertion-order deque drives the cull:
+			// pop the oldest tag off the front and erase it from the set.
+			while (_discovery_pr_tags_order.size() > _max_pr_tags) {
+				_discovery_pr_tags.erase(_discovery_pr_tags_order.front());
+				_discovery_pr_tags_order.pop_front();
 			}
 
 			if (OS::time() > (_tables_last_culled + _tables_cull_interval)) {
@@ -3573,6 +3586,7 @@ will announce it.
 	}
 
 	packet.send();
+	count_path_req_originated();
 	// Bound _path_requests (embedded divergence: upstream relies solely on the
 	// DESTINATION_TIMEOUT cull, which is a day long and so unbounded in practice
 	// under high-cardinality, sustained traffic). When at capacity, evict the oldest
@@ -3633,8 +3647,8 @@ will announce it.
 				//TRACEF("Transport::path_request_handler: unique_tag: %s", unique_tag.toHex().c_str());
 
 				if (_discovery_pr_tags.find(unique_tag) == _discovery_pr_tags.end()) {
-					// CBA ACCUMULATES
 					_discovery_pr_tags.insert(unique_tag);
+					_discovery_pr_tags_order.push_back(unique_tag);  // FIFO order for the recency-based cull
 
 					path_request(
 						destination_hash,
@@ -3855,10 +3869,15 @@ TRACEF("announce_packet str: %s", announce_packet.toString().c_str());
 			}});
 
 			for (auto& [hash, interface] : _interfaces) {
-				// CBA EXPERIMENTAL forwarding path requests even on requestor interface in order to support
-				//  path-finding over LoRa mesh
-				//if (interface != attached_interface) {
-				if (true) {
+				// Rebroadcast the search on every interface EXCEPT the one it
+				// arrived on, matching upstream RNS (Transport.py path_request).
+				// The earlier local divergence re-broadcast onto the arrival
+				// interface too ("EXPERIMENTAL ... LoRa mesh"), which just doubles
+				// traffic for the common single-peer-per-interface topology and
+				// adds to backbone/LoRa load; the cross-interface rebroadcast
+				// (e.g. LoRa request -> rebroadcast onto TCP) is what actually
+				// discovers the path.
+				if (interface != attached_interface) {
 					TRACEF("Transport::path_request: requesting path on interface %s", interface.toString().c_str());
 					// Use the previously extracted tag from this path request
 					// on the new path requests as well, to avoid potential loops

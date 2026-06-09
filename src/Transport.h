@@ -434,6 +434,35 @@ namespace RNS {
 		inline static uint32_t link_transit_fwd()      { return _link_transit_fwd; }
 		inline static uint32_t link_transit_fwd_lora() { return _link_transit_fwd_lora; }
 		inline static uint32_t link_transit_drop()     { return _link_transit_drop; }
+		// Link-handshake stage counters (diagnostic). Bisect a stuck direct-link
+		// establishment: initiated = we sent a LINKREQUEST (initiator); proofs_sent
+		// = we answered an inbound link request with an LRPROOF (responder);
+		// proofs_rx = an LRPROOF arrived and we entered validate_proof (initiator);
+		// active = a link we initiated reached ACTIVE (proof validated).
+		inline static uint32_t links_initiated() { return _links_initiated; }
+		inline static uint32_t lrproofs_sent()   { return _lrproofs_sent; }
+		inline static uint32_t lrproofs_rx()     { return _lrproofs_rx; }
+		inline static uint32_t links_active()    { return _links_active; }
+		// Counter increments are compiled out unless URTN_LINK_DIAG is defined
+		// (enable via PLATFORMIO_BUILD_FLAGS="-DURTN_LINK_DIAG", like the other
+		// URTN_*_DIAG gates). The accessors + members stay so /api/diag can read
+		// them unconditionally (they just read 0 in a production build).
+#if defined(URTN_LINK_DIAG)
+		inline static void count_link_initiated()    { ++_links_initiated; }
+		inline static void count_lrproof_sent()      { ++_lrproofs_sent; }
+		inline static void count_lrproof_rx()        { ++_lrproofs_rx; }
+		inline static void count_link_active()       { ++_links_active; }
+		inline static void count_path_req_originated() { ++_path_reqs_originated; }
+#else
+		inline static void count_link_initiated()    {}
+		inline static void count_lrproof_sent()      {}
+		inline static void count_lrproof_rx()        {}
+		inline static void count_link_active()       {}
+		inline static void count_path_req_originated() {}
+#endif
+		// Every request_path() call (path requests this node originates/rebroadcasts
+		// onto all interfaces, incl. LoRa). Diagnostic for AP-mode LoRa saturation.
+		inline static uint32_t path_reqs_originated() { return _path_reqs_originated; }
 
 	private:
 		// Refresh-on-use for a path entry, mirroring upstream
@@ -465,7 +494,8 @@ namespace RNS {
 		static Utilities::Memory::ContainerMap<Bytes, uint8_t> _path_states;	// Per-destination path state (RNS path_states); separate small in-memory map, not the flash path store
 
 		static PathRequestTable _discovery_path_requests;	// A table for keeping track of path requests on behalf of other nodes
-		static Utilities::Memory::ContainerSet<Bytes> _discovery_pr_tags;	// A table for keeping track of tagged path requests
+		static Utilities::Memory::ContainerSet<Bytes> _discovery_pr_tags;	// A table for keeping track of tagged path requests (membership)
+		static Utilities::Memory::ContainerDeque<Bytes> _discovery_pr_tags_order;	// Insertion order for _discovery_pr_tags, so the cull is FIFO-by-recency (upstream keeps the most-recent max_pr_tags)
 
 		// Transport control destinations are used
 		// for control purposes like path requests
@@ -532,6 +562,11 @@ namespace RNS {
 		static uint32_t _link_transit_fwd;
 		static uint32_t _link_transit_fwd_lora;
 		static uint32_t _link_transit_drop;
+		static uint32_t _links_initiated;
+		static uint32_t _lrproofs_sent;
+		static uint32_t _lrproofs_rx;
+		static uint32_t _links_active;
+		static uint32_t _path_reqs_originated;
 		static size_t _last_memory;
 		static size_t _last_psram;
 		static size_t _last_flash;

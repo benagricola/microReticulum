@@ -197,22 +197,21 @@ void Interface::received_announce() {
 
 double Interface::incoming_announce_frequency() {
 	assert(_impl);
-	// Ported from RNS Interface.py:279-288. Frequency (Hz) of inbound announces
-	// across the ring, with the same decay side-effect (pop the oldest sample
-	// once it ages past AR_FREQ_DECAY).
-	size_t n = _impl->_ia_freq_ring.size();
-	if (!(n > Type::Interface::IC_DEQUE_MIN_SAMPLE)) {
+	// Faithful to upstream RNS Interface.py:212-227. The ia_freq ring is bounded
+	// by its maxlen (IA_FREQ_SAMPLES); upstream's telescoping delta-sum
+	// (sum of consecutive deltas + (now - newest)) collapses to (now - oldest),
+	// so the average inbound-announce frequency is dq_len / (now - oldest).
+	// (The previous version gated on >2 samples and popped the oldest sample once
+	// it aged past a decay window — both local additions absent from upstream.)
+	size_t dq_len = _impl->_ia_freq_ring.size();
+	if (!(dq_len > 1)) {
 		return 0;
 	}
-	double oldest = _impl->_ia_freq_ring.front();
-	double span = OS::time() - oldest;
-	if (span > (double)Type::Interface::AR_FREQ_DECAY) {
-		_impl->_ia_freq_ring.pop_front();
-	}
-	if (span <= 0) {
+	double delta_sum = OS::time() - _impl->_ia_freq_ring.front();
+	if (delta_sum == 0) {
 		return 0;
 	}
-	return (double)n / span;
+	return (double)dq_len / delta_sum;
 }
 
 bool Interface::should_ingress_limit() {
@@ -228,12 +227,17 @@ bool Interface::should_ingress_limit() {
 		: (double)Type::Interface::IC_BURST_FREQ;
 	double ia_freq = incoming_announce_frequency();
 
+	// Faithful to upstream RNS Interface.py:122-135: the post-burst penalty
+	// (ic_held_release) is armed when the burst DEACTIVATES, not when it
+	// activates, and the deactivation has no extra sample-count guard. (The
+	// previous local version armed the penalty at burst start and gated
+	// deactivation on a minimum sample count, so held announces released earlier
+	// than upstream intends.)
 	if (_impl->_ic_burst_active) {
 		if (ia_freq < freq_threshold
 				&& OS::time() > _impl->_ic_burst_activated + (double)Type::Interface::IC_BURST_HOLD) {
-			if (_impl->_ia_freq_ring.size() >= Type::Interface::IC_BURST_MIN_SAMPLES) {
-				_impl->_ic_burst_active = false;
-			}
+			_impl->_ic_burst_active = false;
+			_impl->_ic_held_release = OS::time() + (double)Type::Interface::IC_BURST_PENALTY;
 		}
 		return true;
 	}
@@ -241,7 +245,6 @@ bool Interface::should_ingress_limit() {
 		if (ia_freq > freq_threshold) {
 			_impl->_ic_burst_active = true;
 			_impl->_ic_burst_activated = OS::time();
-			_impl->_ic_held_release = OS::time() + (double)Type::Interface::IC_BURST_PENALTY;
 			return true;
 		}
 		else {

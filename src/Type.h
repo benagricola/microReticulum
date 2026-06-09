@@ -337,22 +337,19 @@ namespace RNS { namespace Type {
 			MODE_GATEWAY        = 0x40,
 		};
 
-		// Ingress Control constants (ported from RNS Interfaces/Interface.py).
+		// Ingress Control constants — match upstream RNS Interfaces/Interface.py
+		// exactly (these govern the announce-flood brake).
 		// How many samples to use for inbound announce frequency calculations.
-		static const uint16_t IA_FREQ_SAMPLES       = 48;
+		static const uint16_t IA_FREQ_SAMPLES       = 6;
 		// Maximum amount of ingress-limited announces to hold at any time.
 		static const uint16_t MAX_HELD_ANNOUNCES    = 256;
 		// How long a spawned interface is considered newly created (2 hours).
 		static const uint32_t IC_NEW_TIME           = 2*60*60;
-		static const uint8_t  IC_BURST_FREQ_NEW     = 3;
-		static const uint8_t  IC_BURST_FREQ         = 10;
-		static const uint8_t  IC_BURST_HOLD         = 15;
-		static const uint8_t  IC_BURST_PENALTY      = 15;
-		static const uint8_t  IC_HELD_RELEASE_INTERVAL = 5;
-		static const uint8_t  IC_DEQUE_MIN_SAMPLE   = 2;
-		static const uint8_t  IC_BURST_MIN_SAMPLES  = 6;
-		// Frequency-decay window: 1 / AR_MINFREQ_HZ (AR_MINFREQ_HZ = 0.1).
-		static const uint16_t AR_FREQ_DECAY         = 10;
+		static constexpr float IC_BURST_FREQ_NEW    = 3.5f;
+		static constexpr float IC_BURST_FREQ        = 12.0f;
+		static const uint16_t IC_BURST_HOLD         = 1*60;
+		static const uint16_t IC_BURST_PENALTY      = 5*60;
+		static const uint8_t  IC_HELD_RELEASE_INTERVAL = 30;
 
 	}
 
@@ -475,7 +472,7 @@ namespace RNS { namespace Type {
 		static const uint8_t PATH_REQUEST_TIMEOUT = 15;           // Default timuout for client path requests in seconds
 		static constexpr const float PATH_REQUEST_GRACE     = 0.4;         // Grace time before a path announcement is made, allows directly reachable peers to respond first
 		static const uint8_t PATH_REQUEST_RW      = 2;            // Path request random window
-		static const uint8_t PATH_REQUEST_MI      = 5;            // Minimum interval in seconds for automated path requests
+		static const uint8_t PATH_REQUEST_MI      = 20;           // Minimum interval in seconds for automated path requests (upstream RNS Transport.PATH_REQUEST_MI)
 
 		static constexpr const float LINK_TIMEOUT  = Link::STALE_TIME * 1.25;
 		static const uint16_t REVERSE_TIMEOUT      = 8*60;        // Reverse table entries are removed after 8 minutes
@@ -485,15 +482,15 @@ namespace RNS { namespace Type {
 		static const uint8_t PERSIST_RANDOM_BLOBS  = RNS_RANDOM_BLOBS_PERSIST_MAX; // Maximum number of random blobs per destination to persist to disk
 		static const uint8_t MAX_RANDOM_BLOBS      = RNS_RANDOM_BLOBS_MAX; // Maximum number of random blobs per destination to keep in memory
 
-		// CBA MCU
-		//static const uint32_t DESTINATION_TIMEOUT = 60*60*24*7;   // Destination table entries are removed if unused for one week
-		//static const uint32_t PATHFINDER_E      = 60*60*24*7; // Path expiration of one week
-		//static const uint32_t AP_PATH_TIME      = 60*60*24;   // Path expiration of one day for Access Point paths
-		//static const uint32_t ROAMING_PATH_TIME = 60*60*6;    // Path expiration of 6 hours for Roaming paths
-		static const uint32_t DESTINATION_TIMEOUT = 60*60*24*1;   // Destination table entries are removed if unused for one day
-		static const uint32_t PATHFINDER_E      = 60*60*24*1; // Path expiration of one day
-		static const uint32_t AP_PATH_TIME      = 60*60*6;   // Path expiration of 6 hours for Access Point paths
-		static const uint32_t ROAMING_PATH_TIME = 60*60*1;    // Path expiration of 1 hour for Roaming paths
+		// Path TTLs match upstream RNS Transport.py exactly. (These were
+		// previously shortened 4-7x "for MCU", but the path/known-dest tables
+		// are now PSRAM+flash microStores bounded by record count, not by TTL,
+		// so the short TTLs only caused paths to expire+flap sooner and drove
+		// extra path-request traffic. Restored to upstream.)
+		static const uint32_t DESTINATION_TIMEOUT = 60*60*24*7;   // Destination table entries are removed if unused for one week
+		static const uint32_t PATHFINDER_E      = 60*60*24*7; // Path expiration of one week
+		static const uint32_t AP_PATH_TIME      = 60*60*24;   // Path expiration of one day for Access Point paths
+		static const uint32_t ROAMING_PATH_TIME = 60*60*6;    // Path expiration of 6 hours for Roaming paths
 
 		static const uint16_t LOCAL_CLIENT_CACHE_MAXSIZE = 512;
 	}
@@ -504,27 +501,38 @@ namespace RNS { namespace Type {
 		static const uint8_t WINDOW               = 4;
 
 		// Absolute minimum window size during transfer
-		static const uint8_t WINDOW_MIN           = 1;
+		static const uint8_t WINDOW_MIN           = 2;
 
 		// The maximum window size for transfers on slow links
 		static const uint8_t WINDOW_MAX_SLOW      = 10;
 
+		// The maximum window size for transfers on very slow links
+		static const uint8_t WINDOW_MAX_VERY_SLOW = 4;
+
 		// The maximum window size for transfers on fast links
 		static const uint8_t WINDOW_MAX_FAST      = 75;
-		
+
 		// For calculating maps and guard segments, this
 		// must be set to the global maximum window.
 		static const uint8_t WINDOW_MAX           = WINDOW_MAX_FAST;
-		
+
 		// If the fast rate is sustained for this many request
 		// rounds, the fast link window size will be allowed.
 		static const uint8_t FAST_RATE_THRESHOLD  = WINDOW_MAX_SLOW - WINDOW - 2;
+
+		// If the very slow rate is sustained for this many request
+		// rounds, the very slow link window size will be used.
+		static const uint8_t VERY_SLOW_RATE_THRESHOLD = 2;
 
 		// If the RTT rate is higher than this value,
 		// the max window size for fast links will be used.
 		// The default is 50 Kbps (the value is stored in
 		// bytes per second, hence the "/ 8").
 		static const uint16_t RATE_FAST            = (50*1000) / 8;
+
+		// If the RTT rate is lower than this value, the max window
+		// size for very slow links will be used. Default 2 Kbps.
+		static const uint16_t RATE_VERY_SLOW       = (2*1000) / 8;
 
 		// The minimum allowed flexibility of the window size.
 		// The difference between window_max and window_min
@@ -560,7 +568,8 @@ namespace RNS { namespace Type {
 
 		static const uint8_t PART_TIMEOUT_FACTOR           = 4;
 		static const uint8_t PART_TIMEOUT_FACTOR_AFTER_RTT = 2;
-		static const uint8_t MAX_RETRIES                   = 8;
+		static const uint8_t PROOF_TIMEOUT_FACTOR          = 3;   // upstream Resource.PROOF_TIMEOUT_FACTOR
+		static const uint8_t MAX_RETRIES                   = 16;  // upstream Resource.MAX_RETRIES (was 8)
 		static const uint8_t MAX_ADV_RETRIES               = 4;
 		static const uint8_t SENDER_GRACE_TIME             = 10;
 		static const float RETRY_GRACE_TIME              = 0.25;
