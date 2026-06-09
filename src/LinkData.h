@@ -145,7 +145,9 @@ namespace RNS {
 		size_t _response_size = 0;
 		Type::RequestReceipt::status _status = Type::RequestReceipt::SENT;
 		double _sent_at = 0.0;
-		int _progress = 0;
+		// 0.0..1.0, mirrors upstream RequestReceipt.progress (set from
+		// resource.get_progress(), a float — an int here truncated to 0).
+		float _progress = 0.0f;
 		double _concluded_at = 0.0;
 		double _response_concluded_at = 0.0;
 		double _timeout = 0.0;

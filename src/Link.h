@@ -101,11 +101,14 @@ namespace RNS {
 		// getters
 		const Bytes& hash() const;
 		const Bytes& request_id() const;
+		size_t response_size() const;
 		size_t response_transfer_size() const;
+		double started_at() const;
 
 		// setters
 		void response_size(size_t size);
 		void response_transfer_size(size_t size);
+		void started_at(double time);
 
 	private:
 		std::shared_ptr<RequestReceiptData> _object;
@@ -130,7 +133,10 @@ namespace RNS {
 			using closed = void(*)(Link& link);
 			using packet = void(*)(const Bytes& plaintext, const Packet& packet);
 			using remote_identified = void(*)(const Link& link, const Identity& remote_identity);
-			using resource = void(*)(const ResourceAdvertisement& resource_advertisement);
+			// ACCEPT_APP gate: return true to accept the advertised resource,
+			// false to reject it (upstream Link.py:1097 uses the callback's
+			// truth value to choose between Resource.accept and Resource.reject).
+			using resource = bool(*)(const ResourceAdvertisement& resource_advertisement);
 			using resource_started = void(*)(const Resource& resource);
 			using resource_concluded = void(*)(const Resource& resource);
 			using resource_progress  = void(*)(const Resource& resource);

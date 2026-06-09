@@ -1080,10 +1080,19 @@ void Link::response_resource_concluded(const Resource& resource) {
 	}
 	else {
 		DEBUGF("Incoming response resource failed with status: %d", resource.status());
-		for (RNS::RequestReceipt pending_request : _object->_pending_requests) {
+		//p for pending_request in self.pending_requests:
+		//p     if pending_request.request_id == resource.request_id:
+		//p         pending_request.request_timed_out(None)
+		// Snapshot the matches first: request_timed_out erases the receipt
+		// from _pending_requests, which would invalidate a live set iterator.
+		std::vector<RNS::RequestReceipt> matching;
+		for (const RNS::RequestReceipt& pending_request : _object->_pending_requests) {
 			if (pending_request.request_id() == resource.request_id()) {
-				pending_request.request_timed_out({Type::NONE});
+				matching.push_back(pending_request);
 			}
+		}
+		for (auto& pending_request : matching) {
+			pending_request.request_timed_out({Type::NONE});
 		}
 	}
 }
@@ -1101,6 +1110,34 @@ void Link::get_channel() {
 		_object->_channel = Channel(LinkChannelOutlet(self))
 	return _object->_channel
 */
+
+// Upstream passes bound methods (self.request_resource_concluded,
+// self.response_resource_concluded, pending_request.response_resource_progress)
+// into Resource.accept (Link.py:1074-1089). The port's Resource callbacks are
+// plain function pointers (no std::function on all targets), so these
+// trampolines recover the owning Link from the Resource and forward.
+static void request_resource_concluded_trampoline(const Resource& resource) {
+	Link link = resource.link();
+	if (link) link.request_resource_concluded(resource);
+}
+
+static void response_resource_concluded_trampoline(const Resource& resource) {
+	Link link = resource.link();
+	if (link) link.response_resource_concluded(resource);
+}
+
+// Upstream binds pending_request.response_resource_progress as the response
+// resource's progress callback; route to the matching pending request by the
+// resource's request_id.
+static void response_resource_progress_trampoline(const Resource& resource) {
+	Link link = resource.link();
+	if (!link) return;
+	for (RNS::RequestReceipt pending_request : link.pending_requests()) {
+		if (pending_request.request_id() == resource.request_id()) {
+			pending_request.response_resource_progress(resource);
+		}
+	}
+}
 
 /*
 void Link::receive(const Packet& packet) {
@@ -1253,15 +1290,17 @@ void Link::receive(const Packet& packet) {
 					break;
 				}
 				// --- RESOURCE_ADV dispatch ---
-				// Decrypt the body, validate flag combinations against our
-				// firmware's no-bz2 / no-split / no-metadata stance, check
-				// the size against FIRMWARE_MAX_INCOMING and the flash
-				// quota, allocate a Resource via Resource::accept which
-				// picks the right ResourceBuffer (heap vs flash), register
-				// it with this Link, and fire the initial REQ. Refusals
-				// emit a RESOURCE_RCL back to the sender with the
-				// advertised hash so they fail cleanly rather than waiting
-				// for our timeout.
+				// Decrypt + unpack the advertisement, then route in
+				// upstream order (Link.py:1069-1102): resource-borne
+				// REQUEST -> request_resource_concluded; resource-borne
+				// RESPONSE -> matching pending request's
+				// response_resource_concluded; otherwise apply the link's
+				// resource_strategy (ACCEPT_NONE / ACCEPT_APP / ACCEPT_ALL).
+				// Every accepted resource passes the embedded guard checks
+				// (no-bz2 / no-metadata, size cap, flash quota) first; a
+				// guard refusal emits RESOURCE_RCL back to the sender with
+				// the advertised hash so it fails cleanly rather than
+				// waiting for our timeout.
 				case Type::Packet::RESOURCE_ADV:
 				{
 					// Lossy-link recovery: if the LRRTT (ctx=254) packet
@@ -1291,10 +1330,7 @@ void Link::receive(const Packet& packet) {
 							}
 						}
 					}
-					if (_object->_resource_strategy == Type::Link::ACCEPT_NONE) {
-						DEBUG("RESOURCE_ADV refused: resource_strategy=ACCEPT_NONE");
-						break;
-					}
+					//p packet.plaintext = self.decrypt(packet.data)
 					const Bytes plaintext = decrypt(packet.data());
 					if (!plaintext) {
 						WARNING("RESOURCE_ADV decrypt failed");
@@ -1324,24 +1360,37 @@ void Link::receive(const Packet& packet) {
 						}
 					};
 
-					if (adv.compressed())   { send_rcl("compressed (c=1) not supported"); break; }
-					if (adv.split())        { send_rcl("split (s=1) not supported"); break; }
-					if (adv.has_metadata()) { send_rcl("metadata (x=1) not supported"); break; }
-					if (adv.transfer_size() == 0) {
-						send_rcl("zero-size resource"); break;
-					}
-					if (adv.transfer_size() > RNS::resource_max_incoming()) {
-						send_rcl("transfer size exceeds firmware cap"); break;
-					}
-					// Flash quota check: only matters for >RAM_BUFFER_THRESHOLD
-					// resources, since heap-backed ones don't consume flash.
-					if (adv.transfer_size() > Type::Resource::RAM_BUFFER_THRESHOLD &&
-					    !flash_quota_can_allocate(adv.transfer_size())) {
-						send_rcl("flash quota exhausted"); break;
-					}
-					// Duplicate-ADV guard: if we already have an in-flight
-					// receive for this hash, don't replace state; let the
-					// sender retransmit parts against the existing buffer.
+					// Embedded divergence from upstream: these guard checks
+					// apply to EVERY accepted resource, including request and
+					// response resources (upstream accepts those ungated) —
+					// the firmware can't take a bz2 stream, a metadata blob
+					// or an oversized transfer regardless of which dispatch
+					// path it arrives on. Refusals send RESOURCE_RCL so the
+					// sender fails cleanly instead of waiting for a timeout.
+					auto passes_embedded_guards = [&]() -> bool {
+						if (adv.compressed())   { send_rcl("compressed (c=1) not supported"); return false; }
+						if (adv.split())        { send_rcl("split (s=1) not supported"); return false; }
+						if (adv.has_metadata()) { send_rcl("metadata (x=1) not supported"); return false; }
+						if (adv.transfer_size() == 0) {
+							send_rcl("zero-size resource"); return false;
+						}
+						if (adv.transfer_size() > RNS::resource_max_incoming()) {
+							send_rcl("transfer size exceeds firmware cap"); return false;
+						}
+						// Flash quota check: only matters for >RAM_BUFFER_THRESHOLD
+						// resources, since heap-backed ones don't consume flash.
+						if (adv.transfer_size() > Type::Resource::RAM_BUFFER_THRESHOLD &&
+						    !flash_quota_can_allocate(adv.transfer_size())) {
+							send_rcl("flash quota exhausted"); return false;
+						}
+						return true;
+					};
+
+					// Duplicate-ADV guard (upstream performs this inside
+					// Resource.accept via has_incoming_resource): if we
+					// already have an in-flight receive for this hash, don't
+					// replace state; let the sender retransmit parts against
+					// the existing buffer.
 					{
 						bool already = false;
 						for (const auto& r : _object->_incoming_resources) {
@@ -1354,72 +1403,126 @@ void Link::receive(const Packet& packet) {
 						}
 					}
 
-					Resource resource = Resource::accept(adv, *this,
-					                                    _object->_callbacks._resource_concluded,
-					                                    _object->_callbacks._resource_progress);
-					if (resource.status() == Type::Resource::FAILED) {
-						// Buffer allocation failed (e.g. heap OOM after the
-						// quota check passed). Tell the sender.
-						send_rcl("buffer allocation failed");
-						break;
-					}
-					register_incoming_resource(resource);
-					resource.send_part_request();
-					break;
-				}
-/*z
-				case Type::Packet::RESOURCE_ADV:
-				{
-					//p packet.plaintext = decrypt(packet.data)
-					const Bytes plaintext = decrypt(packet.data());
-					if (plaintext) {
-						const_cast<Packet&>(packet).plaintext(plaintext);
-						if (ResourceAdvertisement::is_request(packet)) {
-							Resource::accept(packet, callback=_object->_request_resource_concluded);
+					// Allocate + register + initial REQ. Upstream's
+					// Resource.accept (Resource.py:221-233) registers the
+					// resource, fires the link's resource_started callback
+					// and sends the first part request; the port splits that
+					// between Resource::accept and this dispatch.
+					auto accept_resource = [&](Resource::Callbacks::concluded concluded,
+					                           Resource::Callbacks::progress progress) -> Resource {
+						Resource resource = Resource::accept(adv, *this, concluded, progress);
+						if (resource.status() == Type::Resource::FAILED) {
+							// Buffer allocation failed (e.g. heap OOM after
+							// the quota check passed). Tell the sender.
+							send_rcl("buffer allocation failed");
+							return {Type::NONE};
 						}
-						else if (ResourceAdvertisement::is_response(packet)) {
-							Bytes request_id = ResourceAdvertisement::read_request_id(packet)
-							for (auto& pending_request : _object->_pending_requests) {
-								if (pending_request.request_id == request_id) {
-									const Bytes response_resource = Resource::accept(packet, callback=_object->_response_resource_concluded, progress_callback=pending_request.response_resource_progress, request_id = request_id);
-									if (response_resource) {
-										//p if pending_request.response_size == None:
-										if (pending_request.response_size == 0) {
-											pending_request.response_size = ResourceAdvertisement::read_size(packet);
-										}
-										//p if pending_request.response_transfer_size == None:
-										if (pending_request.response_transfer_size == 0) {
-											pending_request.response_transfer_size = 0;
-										}
-										pending_request.response_transfer_size += ResourceAdvertisement::read_transfer_size(packet);
-										//p if pending_request.started_at == None:
-										if (pending_request.started_at == 0.0) {
-											pending_request.started_at = OS::time();
-										}
-										pending_request.response_resource_progress(response_resource);
+						register_incoming_resource(resource);
+						//p if resource.link.callbacks.resource_started != None:
+						//p     resource.link.callbacks.resource_started(resource)
+						if (_object->_callbacks._resource_started) {
+							try {
+								_object->_callbacks._resource_started(resource);
+							}
+							catch (const std::exception& e) {
+								ERRORF("Error while executing resource started callback from %s. The contained exception was: %s", toString().c_str(), e.what());
+							}
+						}
+						resource.send_part_request();
+						return resource;
+					};
+
+					//p if RNS.ResourceAdvertisement.is_request(packet):
+					//p     RNS.Resource.accept(packet, callback=self.request_resource_concluded)
+					// is_request == (adv.q != None and adv.u), Resource.py:1223-1228.
+					if (!adv.request_id().empty() && adv.is_request()) {
+						if (!passes_embedded_guards()) break;
+						accept_resource(request_resource_concluded_trampoline, nullptr);
+					}
+					//p elif RNS.ResourceAdvertisement.is_response(packet):
+					// is_response == (adv.q != None and adv.p), Resource.py:1232-1238.
+					else if (!adv.request_id().empty() && adv.is_response()) {
+						//p request_id = RNS.ResourceAdvertisement.read_request_id(packet)
+						const Bytes request_id = adv.request_id();
+						// Run the embedded guards only if a pending request
+						// matches — with no match upstream silently ignores
+						// the advertisement, so neither do we RCL it.
+						bool have_match = false;
+						for (const RNS::RequestReceipt& pending : _object->_pending_requests) {
+							if (pending.request_id() == request_id) { have_match = true; break; }
+						}
+						if (!have_match) break;
+						if (!passes_embedded_guards()) break;
+						//p for pending_request in self.pending_requests:
+						for (RNS::RequestReceipt pending_request : _object->_pending_requests) {
+							if (pending_request.request_id() == request_id) {
+								//p response_resource = RNS.Resource.accept(packet, callback=self.response_resource_concluded, progress_callback=pending_request.response_resource_progress, request_id = request_id)
+								Resource response_resource = accept_resource(
+									response_resource_concluded_trampoline,
+									response_resource_progress_trampoline);
+								if (response_resource) {
+									//p if pending_request.response_size == None:
+									//p     pending_request.response_size = RNS.ResourceAdvertisement.read_size(packet)
+									if (pending_request.response_size() == 0) {
+										pending_request.response_size(adv.data_size());
 									}
+									//p if pending_request.response_transfer_size == None:
+									//p     pending_request.response_transfer_size = 0
+									//p pending_request.response_transfer_size += RNS.ResourceAdvertisement.read_transfer_size(packet)
+									pending_request.response_transfer_size(
+										pending_request.response_transfer_size() + adv.transfer_size());
+									//p if pending_request.started_at == None:
+									//p     pending_request.started_at = time.time()
+									if (pending_request.started_at() == 0.0) {
+										pending_request.started_at(OS::time());
+									}
+									//p pending_request.response_resource_progress(response_resource)
+									pending_request.response_resource_progress(response_resource);
 								}
 							}
 						}
-						else if (_object->_resource_strategy == ACCEPT_NONE) {
-							//p pass
+					}
+					//p elif self.resource_strategy == Link.ACCEPT_NONE: pass
+					else if (_object->_resource_strategy == Type::Link::ACCEPT_NONE) {
+						// Deliberately do nothing (upstream `pass`): no RCL,
+						// the sender's advertisement times out on its own.
+					}
+					//p elif self.resource_strategy == Link.ACCEPT_APP:
+					else if (_object->_resource_strategy == Type::Link::ACCEPT_APP) {
+						if (_object->_callbacks._resource) {
+							try {
+								//p resource_advertisement.link = self
+								adv.set_link(this);
+								const bool app_accepted = _object->_callbacks._resource(adv);
+								adv.set_link(nullptr);
+								if (app_accepted) {
+									//p RNS.Resource.accept(packet, self.callbacks.resource_concluded)
+									if (!passes_embedded_guards()) break;
+									accept_resource(_object->_callbacks._resource_concluded,
+									                _object->_callbacks._resource_progress);
+								}
+								else {
+									//p RNS.Resource.reject(packet)
+									// Resource.reject (Resource.py:153-163) sends a
+									// RESOURCE_RCL carrying the advertised hash.
+									send_rcl("declined by resource accept callback");
+								}
+							}
+							catch (const std::exception& e) {
+								ERRORF("Error while executing resource accept callback from %s. The contained exception was: %s", toString().c_str(), e.what());
+							}
 						}
-						else if (_object->_resource_strategy == ACCEPT_APP) {
-							if (_object->_callbacks.resource) {
-								try {
-									resource_advertisement = RNS.ResourceAdvertisement.unpack(packet.plaintext());
-									resource_advertisement.link = *this;
-									if (_object->_callbacks.resource(resource_advertisement)) {
-										Resource::accept(packet, _object->_callbacks.resource_concluded);
-									}
-								}
-								catch (const std::exception& e) {
-									ERRORF("Error while executing resource accept callback from %s. The contained exception was: %s", toString().c_str(), e.what());
-								}
-						elif _object->_resource_strategy == ACCEPT_ALL:
-							RNS.Resource.accept(packet, _object->_callbacks.resource_concluded)
+					}
+					//p elif self.resource_strategy == Link.ACCEPT_ALL:
+					//p     RNS.Resource.accept(packet, self.callbacks.resource_concluded)
+					else if (_object->_resource_strategy == Type::Link::ACCEPT_ALL) {
+						if (!passes_embedded_guards()) break;
+						accept_resource(_object->_callbacks._resource_concluded,
+						                _object->_callbacks._resource_progress);
+					}
 					break;
 				}
+/*z
 				case Type::Packet::RESOURCE_REQ:
 				{
 					const Bytes plaintext = decrypt(packet.data());
@@ -2253,9 +2356,19 @@ const Bytes& RequestReceipt::request_id() const {
 	return _object->_request_id;
 }
 
+size_t RequestReceipt::response_size() const {
+	assert(_object);
+	return _object->_response_size;
+}
+
 size_t RequestReceipt::response_transfer_size() const {
 	assert(_object);
 	return _object->_response_transfer_size;
+}
+
+double RequestReceipt::started_at() const {
+	assert(_object);
+	return _object->_started_at;
 }
 
 // setters
@@ -2268,4 +2381,9 @@ void RequestReceipt::response_size(size_t size) {
 void RequestReceipt::response_transfer_size(size_t size) {
 	assert(_object);
 	_object->_response_transfer_size = size;
+}
+
+void RequestReceipt::started_at(double time) {
+	assert(_object);
+	_object->_started_at = time;
 }

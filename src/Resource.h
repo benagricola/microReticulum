@@ -288,6 +288,13 @@ namespace RNS {
 		bool is_response()  const { return (_f & FLAG_IS_RESPONSE)  != 0; }
 		bool has_metadata() const { return (_f & FLAG_HAS_METADATA) != 0; }
 
+		// Upstream sets `resource_advertisement.link = self` before invoking
+		// the ACCEPT_APP resource callback (Link.py:1095-1096) so the
+		// application can see which link the advertisement arrived on. The
+		// pointer is only valid for the duration of the callback invocation.
+		void set_link(const Link* link)           { _link = link; }
+		const Link* get_link() const              { return _link; }
+
 		// Mutators (used by Resource sender to populate before pack())
 		void set_transfer_size(uint32_t t)        { _t = t; }
 		void set_data_size(uint32_t d)            { _d = d; }
@@ -302,6 +309,7 @@ namespace RNS {
 		void set_hashmap(const Bytes& m)          { _m = m; }
 
 	private:
+		const Link* _link = nullptr;  // see set_link(); not serialized
 		uint32_t _t = 0;   // transfer size (on-wire, after encryption)
 		uint32_t _d = 0;   // data size (uncompressed; equal to _t since c=0)
 		uint16_t _n = 0;   // number of parts

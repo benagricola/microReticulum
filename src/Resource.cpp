@@ -1677,10 +1677,10 @@ const Bytes& Resource::request_id() const {
 
 const Bytes& Resource::data() const {
 	assert(_object);
+	// Receiver side: the assembled cleartext (upstream's `resource.data`
+	// file handle, Resource.py:726). Empty before assembly completes.
 	// Sender side: the prepared (eventually encrypted) payload.
-	// Receiver side: callers should use the buffer through ResourceBuffer
-	// once assembly completes; that hookup lands with the receiver part
-	// assembly along with the resource_concluded callback wiring.
+	if (!_object->_initiator) return _object->_plaintext;
 	return _object->_encrypted;
 }
 
