@@ -16,6 +16,7 @@
 
 #include "Destination.h"
 #include "Type.h"
+#include "SdReadStat.h"
 
 #include <memory>
 #include <cassert>
@@ -23,6 +24,7 @@
 namespace RNS {
 
 	class ResourceData;
+	class ResourceBuffer;
 	class Packet;
 	class Destination;
 	class Link;
@@ -128,6 +130,28 @@ namespace RNS {
 		// triggers assembly + PRF emission. Silently ignores parts whose
 		// map_hash doesn't match anything we expect.
 		void on_part(const Packet& part_packet);
+
+		// --- Off-loop receive conclude (firmware worker decrypts/verifies) ---
+		// The firmware registers a deferrer; when set, on_part hands a disk-
+		// backed single-segment resource's conclude to a worker task instead of
+		// running the multi-second read_all+decrypt on loopTask. nullptr (the
+		// default) keeps the original inline behaviour.
+		using ConcludeDeferrer = void (*)(const Resource&);
+		static void set_conclude_deferrer(ConcludeDeferrer deferrer);
+		// loopTask: move the receive buffer out so the worker can read it
+		// without racing a concurrent cancel() that would free _buffer.
+		std::unique_ptr<ResourceBuffer> detach_buffer();
+		// loopTask: put a detached buffer back (deferral queue-full fallback).
+		void reattach_buffer(std::unique_ptr<ResourceBuffer> buffer);
+		// Worker (off loopTask, lock-free): decrypt + verify the assembled
+		// ciphertext (read from the detached buffer by the caller) and stash the
+		// plaintext + proof. Returns false and marks corrupt on failure.
+		bool prepare_from_assembled(const Bytes& assembled);
+		// loopTask: run the RNS-mutating delivery (proof + status + callback)
+		// from the stashed prepare result. Skips a resource cancelled meanwhile.
+		void deliver_assembly();
+		// Firmware-registered deferral hook (nullptr = original inline conclude).
+		static ConcludeDeferrer _conclude_deferrer;
 
 		// Sender-only: ingest an incoming RESOURCE_REQ body and send the
 		// requested parts as RESOURCE packets. Body layout matches

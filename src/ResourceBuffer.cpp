@@ -7,6 +7,7 @@
 #include "Type.h"
 #include "Log.h"
 #include "Utilities/OS.h"
+#include "SdReadStat.h"
 
 #include <SHA256.h>
 
@@ -37,6 +38,10 @@ ResourceMaxIncomingResolver g_resource_max_incoming_resolver = nullptr;
 
 // Monotonic counter to ensure temp filenames are unique within a boot.
 uint64_t g_resource_tmp_counter = 0;
+
+// DIVERGES: off-loop receive part-write hook (firmware-registered). Null =
+// inline writes (upstream behaviour). See ResourceBuffer.h.
+PartWriteHook g_part_write_hook = nullptr;
 
 const char* current_tmp_path() {
     if (g_resource_tmp_path_resolver) {
@@ -115,6 +120,16 @@ Bytes HeapResourceBuffer::read_all() {
     return _data;
 }
 
+size_t HeapResourceBuffer::read_next(uint8_t* dst, size_t max) {
+    if (!_open) return 0;
+    const size_t avail = _data.size();
+    if (_read_offset >= avail) return 0;
+    const size_t n = std::min(max, avail - _read_offset);
+    memcpy(dst, _data.data() + _read_offset, n);
+    _read_offset += n;
+    return n;
+}
+
 Bytes HeapResourceBuffer::compute_sha256() {
     if (!_open) return Bytes();
     SHA256 digest;
@@ -161,14 +176,20 @@ bool FlashResourceBuffer::open(size_t total_size) {
     _temp_path = path;
 
     try {
-        _file = OS::open_file(_temp_path.c_str(), microStore::File::ModeReadWrite);
+        // Deferred mode: create the file and close it immediately. The off-loop
+        // worker owns every subsequent read/write via raw POSIX on _temp_path,
+        // so no microStore handle is kept here (a second open fd racing the
+        // worker's was a source of FATFS corruption on this hardware).
+        microStore::File f = OS::open_file(_temp_path.c_str(), microStore::File::ModeReadWrite);
+        if (!f) {
+            ERRORF("FlashResourceBuffer::open: file handle invalid for '%s'", _temp_path.c_str());
+            return false;
+        }
+        if (part_writes_deferred()) f.close();
+        else                        _file = std::move(f);
     }
     catch (const std::exception& e) {
         ERRORF("FlashResourceBuffer::open: open_file failed: %s", e.what());
-        return false;
-    }
-    if (!_file) {
-        ERRORF("FlashResourceBuffer::open: file handle invalid for '%s'", _temp_path.c_str());
         return false;
     }
 
@@ -182,7 +203,7 @@ bool FlashResourceBuffer::open(size_t total_size) {
 
 bool FlashResourceBuffer::write_part(uint16_t part_index, uint16_t sdu,
                                      const Bytes& part_data) {
-    if (!_open || !_file) return false;
+    if (!_open) return false;
     const size_t offset = static_cast<size_t>(part_index) * static_cast<size_t>(sdu);
     if (offset >= _total_size) {
         ERRORF("FlashResourceBuffer::write_part: offset %zu beyond total %zu",
@@ -191,6 +212,15 @@ bool FlashResourceBuffer::write_part(uint16_t part_index, uint16_t sdu,
     }
     const size_t copy_bytes = std::min(part_data.size(), _total_size - offset);
 
+    // Deferred: hand (path, offset, bytes) to the firmware worker and return.
+    // The hook copies the bytes synchronously; the SD write happens off-loop.
+    if (g_part_write_hook) {
+        g_part_write_hook(_temp_path.c_str(), (uint32_t)offset,
+                          part_data.data(), (uint32_t)copy_bytes);
+        return true;
+    }
+
+    if (!_file) return false;
     if (_file.seek((uint32_t)offset, microStore::SeekModeSet) < 0) {
         ERRORF("FlashResourceBuffer::write_part: seek to %zu failed", offset);
         return false;
@@ -210,6 +240,7 @@ Bytes FlashResourceBuffer::read_all() {
     Bytes out;
     uint8_t* dst = out.writable(_total_size);
     if (dst == nullptr) return Bytes();
+    const int64_t _sd_t0 = RNS::SdReadStat::now_us();
     if (_file.seek(0, microStore::SeekModeSet) < 0) return Bytes();
 
     size_t total_read = 0;
@@ -219,12 +250,25 @@ Bytes FlashResourceBuffer::read_all() {
         if (n == 0 || n == (size_t)-1) break;
         total_read += n;
     }
+    RNS::SdReadStat::record(RNS::SdReadStat::readall_max_us(),
+                            RNS::SdReadStat::readall_count(),
+                            (uint32_t)(RNS::SdReadStat::now_us() - _sd_t0), (uint32_t)total_read);
     if (total_read != _total_size) {
         ERRORF("FlashResourceBuffer::read_all: read %zu of %zu bytes",
                total_read, _total_size);
         out.resize(total_read);
     }
     return out;
+}
+
+size_t FlashResourceBuffer::read_next(uint8_t* dst, size_t max) {
+    if (!_open || !_file) return 0;
+    if (!_read_started) {
+        if (_file.seek(0, microStore::SeekModeSet) < 0) return 0;
+        _read_started = true;
+    }
+    const size_t n = _file.read(dst, max);
+    return (n == (size_t)-1) ? 0 : n;
 }
 
 Bytes FlashResourceBuffer::compute_sha256() {
@@ -320,6 +364,9 @@ void RNS::set_resource_tmp_path_resolver(ResourceTmpPathResolver resolver) {
 void RNS::set_resource_max_incoming_resolver(ResourceMaxIncomingResolver resolver) {
     g_resource_max_incoming_resolver = resolver;
 }
+
+void RNS::set_part_write_hook(PartWriteHook hook) { g_part_write_hook = hook; }
+bool RNS::part_writes_deferred() { return g_part_write_hook != nullptr; }
 
 size_t RNS::resource_max_incoming() {
     if (g_resource_max_incoming_resolver) {

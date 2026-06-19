@@ -39,6 +39,12 @@ public:
     // Read the full assembled buffer (call once after all parts are in).
     virtual Bytes read_all() = 0;
 
+    // Sequential chunked read of the assembled buffer, keeping the backing
+    // file open across calls; returns bytes read, 0 at EOF. Lets the off-loop
+    // conclude worker read under a per-chunk HSPI BusGuard instead of holding
+    // the bus across a whole multi-second read_all.
+    virtual size_t read_next(uint8_t* dst, size_t max) = 0;
+
     // SHA-256 over the entire current content. For flash backends this
     // streams the file through the hash without loading it into RAM.
     virtual Bytes compute_sha256() = 0;
@@ -48,7 +54,24 @@ public:
 
     virtual size_t total_size() const = 0;
     virtual bool   is_flash_backed() const = 0;
+
+    // Full filesystem path backing this buffer (flash backend), or nullptr
+    // (heap backend). The off-loop receive worker reads/writes this path
+    // directly when part-write deferral is active. See set_part_write_hook.
+    virtual const char* backing_path() const { return nullptr; }
 };
+
+// DIVERGES: off-loop receive part-writes (not in upstream RNS). When the
+// firmware registers a hook, FlashResourceBuffer::write_part copies the part
+// and hands (path, offset, bytes) to the hook instead of doing the SD write on
+// the caller's task (loopTask). The firmware worker then performs the actual
+// write off-loop, so a slow/stalling card can't freeze the main loop during a
+// receive. Null hook (default) keeps the original inline write. The hook must
+// copy the bytes synchronously; they are not valid after it returns.
+using PartWriteHook = void (*)(const char* path, uint32_t offset,
+                               const uint8_t* data, uint32_t len);
+void set_part_write_hook(PartWriteHook hook);
+bool part_writes_deferred();
 
 
 class HeapResourceBuffer : public ResourceBuffer {
@@ -59,6 +82,7 @@ public:
     bool   open(size_t total_size) override;
     bool   write_part(uint16_t part_index, uint16_t sdu, const Bytes& part_data) override;
     Bytes  read_all() override;
+    size_t read_next(uint8_t* dst, size_t max) override;
     Bytes  compute_sha256() override;
     void   discard() override;
     size_t total_size() const override { return _total_size; }
@@ -66,8 +90,9 @@ public:
 
 private:
     Bytes  _data;
-    size_t _total_size = 0;
-    bool   _open       = false;
+    size_t _total_size  = 0;
+    size_t _read_offset = 0;
+    bool   _open        = false;
 };
 
 
@@ -79,10 +104,12 @@ public:
     bool   open(size_t total_size) override;
     bool   write_part(uint16_t part_index, uint16_t sdu, const Bytes& part_data) override;
     Bytes  read_all() override;
+    size_t read_next(uint8_t* dst, size_t max) override;
     Bytes  compute_sha256() override;
     void   discard() override;
     size_t total_size() const override { return _total_size; }
     bool   is_flash_backed() const override { return true; }
+    const char* backing_path() const override { return _temp_path.c_str(); }
 
     // Take ownership of the temp file by renaming it into a destination
     // path; the temp file no longer exists after a successful commit, and
@@ -95,9 +122,10 @@ public:
 private:
     std::string         _temp_path;
     microStore::File    _file;
-    size_t              _total_size = 0;
-    bool                _open       = false;
-    bool                _committed  = false;
+    size_t              _total_size   = 0;
+    bool                _open         = false;
+    bool                _committed    = false;
+    bool                _read_started = false;
 };
 
 

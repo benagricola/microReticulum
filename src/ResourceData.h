@@ -50,6 +50,15 @@ private:
 	// this on the receiver. Empty before assembly completes.
 	Bytes _plaintext;
 	std::unique_ptr<ResourceBuffer> _buffer;
+	// Receiver side, off-loop deferred conclude: when the firmware
+	// worker runs the heavy assembly (decrypt+verify) off loopTask, it stashes
+	// the result here. _prepared gates _assemble_and_deliver() to use the stash
+	// instead of re-reading+decrypting; _prepare_corrupt records a decrypt/hash
+	// failure for the loop side to turn into _conclude_corrupt_segment().
+	bool  _prepared        = false;
+	bool  _prepare_corrupt = false;
+	Bytes _prepared_seg_plaintext;
+	Bytes _pending_proof;
 	// Sender side: pre-packed RESOURCE packet bodies, indexed by part.
 	std::vector<Bytes> _parts;
 	// Sender+receiver: full hashmap blob (n * 4 bytes). Single source of
@@ -104,6 +113,10 @@ private:
 	uint16_t _window            = Type::Resource::WINDOW;
 	uint16_t _window_min        = Type::Resource::WINDOW_MIN;
 	uint16_t _window_max        = Type::Resource::WINDOW_MAX_SLOW;
+	// DIVERGES: receiver-side cap on the effective window, in PARTS, derived at
+	// accept from RECV_MAX_INFLIGHT_BYTES / sdu. WINDOW_MAX_FAST by default
+	// (sender side / small-SDU links never bind). See Type.h.
+	uint16_t _window_cap        = Type::Resource::WINDOW_MAX_FAST;
 	uint8_t  _fast_rate_rounds      = 0;
 	uint8_t  _very_slow_rate_rounds = 0;
 	double   _req_data_rtt_rate     = 0.0;

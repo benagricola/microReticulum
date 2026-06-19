@@ -516,6 +516,19 @@ namespace RNS { namespace Type {
 		// The maximum window size for transfers on fast links
 		static const uint8_t WINDOW_MAX_FAST      = 75;
 
+		// DIVERGES: receiver-side in-flight byte cap (not in upstream RNS).
+		// Upstream's window is a PART count (WINDOW_MAX_FAST=75), sized for
+		// hosts that can buffer a whole fast-link window. On a fast link with a
+		// large SDU (TCP MTU 8 KiB -> 75*8K = 600 KiB) that overruns this
+		// memory-constrained receiver: parts pile into the device's RX faster
+		// than it can drain+persist, the sender's interface outbound buffer
+		// overflows ("No interfaces could process the outbound packet"), and the
+		// transfer stalls. Capping in-flight BYTES (not parts) makes the
+		// receiver advertise its true capacity regardless of SDU, so RNS's own
+		// receiver-driven window paces the sender down with no sender throttle.
+		// On LoRa (small SDU) the part cap binds first and this never engages.
+		static const uint32_t RECV_MAX_INFLIGHT_BYTES = 128 * 1024;
+
 		// For calculating maps and guard segments, this
 		// must be set to the global maximum window.
 		static const uint8_t WINDOW_MAX           = WINDOW_MAX_FAST;

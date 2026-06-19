@@ -678,6 +678,7 @@ bool Resource::_load_part(uint16_t index, Bytes& out) const {
 	const size_t length = std::min((size_t)d._sdu,
 	                               (size_t)(d._transfer_size - offset));
 	try {
+		const int64_t _sd_t0 = RNS::SdReadStat::now_us();
 		microStore::File f = Utilities::OS::open_file(
 			d._ciphertext_path.c_str(), microStore::File::ModeRead);
 		if (!f) {
@@ -693,6 +694,9 @@ bool Resource::_load_part(uint16_t index, Bytes& out) const {
 		if (dst == nullptr) return false;
 		const size_t got = f.read(dst, length);
 		f.close();
+		RNS::SdReadStat::record(RNS::SdReadStat::loadpart_max_us(),
+		                        RNS::SdReadStat::loadpart_count(),
+		                        (uint32_t)(RNS::SdReadStat::now_us() - _sd_t0), (uint32_t)got);
 		if (got != length) {
 			ERRORF("Resource::_load_part: read short %zu/%zu", got, length);
 			return false;
@@ -869,6 +873,17 @@ Resource Resource::accept(const ResourceAdvertisement& adv, const Link& link,
 			? (uint16_t)(link_mtu - Type::Reticulum::HEADER_MAXSIZE - Type::Reticulum::IFAC_MIN_SIZE)
 			: const_cast<Link&>(link).get_mdu();
 	}
+	// DIVERGES: cap the effective receive window by in-flight BYTES (see
+	// Type.h RECV_MAX_INFLIGHT_BYTES). Keeps a fast large-SDU link (TCP) from
+	// requesting more parts than this constrained receiver can drain+persist.
+	{
+		const uint16_t sdu = d._sdu ? d._sdu : 1;
+		uint32_t cap = Type::Resource::RECV_MAX_INFLIGHT_BYTES / sdu;
+		if (cap < Type::Resource::WINDOW_MIN)      cap = Type::Resource::WINDOW_MIN;
+		if (cap > Type::Resource::WINDOW_MAX_FAST) cap = Type::Resource::WINDOW_MAX_FAST;
+		d._window_cap = (uint16_t)cap;
+		if (d._window > d._window_cap) d._window = d._window_cap;  // seeded-window may exceed cap
+	}
 
 	//p previous_window = resource.link.get_last_resource_window()
 	//p previous_eifr   = resource.link.get_last_resource_eifr()
@@ -1003,7 +1018,10 @@ void Resource::send_part_request() {
 	Bytes requested;
 	uint16_t asked = 0;
 
-	while (asked < d._window && pn < d._parts_count) {
+	// DIVERGES: never ask for more than the byte-derived window cap, whatever
+	// the adaptive window has grown to (see Type.h RECV_MAX_INFLIGHT_BYTES).
+	const uint16_t eff_window = (d._window < d._window_cap) ? d._window : d._window_cap;
+	while (asked < eff_window && pn < d._parts_count) {
 		if (d._parts_received[pn]) { pn++; continue; }
 		if (!d._map_hashes_known[pn]) {
 			// Hashmap exhausted at this position — ask sender for more.
@@ -1043,6 +1061,7 @@ void Resource::send_part_request() {
 	d._req_sent_ms      = Utilities::OS::ltime();
 	d._last_activity_ms = d._req_sent_ms;
 	d._outstanding_parts = asked;
+	RNS::SdReadStat::rx_reqs()++;
 	// Snapshot the cumulative-bytes counter so the next on_part() that
 	// completes the window can compute observed throughput as
 	// (bytes_since_req / wall_time_since_req).
@@ -1156,6 +1175,13 @@ void Resource::on_part(const Packet& part_packet) {
 		d._consecutive_completed_height = cp;
 		cp++;
 	}
+	// Receive-flow snapshot (diagnostics).
+	RNS::SdReadStat::rx_received()    = d._received_count;
+	RNS::SdReadStat::rx_parts()       = d._parts_count;
+	RNS::SdReadStat::rx_outstanding() = d._outstanding_parts;
+	RNS::SdReadStat::rx_window()      = d._window;
+	RNS::SdReadStat::rx_cch()         = d._consecutive_completed_height;
+	RNS::SdReadStat::rx_eifr()        = d._eifr_bps;
 
 	// Fire progress callback (verified-bytes-so-far == received_count * sdu,
 	// approximate but good enough for the SPA progress bar).
@@ -1167,14 +1193,33 @@ void Resource::on_part(const Packet& part_packet) {
 	}
 
 	if (d._received_count >= d._parts_count) {
-		_assemble_and_deliver();
+		// Off-loop deferred conclude: for a disk-backed (spilled)
+		// segment, hand the heavy read_all+decrypt+verify to the firmware worker
+		// instead of stalling loopTask for it. The deferrer detaches the receive
+		// buffer, runs prepare_from_assembled() off-loop, then drives
+		// deliver_assembly() back on the loop. Multi-segment (split) transfers
+		// defer each segment's read+decrypt the same way; the loop-side delivery
+		// then appends the segment's cleartext to the cross-segment store and,
+		// on the final segment, reads the store back (those SD ops stay on the
+		// loop for now, WDT-reset-guarded). Falls through to the inline path
+		// when no deferrer is registered or the payload is small enough to live
+		// in RAM (heap-backed: read_all is a fast PSRAM copy, nothing to defer).
+		if (_conclude_deferrer
+		    && d._transfer_size > Type::Resource::RAM_BUFFER_THRESHOLD) {
+			d._status = Type::Resource::ASSEMBLING;
+			d._last_activity_ms = Utilities::OS::ltime();
+			_conclude_deferrer(*this);
+		}
+		else {
+			_assemble_and_deliver();
+		}
 	}
 	else if (d._outstanding_parts == 0) {
 		// Window fully satisfied: grow the sliding window and ramp window_max by
 		// the measured rate, faithful to upstream RNS Resource.py:889-913.
 		// Grow the window (+1) up to window_max, ratcheting window_min by the
 		// flexibility so the min trails the window.
-		if (d._window < d._window_max) {
+		if (d._window < d._window_max && d._window < d._window_cap) {   // DIVERGES: also bounded by the byte cap
 			d._window += 1;
 			if ((d._window - d._window_min) > (Type::Resource::WINDOW_FLEXIBILITY - 1)) {
 				d._window_min += 1;
@@ -1440,53 +1485,65 @@ void Resource::_assemble_and_deliver() {
 	// random_hash prefix the sender prepended before encryption. This
 	// matches RNS Resource.py assemble(): decrypt the stream, strip the
 	// random hash, *then* verify the content hash over the plaintext.
-	const Bytes assembled = d._buffer->read_all();
-	// The per-segment receive buffer's job ends here. Discard now so the
-	// flash temp file + quota are released before the next segment's ADV
-	// guard runs, instead of at sweep-time destruction. (read_all returned
-	// either a copy or a shared handle to the heap data, both safe.)
-	d._buffer->discard();
-	Utilities::OS::reset_watchdog();
-	Bytes decrypted;
-	try {
-		decrypted = d._link.decrypt(assembled);
+	Bytes seg_plaintext;
+	Bytes proof;
+	if (d._prepared) {
+		// Off-loop worker already ran read_all + decrypt + verify;
+		// use the stashed result and skip the heavy work on the loop.
+		d._prepared = false;   // consume the stash
+		if (d._prepare_corrupt) { _conclude_corrupt_segment(); return; }
+		seg_plaintext = std::move(d._prepared_seg_plaintext);
+		proof         = std::move(d._pending_proof);
+	}
+	else {
+		const Bytes assembled = d._buffer->read_all();
+		// The per-segment receive buffer's job ends here. Discard now so the
+		// flash temp file + quota are released before the next segment's ADV
+		// guard runs, instead of at sweep-time destruction. (read_all returned
+		// either a copy or a shared handle to the heap data, both safe.)
+		d._buffer->discard();
 		Utilities::OS::reset_watchdog();
-	}
-	catch (const std::exception& e) {
-		ERRORF("Resource: Link.decrypt failed: %s", e.what());
-		_conclude_corrupt_segment();
-		return;
-	}
-	if (decrypted.size() < Type::Resource::RANDOM_HASH_SIZE) {
-		ERROR("Resource: decrypted body too short to contain random_hash prefix");
-		_conclude_corrupt_segment();
-		return;
-	}
-	// This SEGMENT's cleartext. Only becomes _plaintext directly for
-	// single-segment transfers — for split transfers it is appended to
-	// the cross-segment store, and _plaintext is the full concatenation
-	// loaded back on the final segment.
-	Bytes seg_plaintext(decrypted.data() + Type::Resource::RANDOM_HASH_SIZE,
-	                    decrypted.size() - Type::Resource::RANDOM_HASH_SIZE);
+		Bytes decrypted;
+		try {
+			decrypted = d._link.decrypt(assembled);
+			Utilities::OS::reset_watchdog();
+		}
+		catch (const std::exception& e) {
+			ERRORF("Resource: Link.decrypt failed: %s", e.what());
+			_conclude_corrupt_segment();
+			return;
+		}
+		if (decrypted.size() < Type::Resource::RANDOM_HASH_SIZE) {
+			ERROR("Resource: decrypted body too short to contain random_hash prefix");
+			_conclude_corrupt_segment();
+			return;
+		}
+		// This SEGMENT's cleartext. Only becomes _plaintext directly for
+		// single-segment transfers — for split transfers it is appended to
+		// the cross-segment store, and _plaintext is the full concatenation
+		// loaded back on the final segment.
+		seg_plaintext = Bytes(decrypted.data() + Type::Resource::RANDOM_HASH_SIZE,
+		                      decrypted.size() - Type::Resource::RANDOM_HASH_SIZE);
 
-	// Verify the resource hash over the *plaintext* payload + random_hash
-	// salt, full 32-byte SHA-256 — matching upstream RNS (Resource.py:683)
-	// and the sender's `Identity::full_hash(plaintext + random_hash)`.
-	const Bytes computed_hash =
-		Identity::full_hash(seg_plaintext + d._random_hash);
-	Utilities::OS::reset_watchdog();
-	if (computed_hash != d._hash) {
-		WARNINGF("Resource: assembled hash mismatch for %s — corrupt",
-		         d._hash.toHex().c_str());
-		_conclude_corrupt_segment();
-		return;
-	}
+		// Verify the resource hash over the *plaintext* payload + random_hash
+		// salt, full 32-byte SHA-256 — matching upstream RNS (Resource.py:683)
+		// and the sender's `Identity::full_hash(plaintext + random_hash)`.
+		const Bytes computed_hash =
+			Identity::full_hash(seg_plaintext + d._random_hash);
+		Utilities::OS::reset_watchdog();
+		if (computed_hash != d._hash) {
+			WARNINGF("Resource: assembled hash mismatch for %s — corrupt",
+			         d._hash.toHex().c_str());
+			_conclude_corrupt_segment();
+			return;
+		}
 
-	//p proof = RNS.Identity.full_hash(self.data+self.hash)
-	// The proof covers this SEGMENT's cleartext; compute it before
-	// _plaintext is (for the final segment) replaced by the full
-	// concatenation.
-	const Bytes proof = Identity::full_hash(seg_plaintext + d._hash);
+		//p proof = RNS.Identity.full_hash(self.data+self.hash)
+		// The proof covers this SEGMENT's cleartext; compute it before
+		// _plaintext is (for the final segment) replaced by the full
+		// concatenation.
+		proof = Identity::full_hash(seg_plaintext + d._hash);
+	}
 
 	//p self.file = open(self.storagepath, "ab"); self.file.write(data)
 	// (Resource.py:697-699) Append the verified segment cleartext to the
@@ -1557,7 +1614,6 @@ void Resource::_assemble_and_deliver() {
 			// the data()/plaintext() accessors the concluded callback
 			// reads, then drop the store.
 			seg_plaintext = Bytes();
-			decrypted = Bytes();
 			bool load_ok = false;
 			try {
 				microStore::File f = Utilities::OS::open_file(
@@ -1612,6 +1668,75 @@ void Resource::_assemble_and_deliver() {
 		DEBUGF("Resource: segment %u of %u received, waiting for next segment to be announced",
 		       (unsigned)d._segment_index, (unsigned)d._total_segments);
 	}
+}
+
+// --- Off-loop receive conclude (firmware worker decrypts/verifies) ----------
+// on_part hands a spilled single-segment resource's conclude to a firmware
+// worker via _conclude_deferrer so the multi-second read_all+decrypt does not
+// run on loopTask. The worker reads the detached buffer and calls
+// prepare_from_assembled() (lock-free, no RNS mutation); the loop then runs
+// deliver_assembly(). See Resource.h.
+
+Resource::ConcludeDeferrer Resource::_conclude_deferrer = nullptr;
+
+void Resource::set_conclude_deferrer(Resource::ConcludeDeferrer deferrer) {
+	_conclude_deferrer = deferrer;
+}
+
+std::unique_ptr<ResourceBuffer> Resource::detach_buffer() {
+	assert(_object);
+	return std::move(_object->_buffer);
+}
+
+void Resource::reattach_buffer(std::unique_ptr<ResourceBuffer> buffer) {
+	assert(_object);
+	_object->_buffer = std::move(buffer);
+}
+
+bool Resource::prepare_from_assembled(const Bytes& assembled) {
+	assert(_object);
+	auto& d = *_object;
+	// Mirrors the inline decrypt+strip+verify in _assemble_and_deliver, but
+	// runs off loopTask and never touches RNS state: it only stashes the
+	// result (or marks corrupt) for the loop side to act on in delivery.
+	Bytes decrypted;
+	try {
+		decrypted = d._link.decrypt(assembled);
+	}
+	catch (const std::exception& e) {
+		ERRORF("Resource: off-loop Link.decrypt failed: %s", e.what());
+		d._prepare_corrupt = true; d._prepared = true; return false;
+	}
+	if (decrypted.size() < Type::Resource::RANDOM_HASH_SIZE) {
+		ERROR("Resource: off-loop decrypted body too short for random_hash prefix");
+		d._prepare_corrupt = true; d._prepared = true; return false;
+	}
+	Bytes seg_plaintext(decrypted.data() + Type::Resource::RANDOM_HASH_SIZE,
+	                    decrypted.size() - Type::Resource::RANDOM_HASH_SIZE);
+	if (Identity::full_hash(seg_plaintext + d._random_hash) != d._hash) {
+		WARNINGF("Resource: off-loop assembled hash mismatch for %s — corrupt",
+		         d._hash.toHex().c_str());
+		d._prepare_corrupt = true; d._prepared = true; return false;
+	}
+	d._prepared_seg_plaintext = seg_plaintext;
+	d._pending_proof = Identity::full_hash(seg_plaintext + d._hash);
+	d._prepare_corrupt = false;
+	d._prepared = true;
+	return true;
+}
+
+void Resource::deliver_assembly() {
+	assert(_object);
+	auto& d = *_object;
+	// A cancel() (e.g. link teardown) may have failed the resource while the
+	// worker prepared. Don't deliver a dead resource; the buffer was detached,
+	// so nothing the worker read was freed under it.
+	if (d._status == Type::Resource::FAILED || d._status == Type::Resource::CORRUPT) {
+		return;
+	}
+	// _prepared is set, so _assemble_and_deliver skips read_all+decrypt and
+	// runs only the loop-side delivery (proof + status + concluded callback).
+	_assemble_and_deliver();
 }
 
 // Terminal CORRUPT helper for the receive-assembly paths. Upstream fires
@@ -2024,10 +2149,12 @@ void Resource::tick(uint64_t now_ms) {
 			+ Type::Resource::RETRY_GRACE_TIME
 			+ extra_wait_s;
 		const uint64_t window_timeout_ms = (uint64_t)(window_timeout_s * 1000.0);
+		RNS::SdReadStat::rx_last_wtmo_ms() = (uint32_t)window_timeout_ms;
 
 		if (elapsed > window_timeout_ms) {
 			if (d._retries_left > 0) {
 				d._retries_left--;
+				RNS::SdReadStat::rx_timeouts()++;
 				// Shrink the window on a part timeout so a struggling link
 				// converges to a smaller, more reliable window — faithful to
 				// upstream RNS Resource.py:612-617.
