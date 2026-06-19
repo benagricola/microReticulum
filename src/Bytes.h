@@ -346,7 +346,13 @@ MEM("Creating from data-move...");
 			_data->insert(_data->end(), (uint8_t* )string, (uint8_t* )string + string_size);
 		}
 		inline void append(uint8_t byte) {
-			exclusiveData(true, size() + 1);
+			// Do not pass a size()+1 capacity hint: exclusiveData() would then
+			// reserve() to exactly size()+1 on every byte, forcing the vector to
+			// reallocate and copy the whole buffer per byte (O(n^2) over an
+			// N-byte buffer). Byte-by-byte accumulation of a large frame (e.g. an
+			// 8 KiB TCP SDU in the HDLC decoder) then costs seconds. Let push_back
+			// grow the buffer geometrically instead.
+			exclusiveData(true);
 			_data->push_back(byte);
 		}
 		//inline void append(const std::string& string) { append(string.c_str()); }
