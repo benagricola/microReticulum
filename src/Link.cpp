@@ -480,9 +480,24 @@ const RNS::RequestReceipt Link::request(const Bytes& path, const Bytes& data /*=
 
 	//p unpacked_request = [OS::time(), request_path_hash, data]
 	//p packed_request = umsgpack.packb(unpacked_request)
-    MsgPack::Packer packer;
-	packer.to_array(OS::time(), request_path_hash, data);
-	Bytes packed_request(packer.data(), packer.size());
+	// `data` is the caller's already msgpack-encoded request value and must be
+	// embedded RAW as element [2], not wrapped as a msgpack bin. Python RNS
+	// (and every Python request responder, e.g. LXMF's propagation /get) treats
+	// element [2] as an arbitrary structured value (LXMF sends [None, None] /
+	// [wants, haves, limit]); serialising `data` (a Bytes == bin_t) via to_array
+	// would make it a bin, so the responder reads element [2] as opaque bytes,
+	// indexes data[0]/data[1] on them and throws - no response is ever sent.
+	// Build [time, path_hash] as a 2-array, widen the array header to 3, then
+	// append the caller's raw msgpack (or nil when there is no data).
+	MsgPack::Packer packer;
+	packer.to_array(OS::time(), request_path_hash);
+	std::vector<uint8_t> rbuf(packer.data(), packer.data() + packer.size());
+	if (!rbuf.empty() && (rbuf[0] & 0xF0) == 0x90) {
+		rbuf[0] = (uint8_t)(0x90 | 0x03);   // fixarray(2) -> fixarray(3)
+		if (data && data.size() > 0) rbuf.insert(rbuf.end(), data.data(), data.data() + data.size());
+		else                         rbuf.push_back(0xC0);   // nil
+	}
+	Bytes packed_request(rbuf.data(), rbuf.size());
 
 	if (timeout == 0.0) {
 		timeout = _object->_rtt * _object->_traffic_timeout_factor + Type::Resource::RESPONSE_MAX_GRACE_TIME * 1.125;
@@ -497,6 +512,10 @@ const RNS::RequestReceipt Link::request(const Bytes& path, const Bytes& data /*=
 		}
 		else {
 			packet_receipt.set_timeout(timeout);
+			Transport::count_request_sent();
+			DEBUGF("Link %s sent REQUEST packet (%u bytes, path_hash %s)",
+			       link_id().toHex().c_str(), (unsigned)packed_request.size(),
+			       request_path_hash.toHex().c_str());
 			return RequestReceipt(
 				*this,
 				packet_receipt,
@@ -513,6 +532,7 @@ const RNS::RequestReceipt Link::request(const Bytes& path, const Bytes& data /*=
 		const Bytes request_id(Identity::truncated_hash(packed_request));
 		DEBUGF("Sending request %s as resource.", request_id.toHex().c_str());
 		Resource request_resource(packed_request, *this, request_id, false, timeout);
+		Transport::count_request_sent();
 
 		return RequestReceipt(
 			*this,
@@ -1000,10 +1020,14 @@ void Link::handle_request(const Bytes& request_id, const ResourceRequest& resour
 
 void Link::handle_response(const Bytes& request_id, const Bytes& response_data, size_t response_size, size_t response_transfer_size) {
 	assert(_object);
+	DEBUGF("Link %s handle_response: req_id %s, status %d, %u pending request(s)",
+	       link_id().toHex().c_str(), request_id.toHex().c_str(),
+	       (int)_object->_status, (unsigned)_object->_pending_requests.size());
 	if (_object->_status == Type::Link::ACTIVE) {
 		RNS::RequestReceipt remove = {Type::NONE};
 		for (RNS::RequestReceipt pending_request : _object->_pending_requests) {
 			if (pending_request.request_id() == request_id) {
+				Transport::count_response_matched();
 				remove = pending_request;
 				try {
 					pending_request.response_size(response_size);
@@ -1254,6 +1278,9 @@ void Link::receive(const Packet& packet) {
 				}
 				case Type::Packet::RESPONSE:
 				{
+					Transport::count_response_rx();
+					DEBUGF("Link %s received RESPONSE packet (%u bytes)",
+					       link_id().toHex().c_str(), (unsigned)packet.data().size());
 					try {
 						const Bytes packed_response = decrypt(packet.data());
 						if (packed_response) {
@@ -1261,15 +1288,34 @@ void Link::receive(const Packet& packet) {
 							//p request_id = unpacked_response[0]
 							//p response_data = unpacked_response[1]
                             //p transfer_size = len(umsgpack.packb(response_data))-2
-							MsgPack::Unpacker unpacker;
-							unpacker.feed(packed_response.data(), packed_response.size());
-							MsgPack::bin_t<uint8_t> request_id;
-							MsgPack::bin_t<uint8_t> response_data;
-							unpacker.from_array(request_id, response_data);
-							MsgPack::Packer packer;
-							packer.serialize(response_data);
-							size_t transfer_size = packer.size() - 2;
-							handle_response(Bytes(request_id.data(), request_id.size()), Bytes(response_data.data(), response_data.size()), transfer_size, transfer_size);
+							// packed_response = msgpack([request_id, response]) where `response`
+							// is an arbitrary structured value (Python responders send a list /
+							// map, not a bin). Read request_id (a bin) and hand `response` back
+							// as RAW msgpack for the caller to decode; unpacking it as bin_t (as
+							// before) only works C++<->C++ and silently fails against Python.
+							const uint8_t* rd = packed_response.data();
+							size_t rlen = packed_response.size();
+							if (rlen >= 2 && (rd[0] & 0xF0) == 0x90 && (rd[0] & 0x0F) >= 2) {
+								size_t off = 1;
+								size_t idlen = 0;
+								uint8_t tag = rd[off++];
+								if      (tag == 0xC4 && off < rlen)     { idlen = rd[off]; off += 1; }
+								else if (tag == 0xC5 && off + 1 < rlen) { idlen = ((size_t)rd[off] << 8) | rd[off+1]; off += 2; }
+								else if (tag == 0xC6 && off + 3 < rlen) { idlen = ((size_t)rd[off] << 24) | ((size_t)rd[off+1] << 16) | ((size_t)rd[off+2] << 8) | rd[off+3]; off += 4; }
+								if (idlen > 0 && off + idlen <= rlen) {
+									Bytes request_id(rd + off, idlen);
+									off += idlen;
+									Bytes response_data(rd + off, rlen - off);   // element [1], raw msgpack
+									size_t transfer_size = response_data.size();
+									handle_response(request_id, response_data, transfer_size, transfer_size);
+								}
+								else {
+									DEBUGF("Link %s: malformed response request_id (len %u)", link_id().toHex().c_str(), (unsigned)idlen);
+								}
+							}
+							else {
+								DEBUGF("Link %s: response is not a >=2 element array", link_id().toHex().c_str());
+							}
 						}
 					}
 					catch (const std::exception& e) {

@@ -443,6 +443,13 @@ namespace RNS {
 		inline static uint32_t lrproofs_sent()   { return _lrproofs_sent; }
 		inline static uint32_t lrproofs_rx()     { return _lrproofs_rx; }
 		inline static uint32_t links_active()    { return _links_active; }
+		// Request/response over an established link (initiator side):
+		// requests_sent = Link::request transmitted a REQUEST; responses_rx =
+		// a RESPONSE packet arrived and decrypted; responses_matched = it
+		// matched a pending request and fired its callback.
+		inline static uint32_t requests_sent()     { return _requests_sent; }
+		inline static uint32_t responses_rx()      { return _responses_rx; }
+		inline static uint32_t responses_matched() { return _responses_matched; }
 		// Counter increments are compiled out unless URTN_LINK_DIAG is defined
 		// (enable via PLATFORMIO_BUILD_FLAGS="-DURTN_LINK_DIAG", like the other
 		// URTN_*_DIAG gates). The accessors + members stay so /api/diag can read
@@ -453,12 +460,18 @@ namespace RNS {
 		inline static void count_lrproof_rx()        { ++_lrproofs_rx; }
 		inline static void count_link_active()       { ++_links_active; }
 		inline static void count_path_req_originated() { ++_path_reqs_originated; }
+		inline static void count_request_sent()      { ++_requests_sent; }
+		inline static void count_response_rx()       { ++_responses_rx; }
+		inline static void count_response_matched()  { ++_responses_matched; }
 #else
 		inline static void count_link_initiated()    {}
 		inline static void count_lrproof_sent()      {}
 		inline static void count_lrproof_rx()        {}
 		inline static void count_link_active()       {}
 		inline static void count_path_req_originated() {}
+		inline static void count_request_sent()      {}
+		inline static void count_response_rx()       {}
+		inline static void count_response_matched()  {}
 #endif
 		// Every request_path() call (path requests this node originates/rebroadcasts
 		// onto all interfaces, incl. LoRa). Diagnostic for AP-mode LoRa saturation.
@@ -566,6 +579,9 @@ namespace RNS {
 		static uint32_t _lrproofs_sent;
 		static uint32_t _lrproofs_rx;
 		static uint32_t _links_active;
+		static uint32_t _requests_sent;
+		static uint32_t _responses_rx;
+		static uint32_t _responses_matched;
 		static uint32_t _path_reqs_originated;
 		static size_t _last_memory;
 		static size_t _last_psram;
