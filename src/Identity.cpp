@@ -340,10 +340,16 @@ Recall identity for a destination hash.
 		Destination registered_destination(Transport::find_destination_from_hash(destination_hash));
 		if (registered_destination) {
 			TRACEF("Identity::recall: Found destination %s", destination_hash.toHex().c_str());
-			Identity identity(false);
-			identity.load_public_key(registered_destination.identity().get_public_key());
-			identity.app_data({Bytes::NONE});
-			return identity;
+			// A registered destination need not carry an identity (group/plain
+			// types); guard before get_public_key() and fall through to the
+			// announce-based recovery below rather than dereferencing NONE.
+			if (registered_destination.identity()) {
+				Identity identity(false);
+				identity.load_public_key(registered_destination.identity().get_public_key());
+				identity.app_data({Bytes::NONE});
+				return identity;
+			}
+			TRACEF("Identity::recall: Destination %s has no associated identity", destination_hash.toHex().c_str());
 		}
 		TRACEF("Identity::recall: Unable to find destination %s", destination_hash.toHex().c_str());
 
